@@ -22,9 +22,15 @@ This codebase implements a systematic ablation study comparing recursive archite
 | Size | d_model | Layers | Params | Purpose |
 |------|---------|--------|--------|---------|
 | `nano` | 512 | 6 | ~18M | Match ReLSM-Nano, quick experiments |
+| `50M` | 512 | 8 | ~50M | Small baseline floor (original ladder start) |
+| `125M` | 768 | 12 | ~125M | GPT-2 scale control |
 | `300M` | 1024 | 24 | ~300M | Fast ladder iteration |
+| `350M` | 1024 | 24 | ~350M | GPT-2 medium-sized control |
+| `760M` | 1280 | 36 | ~760M | Large baseline for ablations |
 | `1B` | 2048 | 18 | ~1B | ReLSM-16k comparison (target) |
-| `1B-16k` | 2048 | 18 | ~1B | Long context with GQA |
+| `1B-16k` | 2048 | 18 | ~1B | Long context (16k) with GQA |
+
+Both `train.py` and the `create_model` factory accept the same size strings above, so direct factory calls match the CLI/documented options.
 
 ## Quick Start
 

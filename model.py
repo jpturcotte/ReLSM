@@ -550,6 +550,7 @@ class BaselineTransformer(nn.Module):
             cum_halt = torch.zeros(B, 1, device=h.device, dtype=h.dtype)
             steps_used = torch.zeros(B, device=h.device, dtype=torch.int64)
             ponder = 0.0
+            iterations_run = 0
 
             # enforce a minimum number of steps
             for k in range(cfg.max_K):
@@ -565,16 +566,18 @@ class BaselineTransformer(nn.Module):
                 cum_halt = cum_halt + delta
                 ponder = ponder + p.mean()
 
-                # Mark steps for those not yet halted
-                not_halted = (cum_halt < cfg.halt_threshold).squeeze(-1)
-                steps_used[not_halted] = k + 1
+                # Track the number of iterations performed for every sequence
+                iterations_run = k + 1
+                steps_used[:] = iterations_run
 
                 # Break if all halted and min_K satisfied
                 if (cum_halt >= cfg.halt_threshold).all() and (k + 1) >= cfg.min_K:
                     break
 
-            # If some never halted, they used max_K
-            steps_used[steps_used == 0] = min(cfg.max_K, max(cfg.min_K, 1))
+            # If some never halted, they used the final iteration count (max_K cap)
+            never_halted = (cum_halt < cfg.halt_threshold).squeeze(-1)
+            if never_halted.any():
+                steps_used[never_halted] = iterations_run
 
             self.aux["inner_steps"] = steps_used.detach().cpu()
             self.aux["ponder"] = float(ponder)
@@ -738,9 +741,11 @@ def create_model(
     Factory for baseline + ladder variants.
 
     Sizes:
+      - nano (ReLSM-Nano compatible quick runs)
       - 50M, 125M, 350M, 760M (original)
       - 300M (recommended ladder iteration size)
       - 1B   (baseline control scale)
+      - 1B-16k (long context with GQA)
 
     Variant:
       baseline | shared_loop | latent | act | ssm | ssm_mem
@@ -749,6 +754,7 @@ def create_model(
     base.update(kwargs)
 
     configs = {
+        "nano": TransformerConfig(d_model=512,  n_layers=6,  n_heads=8,  **base),
         "50M":  TransformerConfig(d_model=512,  n_layers=8,  n_heads=8,  **base),
         "125M": TransformerConfig(d_model=768,  n_layers=12, n_heads=12, **base),
         "350M": TransformerConfig(d_model=1024, n_layers=24, n_heads=16, **base),
@@ -759,6 +765,14 @@ def create_model(
 
         # ~1B control (adjust vocab_size to your tokenizer; with 50k vocab this is ~1B-ish)
         "1B":   TransformerConfig(d_model=2048, n_layers=18, n_heads=16, d_ff=5504, dropout=0.05, **base),
+        "1B-16k": TransformerConfig(
+            d_model=2048,
+            n_layers=18,
+            n_heads=16,
+            d_ff=5504,
+            dropout=0.05,
+            **{**base, "max_seq_len": 16384, "use_gqa": True},
+        ),
     }
 
     if size not in configs:
