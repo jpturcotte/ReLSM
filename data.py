@@ -429,7 +429,18 @@ def load_language_dataset(
     num_shards = max(1, num_shards)
     shard_index = min(max(shard_index, 0), num_shards - 1)
     if num_shards > 1:
-        ds = ds.shard(num_shards=num_shards, index=shard_index, contiguous=True)
+        try:
+            ds = ds.shard(num_shards=num_shards, index=shard_index, contiguous=True)
+        except TypeError:
+            ds = ds.shard(num_shards=num_shards, index=shard_index)
+        except AttributeError:
+            if log:
+                print(
+                    f"  Warning: {config.name} does not support sharding; "
+                    "falling back to unsharded stream."
+                )
+            num_shards = 1
+            shard_index = 0
 
     max_samples = max_samples_override if max_samples_override is not None else config.max_samples
 
@@ -476,9 +487,14 @@ class LanguageDataset(IterableDataset):
         random.Random(42 + worker_id).shuffle(config_items)
 
         for _, config in config_items:
-            worker_max_samples = None
             if config.max_samples is not None and num_workers > 1:
-                worker_max_samples = math.ceil(config.max_samples / num_workers)
+                base = config.max_samples // num_workers
+                remainder = config.max_samples % num_workers
+                worker_max_samples = base + (1 if worker_id < remainder else 0)
+                if worker_max_samples == 0:
+                    continue
+            else:
+                worker_max_samples = config.max_samples
 
             stream = load_language_dataset(
                 config,
