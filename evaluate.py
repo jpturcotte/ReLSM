@@ -394,12 +394,12 @@ class PerplexityEvaluator:
 
 def load_model(checkpoint_path: str, device: torch.device):
     """Load model from checkpoint."""
-    from model import UnifiedTransformer
-    
+    from model import BaselineTransformer
+
     checkpoint = torch.load(checkpoint_path, map_location=device)
     config = checkpoint["config"]
-    
-    model = UnifiedTransformer(config)
+
+    model = BaselineTransformer(config)
     model.load_state_dict(checkpoint["model_state_dict"])
     model = model.to(device)
     model.eval()
