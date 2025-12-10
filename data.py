@@ -21,7 +21,7 @@ Also includes:
 
 import random
 import math
-from typing import List, Dict, Optional, Tuple, Iterator, Callable
+from typing import List, Dict, Optional, Tuple, Iterator, Callable, Iterable
 from dataclasses import dataclass
 from itertools import cycle
 import torch
@@ -389,37 +389,60 @@ LANGUAGE_CONFIGS = {
 }
 
 
-def load_language_dataset(config: LanguageDataConfig, tokenizer, max_seq_len: int) -> List[Dict]:
-    """Load a single language dataset."""
+def load_language_dataset(
+    config: LanguageDataConfig, tokenizer, max_seq_len: int, *, log: bool = True
+) -> Iterable[Dict[str, str]]:
+    """Stream a language dataset without loading it fully into memory."""
     from datasets import load_dataset
-    
-    print(f"Loading {config.name}...")
-    
+
+    if log:
+        print(f"Loading {config.name}...")
+
     try:
         if config.subset:
-            ds = load_dataset(config.name, config.subset, split=config.split, trust_remote_code=True)
+            ds = load_dataset(
+                config.name,
+                config.subset,
+                split=config.split,
+                streaming=True,
+                trust_remote_code=True,
+            )
         else:
-            ds = load_dataset(config.name, split=config.split, trust_remote_code=True)
+            ds = load_dataset(
+                config.name,
+                split=config.split,
+                streaming=True,
+                trust_remote_code=True,
+            )
     except Exception as e:
-        print(f"  Failed: {e}")
-        return []
-    
-    if config.max_samples and len(ds) > config.max_samples:
-        ds = ds.shuffle(seed=42).select(range(config.max_samples))
-    
-    processed = []
-    for item in ds:
-        text = item.get(config.text_field, "")
-        if text and len(text) > 50:
-            processed.append({"text": text, "source": config.name})
-    
-    print(f"  Loaded {len(processed)} examples")
-    return processed
+        if log:
+            print(f"  Failed: {e}")
+        return iter(())
+
+    buffer_size = 10_000
+    if config.max_samples:
+        buffer_size = min(buffer_size, config.max_samples)
+        ds = ds.shuffle(seed=42, buffer_size=buffer_size).take(config.max_samples)
+    else:
+        ds = ds.shuffle(seed=42, buffer_size=buffer_size)
+
+    def generator() -> Iterator[Dict[str, str]]:
+        count = 0
+        for item in ds:
+            text = item.get(config.text_field, "")
+            if text and len(text) > 50:
+                count += 1
+                yield {"text": text, "source": config.name}
+
+        if log:
+            print(f"  Streamed {count} examples from {config.name}")
+
+    return generator()
 
 
-class LanguageDataset(Dataset):
-    """Dataset for Phase 2: Language Generalization."""
-    
+class LanguageDataset(IterableDataset):
+    """Dataset for Phase 2: Language Generalization, streamed to limit RAM."""
+
     def __init__(
         self,
         tokenizer,
@@ -428,37 +451,38 @@ class LanguageDataset(Dataset):
     ):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
-        
-        if configs is None:
-            configs = LANGUAGE_CONFIGS
-        
-        self.examples = []
-        for name, config in configs.items():
-            self.examples.extend(load_language_dataset(config, tokenizer, max_seq_len))
-        
-        random.shuffle(self.examples)
-        print(f"Total language examples: {len(self.examples)}")
-    
-    def __len__(self):
-        return len(self.examples)
-    
-    def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
-        text = self.examples[idx]["text"]
-        
-        tokens = self.tokenizer.encode(text, add_special_tokens=True)
-        if len(tokens) > self.max_seq_len:
-            tokens = tokens[:self.max_seq_len]
-        
-        input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
-        labels = torch.tensor(tokens[1:], dtype=torch.long)
-        
-        pad_len = self.max_seq_len - 1 - len(input_ids)
-        if pad_len > 0:
-            pad_id = self.tokenizer.pad_token_id or 0
-            input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
-            labels = torch.cat([labels, torch.full((pad_len,), -100)])
-        
-        return {"input_ids": input_ids, "labels": labels}
+        self.configs = configs or LANGUAGE_CONFIGS
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+
+        config_items = list(self.configs.items())
+        random.Random(42 + worker_id).shuffle(config_items)
+
+        for _, config in config_items:
+            stream = load_language_dataset(
+                config, self.tokenizer, self.max_seq_len, log=(worker_id == 0)
+            )
+            for idx, example in enumerate(stream):
+                if idx % num_workers != worker_id:
+                    continue
+
+                tokens = self.tokenizer.encode(example["text"], add_special_tokens=True)
+                if len(tokens) > self.max_seq_len:
+                    tokens = tokens[:self.max_seq_len]
+
+                input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
+                labels = torch.tensor(tokens[1:], dtype=torch.long)
+
+                pad_len = self.max_seq_len - 1 - len(input_ids)
+                if pad_len > 0:
+                    pad_id = self.tokenizer.pad_token_id or 0
+                    input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
+                    labels = torch.cat([labels, torch.full((pad_len,), -100)])
+
+                yield {"input_ids": input_ids, "labels": labels}
 
 
 # =============================================================================
@@ -690,7 +714,7 @@ def create_curriculum_loaders(
     lang_loader = DataLoader(
         lang_dataset,
         batch_size=lang_batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
     )

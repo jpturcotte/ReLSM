@@ -263,7 +263,7 @@ def train(args):
         lang_loader = DataLoader(
             lang_dataset,
             batch_size=args.lang_batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,
         )
