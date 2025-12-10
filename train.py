@@ -203,11 +203,10 @@ def train(args):
     size = args.model_size
     extra_kwargs = {}
     if size == "nano":
-        size = "50M"
         extra_kwargs["max_seq_len"] = args.lang_seq_len
     elif size == "1B-16k":
-        size = "1B"
         extra_kwargs["max_seq_len"] = 16384
+        extra_kwargs["use_gqa"] = True
 
     model = create_model(
         size=size,
