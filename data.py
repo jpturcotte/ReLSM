@@ -21,7 +21,7 @@ Also includes:
 
 import random
 import math
-from typing import List, Dict, Optional, Tuple, Iterator, Callable
+from typing import List, Dict, Optional, Tuple, Iterator, Callable, Iterable
 from dataclasses import dataclass
 from itertools import cycle
 import torch
@@ -389,37 +389,100 @@ LANGUAGE_CONFIGS = {
 }
 
 
-def load_language_dataset(config: LanguageDataConfig, tokenizer, max_seq_len: int) -> List[Dict]:
-    """Load a single language dataset."""
+def load_language_dataset(
+    config: LanguageDataConfig,
+    tokenizer,
+    max_seq_len: int,
+    *,
+    log: bool = True,
+    num_shards: int = 1,
+    shard_index: int = 0,
+    max_samples_override: Optional[int] = None,
+) -> Iterable[Dict[str, str]]:
+    """Stream a language dataset without loading it fully into memory."""
     from datasets import load_dataset
-    
-    print(f"Loading {config.name}...")
-    
+
+    if log:
+        print(f"Loading {config.name}...")
+
     try:
         if config.subset:
-            ds = load_dataset(config.name, config.subset, split=config.split, trust_remote_code=True)
+            ds = load_dataset(
+                config.name,
+                config.subset,
+                split=config.split,
+                streaming=True,
+                trust_remote_code=True,
+            )
         else:
-            ds = load_dataset(config.name, split=config.split, trust_remote_code=True)
+            ds = load_dataset(
+                config.name,
+                split=config.split,
+                streaming=True,
+                trust_remote_code=True,
+            )
     except Exception as e:
-        print(f"  Failed: {e}")
-        return []
-    
-    if config.max_samples and len(ds) > config.max_samples:
-        ds = ds.shuffle(seed=42).select(range(config.max_samples))
-    
-    processed = []
-    for item in ds:
-        text = item.get(config.text_field, "")
-        if text and len(text) > 50:
-            processed.append({"text": text, "source": config.name})
-    
-    print(f"  Loaded {len(processed)} examples")
-    return processed
+        if log:
+            print(f"  Failed: {e}")
+        return iter(())
+
+    num_shards = max(1, num_shards)
+    shard_index = min(max(shard_index, 0), num_shards - 1)
+    requested_shard_index = shard_index
+    shardable = True
+    if num_shards > 1:
+        try:
+            ds = ds.shard(num_shards=num_shards, index=shard_index, contiguous=True)
+        except TypeError:
+            ds = ds.shard(num_shards=num_shards, index=shard_index)
+        except AttributeError:
+            if log:
+                print(
+                    f"  Warning: {config.name} does not support sharding; "
+                    "falling back to unsharded stream."
+                )
+            shardable = False
+            num_shards = 1
+
+    if not shardable and requested_shard_index > 0:
+        if log:
+            print(
+                f"  Skipping worker {requested_shard_index} "
+                f"for {config.name} (no sharding support)"
+            )
+        return iter(())
+
+    if not shardable and config.max_samples is not None:
+        effective_max_samples = config.max_samples
+    else:
+        effective_max_samples = max_samples_override
+
+    max_samples = effective_max_samples if effective_max_samples is not None else config.max_samples
+
+    buffer_size = 10_000
+    if max_samples:
+        buffer_size = min(buffer_size, max_samples)
+        ds = ds.shuffle(seed=42, buffer_size=buffer_size).take(max_samples)
+    else:
+        ds = ds.shuffle(seed=42, buffer_size=buffer_size)
+
+    def generator() -> Iterator[Dict[str, str]]:
+        count = 0
+        for item in ds:
+            text = item.get(config.text_field, "")
+            if text and len(text) > 50:
+                count += 1
+                yield {"text": text, "source": config.name}
+
+        if log:
+            print(f"  Streamed {count} examples from {config.name}")
+
+    return generator()
 
 
-class LanguageDataset(Dataset):
-    """Dataset for Phase 2: Language Generalization."""
-    
+class LanguageDataset(IterableDataset):
+    """Dataset for Phase 2: Language Generalization, streamed to limit RAM."""
+
     def __init__(
         self,
         tokenizer,
@@ -428,37 +491,77 @@ class LanguageDataset(Dataset):
     ):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
-        
-        if configs is None:
-            configs = LANGUAGE_CONFIGS
-        
-        self.examples = []
-        for name, config in configs.items():
-            self.examples.extend(load_language_dataset(config, tokenizer, max_seq_len))
-        
-        random.shuffle(self.examples)
-        print(f"Total language examples: {len(self.examples)}")
-    
-    def __len__(self):
-        return len(self.examples)
-    
-    def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
-        text = self.examples[idx]["text"]
-        
-        tokens = self.tokenizer.encode(text, add_special_tokens=True)
-        if len(tokens) > self.max_seq_len:
-            tokens = tokens[:self.max_seq_len]
-        
-        input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
-        labels = torch.tensor(tokens[1:], dtype=torch.long)
-        
-        pad_len = self.max_seq_len - 1 - len(input_ids)
-        if pad_len > 0:
-            pad_id = self.tokenizer.pad_token_id or 0
-            input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
-            labels = torch.cat([labels, torch.full((pad_len,), -100)])
-        
-        return {"input_ids": input_ids, "labels": labels}
+        self.configs = configs or LANGUAGE_CONFIGS
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        rng = random.Random(42 + worker_id)
+
+        config_items = list(self.configs.items())
+        rng.shuffle(config_items)
+
+        active_streams: List[Tuple[LanguageDataConfig, Iterator[Dict[str, str]]]] = []
+
+        for _, config in config_items:
+            if config.max_samples is not None and num_workers > 1:
+                base = config.max_samples // num_workers
+                remainder = config.max_samples % num_workers
+                worker_max_samples = base + (1 if worker_id < remainder else 0)
+                if worker_max_samples == 0:
+                    continue
+            else:
+                worker_max_samples = config.max_samples
+
+            stream = load_language_dataset(
+                config,
+                self.tokenizer,
+                self.max_seq_len,
+                log=(worker_id == 0),
+                num_shards=num_workers,
+                shard_index=worker_id,
+                max_samples_override=worker_max_samples,
+            )
+            active_streams.append((config, iter(stream)))
+
+        while active_streams:
+            weights = [config.weight for config, _ in active_streams]
+            total_weight = sum(weights)
+            pick = rng.uniform(0, total_weight)
+
+            chosen_index = 0
+            cumulative = 0.0
+            for i, w in enumerate(weights):
+                cumulative += w
+                if pick <= cumulative:
+                    chosen_index = i
+                    break
+
+            config, stream = active_streams[chosen_index]
+
+            try:
+                example = next(stream)
+            except StopIteration:
+                active_streams.pop(chosen_index)
+                continue
+
+            tokens = self.tokenizer.encode(example["text"], add_special_tokens=True)
+            if len(tokens) > self.max_seq_len:
+                tokens = tokens[:self.max_seq_len]
+
+            input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
+            labels = torch.tensor(tokens[1:], dtype=torch.long)
+
+            pad_len = self.max_seq_len - 1 - len(input_ids)
+            if pad_len > 0:
+                pad_id = self.tokenizer.pad_token_id or 0
+                input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
+                labels = torch.cat([labels, torch.full((pad_len,), -100)])
+
+            yield {"input_ids": input_ids, "labels": labels}
+
+            active_streams[chosen_index] = (config, stream)
 
 
 # =============================================================================
@@ -690,7 +793,7 @@ def create_curriculum_loaders(
     lang_loader = DataLoader(
         lang_dataset,
         batch_size=lang_batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
     )
