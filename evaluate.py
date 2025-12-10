@@ -21,6 +21,7 @@ import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
+from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F
@@ -42,17 +43,31 @@ class AlgorithmicEvaluator:
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
-    
+
+    @contextmanager
+    def _generation_context(self):
+        was_training = self.model.training
+        self.model.to(self.device)
+        self.model.eval()
+        try:
+            yield
+        finally:
+            if was_training:
+                self.model.train()
+            else:
+                self.model.eval()
+
     def _generate(self, prompt: str, max_tokens: int = 20) -> str:
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
-        
-        with torch.no_grad():
-            output_ids = self.model.generate(
-                input_ids,
-                max_new_tokens=max_tokens,
-                temperature=0.1,
-                top_k=1,
-            )
+
+        with self._generation_context():
+            with torch.no_grad():
+                output_ids = self.model.generate(
+                    input_ids,
+                    max_new_tokens=max_tokens,
+                    temperature=0.1,
+                    top_k=1,
+                )
         
         generated = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
         return generated[len(prompt):].strip()
@@ -128,17 +143,31 @@ class OODLengthEvaluator:
         self.tokenizer = tokenizer
         self.device = device
         self.train_length = train_length
-    
+
+    @contextmanager
+    def _generation_context(self):
+        was_training = self.model.training
+        self.model.to(self.device)
+        self.model.eval()
+        try:
+            yield
+        finally:
+            if was_training:
+                self.model.train()
+            else:
+                self.model.eval()
+
     def _generate(self, prompt: str, max_tokens: int = 50) -> str:
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
-        
-        with torch.no_grad():
-            output_ids = self.model.generate(
-                input_ids,
-                max_new_tokens=max_tokens,
-                temperature=0.1,
-                top_k=1,
-            )
+
+        with self._generation_context():
+            with torch.no_grad():
+                output_ids = self.model.generate(
+                    input_ids,
+                    max_new_tokens=max_tokens,
+                    temperature=0.1,
+                    top_k=1,
+                )
         
         return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)[len(prompt):].strip()
     
