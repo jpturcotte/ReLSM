@@ -53,6 +53,10 @@ python evaluate.py --checkpoint ./runs/nano_baseline/best_model.pt
 python evaluate.py --checkpoint ./runs/nano_latent/best_model.pt
 ```
 
+### Nano Baseline Control
+
+Note that `nano_baseline.py` is a standalone script that implements a control model with learned **absolute positional embeddings**. This is distinct from running `train.py --variant baseline`, which uses the main model codebase with RoPE. Use `nano_baseline.py` specifically to test the hypothesis that absolute embeddings fail out-of-distribution length generalization.
+
 ## Split Curriculum Training
 
 Following ReLSM's strategy:
