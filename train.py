@@ -198,12 +198,29 @@ def train(args):
     # MODEL
     # =========================================================================
     
-    from model import create_model, CONFIGS
-    
+    from model import create_model
+
+    size = args.model_size
+    extra_kwargs = {}
+    if size == "nano":
+        size = "50M"
+        extra_kwargs["max_seq_len"] = args.lang_seq_len
+    elif size == "1B-16k":
+        size = "1B"
+        extra_kwargs["max_seq_len"] = 16384
+
     model = create_model(
-        size=args.model_size,
+        size=size,
         variant=args.variant,
         vocab_size=tokenizer.vocab_size,
+        K=args.K,
+        min_K=args.min_K,
+        max_K=args.max_K,
+        lambda_ponder=args.lambda_ponder,
+        thought_tokens=args.thought_tokens,
+        num_mem=args.num_mem,
+        local_window=args.local_window,
+        **extra_kwargs,
     )
     model = model.to(device)
     
@@ -309,6 +326,7 @@ def train(args):
     
     running_loss = 0.0
     running_inner_steps = 0.0
+    running_ponder = 0.0
     
     while curriculum.tokens_seen < args.total_tokens:
         batch = curriculum.next_batch()
@@ -322,12 +340,18 @@ def train(args):
         
         # Forward
         with ctx:
-            if args.variant in ["latent", "act"]:
-                logits, loss, _, stats = model(input_ids, labels=labels, return_thought_stats=True)
-                running_inner_steps += stats.get("avg_K", 0)
+            logits, loss, _ = model(input_ids, labels=labels)
+            inner_steps = model.aux.get("inner_steps", 0)
+            ponder = model.aux.get("ponder", 0.0)
+
+            if isinstance(inner_steps, torch.Tensor):
+                avg_inner = inner_steps.float().mean().item()
             else:
-                logits, loss, _ = model(input_ids, labels=labels)
-            
+                avg_inner = float(inner_steps) if inner_steps else 0.0
+
+            running_inner_steps += avg_inner
+            running_ponder += float(ponder)
+
             loss = loss / args.grad_accum_steps
         
         # Backward
@@ -348,14 +372,15 @@ def train(args):
         # Logging
         if global_step % args.log_interval == 0:
             elapsed = time.time() - start_time
-            toks_per_sec = tokens_seen / elapsed
-            peak_vram = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0
+            toks_per_sec = tokens_seen / max(elapsed, 1e-6)
+            peak_vram = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0.0
             avg_loss = running_loss / args.log_interval
-            avg_K = running_inner_steps / args.log_interval if args.variant in ["latent", "act"] else 0
-            
+            avg_K = running_inner_steps / args.log_interval if running_inner_steps > 0 else 0.0
+            avg_ponder = running_ponder / args.log_interval if running_ponder > 0 else 0.0
+
             phase = curriculum.phase
             progress = curriculum.progress * 100
-            
+
             print(f"Step {global_step:>6} | "
                   f"Phase: {phase[:4]:>4} | "
                   f"Progress: {progress:>5.1f}% | "
@@ -363,8 +388,9 @@ def train(args):
                   f"LR: {lr:.2e} | "
                   f"Tok/s: {toks_per_sec:.0f} | "
                   f"VRAM: {peak_vram:.1f}GB" +
-                  (f" | K: {avg_K:.1f}" if avg_K > 0 else ""))
-            
+                  (f" | K: {avg_K:.1f}" if avg_K > 0 else "") +
+                  (f" | ponder: {avg_ponder:.3f}" if avg_ponder > 0 else ""))
+
             logger.log(
                 step=global_step,
                 phase=phase,
@@ -373,10 +399,12 @@ def train(args):
                 tokens_per_sec=toks_per_sec,
                 peak_vram_gb=peak_vram,
                 avg_inner_steps=avg_K,
+                ponder=avg_ponder,
             )
-            
+
             running_loss = 0.0
             running_inner_steps = 0.0
+            running_ponder = 0.0
         
         # Evaluation
         if global_step % args.eval_interval == 0:
@@ -452,10 +480,17 @@ def main():
     
     # Model
     parser.add_argument("--model_size", type=str, default="nano",
-                       choices=["nano", "300M", "1B", "1B-16k"])
+                       choices=["nano", "50M", "125M", "300M", "350M", "760M", "1B", "1B-16k"])
     parser.add_argument("--variant", type=str, default="baseline",
                        choices=["baseline", "shared_loop", "latent", "act", "ssm", "ssm_mem"])
     parser.add_argument("--tokenizer", type=str, default="gpt2")
+    parser.add_argument("--K", type=int, default=4, help="Fixed inner steps for latent/ssm")
+    parser.add_argument("--min_K", type=int, default=2, help="Minimum ACT steps")
+    parser.add_argument("--max_K", type=int, default=8, help="Maximum ACT steps")
+    parser.add_argument("--lambda_ponder", type=float, default=0.01, help="Ponder cost weight for ACT")
+    parser.add_argument("--thought_tokens", type=int, default=16, help="Number of latent thought tokens")
+    parser.add_argument("--num_mem", type=int, default=64, help="Memory tokens for ssm_mem")
+    parser.add_argument("--local_window", type=int, default=0, help="Local window for thought attention")
     
     # Curriculum
     parser.add_argument("--alg_tokens", type=int, default=100_000_000,
