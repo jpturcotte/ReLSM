@@ -25,7 +25,7 @@ from typing import List, Dict, Optional, Tuple, Iterator, Callable
 from dataclasses import dataclass
 from itertools import cycle
 import torch
-from torch.utils.data import Dataset, DataLoader, IterableDataset
+from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
 
 
 # =============================================================================
@@ -39,10 +39,11 @@ class AlgorithmicGenerator:
     """
     
     @staticmethod
-    def modular_arithmetic(mod: int = 97) -> Dict[str, str]:
+    def modular_arithmetic(mod: int = 97, rng: Optional[random.Random] = None) -> Dict[str, str]:
         """Modular addition: (a + b) mod p"""
-        a = random.randint(0, mod - 1)
-        b = random.randint(0, mod - 1)
+        rng = rng or random
+        a = rng.randint(0, mod - 1)
+        b = rng.randint(0, mod - 1)
         result = (a + b) % mod
         
         return {
@@ -53,9 +54,10 @@ class AlgorithmicGenerator:
         }
     
     @staticmethod
-    def parity(length: int = 8) -> Dict[str, str]:
+    def parity(length: int = 8, rng: Optional[random.Random] = None) -> Dict[str, str]:
         """Parity of binary string"""
-        bits = [random.randint(0, 1) for _ in range(length)]
+        rng = rng or random
+        bits = [rng.randint(0, 1) for _ in range(length)]
         parity = sum(bits) % 2
         bit_str = "".join(map(str, bits))
         
@@ -67,11 +69,12 @@ class AlgorithmicGenerator:
         }
     
     @staticmethod
-    def addition(max_digits: int = 4) -> Dict[str, str]:
+    def addition(max_digits: int = 4, rng: Optional[random.Random] = None) -> Dict[str, str]:
         """Multi-digit addition"""
-        digits = random.randint(1, max_digits)
-        a = random.randint(10**(digits-1), 10**digits - 1) if digits > 1 else random.randint(0, 9)
-        b = random.randint(10**(digits-1), 10**digits - 1) if digits > 1 else random.randint(0, 9)
+        rng = rng or random
+        digits = rng.randint(1, max_digits)
+        a = rng.randint(10**(digits-1), 10**digits - 1) if digits > 1 else rng.randint(0, 9)
+        b = rng.randint(10**(digits-1), 10**digits - 1) if digits > 1 else rng.randint(0, 9)
         result = a + b
         
         return {
@@ -82,10 +85,11 @@ class AlgorithmicGenerator:
         }
     
     @staticmethod
-    def multiplication(max_val: int = 99) -> Dict[str, str]:
+    def multiplication(max_val: int = 99, rng: Optional[random.Random] = None) -> Dict[str, str]:
         """Two-digit multiplication"""
-        a = random.randint(2, max_val)
-        b = random.randint(2, max_val)
+        rng = rng or random
+        a = rng.randint(2, max_val)
+        b = rng.randint(2, max_val)
         result = a * b
         
         return {
@@ -96,9 +100,10 @@ class AlgorithmicGenerator:
         }
     
     @staticmethod
-    def copy_sequence(length: int = 8) -> Dict[str, str]:
+    def copy_sequence(length: int = 8, rng: Optional[random.Random] = None) -> Dict[str, str]:
         """Copy task - tests basic sequence modeling"""
-        seq = [random.randint(0, 9) for _ in range(length)]
+        rng = rng or random
+        seq = [rng.randint(0, 9) for _ in range(length)]
         seq_str = " ".join(map(str, seq))
         
         return {
@@ -109,9 +114,10 @@ class AlgorithmicGenerator:
         }
     
     @staticmethod
-    def reverse_sequence(length: int = 8) -> Dict[str, str]:
+    def reverse_sequence(length: int = 8, rng: Optional[random.Random] = None) -> Dict[str, str]:
         """Reverse task - tests sequential reasoning"""
-        seq = [random.randint(0, 9) for _ in range(length)]
+        rng = rng or random
+        seq = [rng.randint(0, 9) for _ in range(length)]
         seq_str = " ".join(map(str, seq))
         rev_str = " ".join(map(str, reversed(seq)))
         
@@ -123,8 +129,9 @@ class AlgorithmicGenerator:
         }
     
     @staticmethod
-    def dyck_language(max_depth: int = 4, length: int = 8) -> Dict[str, str]:
+    def dyck_language(max_depth: int = 4, length: int = 8, rng: Optional[random.Random] = None) -> Dict[str, str]:
         """Dyck language (balanced parentheses) - tests stack operations"""
+        rng = rng or random
         # Generate valid Dyck sequence
         seq = []
         depth = 0
@@ -136,7 +143,7 @@ class AlgorithmicGenerator:
                 seq.append(")")
                 depth -= 1
             else:
-                if random.random() < 0.5:
+                if rng.random() < 0.5:
                     seq.append("(")
                     depth += 1
                 else:
@@ -158,14 +165,15 @@ class AlgorithmicGenerator:
         }
     
     @staticmethod
-    def chain_arithmetic(n_ops: int = 3) -> Dict[str, str]:
+    def chain_arithmetic(n_ops: int = 3, rng: Optional[random.Random] = None) -> Dict[str, str]:
         """Chain of arithmetic operations"""
-        val = random.randint(1, 50)
+        rng = rng or random
+        val = rng.randint(1, 50)
         expr = str(val)
-        
+
         for _ in range(n_ops):
-            op = random.choice(["+", "-"])
-            operand = random.randint(1, 20)
+            op = rng.choice(["+", "-"])
+            operand = rng.randint(1, 20)
             expr += f" {op} {operand}"
             val = val + operand if op == "+" else val - operand
         
@@ -177,10 +185,11 @@ class AlgorithmicGenerator:
         }
     
     @staticmethod
-    def comparison(max_val: int = 1000) -> Dict[str, str]:
+    def comparison(max_val: int = 1000, rng: Optional[random.Random] = None) -> Dict[str, str]:
         """Number comparison"""
-        a = random.randint(1, max_val)
-        b = random.randint(1, max_val)
+        rng = rng or random
+        a = rng.randint(1, max_val)
+        b = rng.randint(1, max_val)
         result = ">" if a > b else ("<" if a < b else "=")
         
         return {
@@ -191,20 +200,53 @@ class AlgorithmicGenerator:
         }
     
     @staticmethod
-    def successor(max_val: int = 1000) -> Dict[str, str]:
+    def successor(max_val: int = 1000, rng: Optional[random.Random] = None) -> Dict[str, str]:
         """Successor function"""
-        n = random.randint(0, max_val)
+        rng = rng or random
+        n = rng.randint(0, max_val)
         return {
             "text": f"succ({n}) = {n + 1}",
             "input": f"succ({n}) =",
             "target": str(n + 1),
             "task": "successor",
         }
-    
+
     @classmethod
-    def generate_batch(cls, n: int, tasks: Optional[List[str]] = None) -> List[Dict]:
+    def generate_batch(
+        cls,
+        n: int,
+        tasks: Optional[List[str]] = None,
+        rng: Optional[random.Random] = None,
+    ) -> List[Dict]:
         """Generate mixed batch of algorithmic tasks."""
-        generators = {
+        rng = rng or random
+        generators = cls._get_generators()
+        
+        if tasks is None:
+            tasks = list(generators.keys())
+        
+        return [cls.generate_example(tasks=tasks, rng=rng, generators=generators) for _ in range(n)]
+
+    @classmethod
+    def generate_example(
+        cls,
+        tasks: Optional[List[str]] = None,
+        rng: Optional[random.Random] = None,
+        generators: Optional[Dict[str, Callable]] = None,
+    ) -> Dict:
+        rng = rng or random
+        if generators is None:
+            generators = cls._get_generators()
+
+        if tasks is None:
+            tasks = list(generators.keys())
+
+        task = rng.choice(tasks)
+        return generators[task](rng=rng)
+
+    @classmethod
+    def _get_generators(cls) -> Dict[str, Callable]:
+        return {
             "mod_add": cls.modular_arithmetic,
             "parity": cls.parity,
             "addition": cls.addition,
@@ -216,24 +258,14 @@ class AlgorithmicGenerator:
             "compare": cls.comparison,
             "successor": cls.successor,
         }
-        
-        if tasks is None:
-            tasks = list(generators.keys())
-        
-        examples = []
-        for _ in range(n):
-            task = random.choice(tasks)
-            examples.append(generators[task]())
-        
-        return examples
 
 
-class AlgorithmicDataset(Dataset):
+class AlgorithmicDataset(IterableDataset):
     """
     Dataset for Phase 1: Algorithmic Grokking.
-    Regenerates data each epoch - infinite procedural generation.
+    Generates fresh data each epoch for true procedural sampling.
     """
-    
+
     def __init__(
         self,
         tokenizer,
@@ -246,45 +278,73 @@ class AlgorithmicDataset(Dataset):
         self.num_examples = num_examples
         self.max_seq_len = max_seq_len
         self.tasks = tasks
-        
-        if seed is not None:
-            random.seed(seed)
-        
-        # Generate initial batch
-        self._regenerate()
-    
-    def _regenerate(self):
-        """Regenerate all examples - call between epochs for fresh data."""
-        self.examples = AlgorithmicGenerator.generate_batch(self.num_examples, self.tasks)
-    
+        self.seed = seed
+
+        self._char_token_map = self._build_char_token_map()
+
+    def _build_char_token_map(self) -> Dict[str, int]:
+        """Precompute a fast char->id map for synthetic strings."""
+        chars = "0123456789()+-*=? "
+        chars += "abcdefghijklmnopqrstuvwxyz"
+        chars += "ABCDEFGHIJKLMNOPQRSTUVWXYZ"  # For future-proofing
+        chars += ":,"  # punctuation used in prompts
+
+        token_map = {}
+        for ch in set(chars):
+            encoded = self.tokenizer.encode(ch, add_special_tokens=False)
+            if len(encoded) == 1:
+                token_map[ch] = encoded[0]
+        return token_map
+
+    def _encode_text(self, text: str) -> List[int]:
+        """Encode text quickly using the char map when possible."""
+        if self._char_token_map and all(ch in self._char_token_map for ch in text):
+            core_tokens = [self._char_token_map[ch] for ch in text]
+            return self.tokenizer.build_inputs_with_special_tokens(core_tokens)
+        return self.tokenizer.encode(text, add_special_tokens=True)
+
     def __len__(self):
         return self.num_examples
-    
-    def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
-        example = self.examples[idx]
-        text = example["text"]
-        
-        # Tokenize
-        tokens = self.tokenizer.encode(text, add_special_tokens=True)
-        
-        if len(tokens) > self.max_seq_len:
-            tokens = tokens[:self.max_seq_len]
-        
-        input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
-        labels = torch.tensor(tokens[1:], dtype=torch.long)
-        
-        # Pad
-        pad_len = self.max_seq_len - 1 - len(input_ids)
-        if pad_len > 0:
-            pad_id = self.tokenizer.pad_token_id or 0
-            input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
-            labels = torch.cat([labels, torch.full((pad_len,), -100)])
-        
-        return {
-            "input_ids": input_ids,
-            "labels": labels,
-            "task": example["task"],
-        }
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        worker_info = get_worker_info()
+
+        if self.seed is not None:
+            seed = self.seed + (worker_info.id if worker_info is not None else 0)
+        else:
+            seed = random.SystemRandom().randint(0, 2**63 - 1)
+            if worker_info is not None:
+                seed += worker_info.id
+
+        rng = random.Random(seed)
+        generators = AlgorithmicGenerator._get_generators()
+
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+
+        for _ in range(worker_id, self.num_examples, num_workers):
+            example = AlgorithmicGenerator.generate_example(
+                tasks=self.tasks, rng=rng, generators=generators
+            )
+            tokens = self._encode_text(example["text"])
+
+            if len(tokens) > self.max_seq_len:
+                tokens = tokens[:self.max_seq_len]
+
+            input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
+            labels = torch.tensor(tokens[1:], dtype=torch.long)
+
+            pad_len = self.max_seq_len - 1 - len(input_ids)
+            if pad_len > 0:
+                pad_id = self.tokenizer.pad_token_id or 0
+                input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
+                labels = torch.cat([labels, torch.full((pad_len,), -100)])
+
+            yield {
+                "input_ids": input_ids,
+                "labels": labels,
+                "task": example["task"],
+            }
 
 
 # =============================================================================
@@ -622,7 +682,7 @@ def create_curriculum_loaders(
     alg_loader = DataLoader(
         alg_dataset,
         batch_size=alg_batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
     )
