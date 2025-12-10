@@ -24,10 +24,13 @@ import sys
 import time
 import math
 import json
+import random
 import argparse
 from pathlib import Path
 from contextlib import nullcontext
 from typing import Optional, Dict, List
+
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -168,14 +171,22 @@ def evaluate_perplexity(model, val_loader, device, ctx, max_batches: int = 50) -
 
 def train(args):
     """Main training loop with split curriculum."""
-    
+
     # =========================================================================
     # SETUP
     # =========================================================================
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
@@ -244,7 +255,7 @@ def train(args):
         tokenizer=tokenizer,
         num_examples=args.alg_examples,
         max_seq_len=args.alg_seq_len,
-        seed=42,
+        seed=args.seed,
     )
     alg_loader = DataLoader(
         alg_dataset,
@@ -511,12 +522,13 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--grad_accum_steps", type=int, default=4)
-    
+
     # Logging
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--eval_interval", type=int, default=500)
-    
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+
     args = parser.parse_args()
     train(args)
 
