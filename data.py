@@ -428,6 +428,7 @@ def load_language_dataset(
 
     num_shards = max(1, num_shards)
     shard_index = min(max(shard_index, 0), num_shards - 1)
+    requested_shard_index = shard_index
     shardable = True
     if num_shards > 1:
         try:
@@ -442,11 +443,13 @@ def load_language_dataset(
                 )
             shardable = False
             num_shards = 1
-            shard_index = 0
 
-    if not shardable and shard_index > 0:
+    if not shardable and requested_shard_index > 0:
         if log:
-            print(f"  Skipping worker {shard_index} for {config.name} (no sharding support)")
+            print(
+                f"  Skipping worker {requested_shard_index} "
+                f"for {config.name} (no sharding support)"
+            )
         return iter(())
 
     if not shardable and config.max_samples is not None:
