@@ -486,6 +486,8 @@ class LanguageDataset(IterableDataset):
         config_items = list(self.configs.items())
         random.Random(42 + worker_id).shuffle(config_items)
 
+        active_streams: List[Tuple[LanguageDataConfig, Iterator[Dict[str, str]]]] = []
+
         for _, config in config_items:
             if config.max_samples is not None and num_workers > 1:
                 base = config.max_samples // num_workers
@@ -505,7 +507,16 @@ class LanguageDataset(IterableDataset):
                 shard_index=worker_id,
                 max_samples_override=worker_max_samples,
             )
-            for example in stream:
+            active_streams.append((config, iter(stream)))
+
+        while active_streams:
+            next_round: List[Tuple[LanguageDataConfig, Iterator[Dict[str, str]]]] = []
+            for config, stream in active_streams:
+                try:
+                    example = next(stream)
+                except StopIteration:
+                    continue
+
                 tokens = self.tokenizer.encode(example["text"], add_special_tokens=True)
                 if len(tokens) > self.max_seq_len:
                     tokens = tokens[:self.max_seq_len]
@@ -520,6 +531,10 @@ class LanguageDataset(IterableDataset):
                     labels = torch.cat([labels, torch.full((pad_len,), -100)])
 
                 yield {"input_ids": input_ids, "labels": labels}
+
+                next_round.append((config, stream))
+
+            active_streams = next_round
 
 
 # =============================================================================
