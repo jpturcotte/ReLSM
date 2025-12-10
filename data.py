@@ -428,6 +428,7 @@ def load_language_dataset(
 
     num_shards = max(1, num_shards)
     shard_index = min(max(shard_index, 0), num_shards - 1)
+    shardable = True
     if num_shards > 1:
         try:
             ds = ds.shard(num_shards=num_shards, index=shard_index, contiguous=True)
@@ -439,10 +440,21 @@ def load_language_dataset(
                     f"  Warning: {config.name} does not support sharding; "
                     "falling back to unsharded stream."
                 )
+            shardable = False
             num_shards = 1
             shard_index = 0
 
-    max_samples = max_samples_override if max_samples_override is not None else config.max_samples
+    if not shardable and shard_index > 0:
+        if log:
+            print(f"  Skipping worker {shard_index} for {config.name} (no sharding support)")
+        return iter(())
+
+    if not shardable and config.max_samples is not None:
+        effective_max_samples = config.max_samples
+    else:
+        effective_max_samples = max_samples_override
+
+    max_samples = effective_max_samples if effective_max_samples is not None else config.max_samples
 
     buffer_size = 10_000
     if max_samples:
@@ -482,9 +494,10 @@ class LanguageDataset(IterableDataset):
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         num_workers = worker_info.num_workers if worker_info is not None else 1
+        rng = random.Random(42 + worker_id)
 
         config_items = list(self.configs.items())
-        random.Random(42 + worker_id).shuffle(config_items)
+        rng.shuffle(config_items)
 
         active_streams: List[Tuple[LanguageDataConfig, Iterator[Dict[str, str]]]] = []
 
@@ -510,31 +523,42 @@ class LanguageDataset(IterableDataset):
             active_streams.append((config, iter(stream)))
 
         while active_streams:
-            next_round: List[Tuple[LanguageDataConfig, Iterator[Dict[str, str]]]] = []
-            for config, stream in active_streams:
-                try:
-                    example = next(stream)
-                except StopIteration:
-                    continue
+            weights = [config.weight for config, _ in active_streams]
+            total_weight = sum(weights)
+            pick = rng.uniform(0, total_weight)
 
-                tokens = self.tokenizer.encode(example["text"], add_special_tokens=True)
-                if len(tokens) > self.max_seq_len:
-                    tokens = tokens[:self.max_seq_len]
+            chosen_index = 0
+            cumulative = 0.0
+            for i, w in enumerate(weights):
+                cumulative += w
+                if pick <= cumulative:
+                    chosen_index = i
+                    break
 
-                input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
-                labels = torch.tensor(tokens[1:], dtype=torch.long)
+            config, stream = active_streams[chosen_index]
 
-                pad_len = self.max_seq_len - 1 - len(input_ids)
-                if pad_len > 0:
-                    pad_id = self.tokenizer.pad_token_id or 0
-                    input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
-                    labels = torch.cat([labels, torch.full((pad_len,), -100)])
+            try:
+                example = next(stream)
+            except StopIteration:
+                active_streams.pop(chosen_index)
+                continue
 
-                yield {"input_ids": input_ids, "labels": labels}
+            tokens = self.tokenizer.encode(example["text"], add_special_tokens=True)
+            if len(tokens) > self.max_seq_len:
+                tokens = tokens[:self.max_seq_len]
 
-                next_round.append((config, stream))
+            input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
+            labels = torch.tensor(tokens[1:], dtype=torch.long)
 
-            active_streams = next_round
+            pad_len = self.max_seq_len - 1 - len(input_ids)
+            if pad_len > 0:
+                pad_id = self.tokenizer.pad_token_id or 0
+                input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
+                labels = torch.cat([labels, torch.full((pad_len,), -100)])
+
+            yield {"input_ids": input_ids, "labels": labels}
+
+            active_streams[chosen_index] = (config, stream)
 
 
 # =============================================================================
