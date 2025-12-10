@@ -59,6 +59,7 @@ class AlgorithmicEvaluator:
 
     def _generate(self, prompt: str, max_tokens: int = 20) -> str:
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+        input_len = input_ids.shape[1]
 
         with self._generation_context():
             with torch.no_grad():
@@ -69,8 +70,9 @@ class AlgorithmicEvaluator:
                     top_k=1,
                 )
         
-        generated = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        return generated[len(prompt):].strip()
+        generated_tokens = output_ids[0, input_len:]
+        generated = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        return generated.strip()
     
     def _extract_answer(self, text: str) -> str:
         """Extract first number or word from response."""
@@ -159,6 +161,7 @@ class OODLengthEvaluator:
 
     def _generate(self, prompt: str, max_tokens: int = 50) -> str:
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+        input_len = input_ids.shape[1]
 
         with self._generation_context():
             with torch.no_grad():
@@ -169,7 +172,8 @@ class OODLengthEvaluator:
                     top_k=1,
                 )
         
-        return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)[len(prompt):].strip()
+        generated_tokens = output_ids[0, input_len:]
+        return self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
     
     def evaluate_parity_ood(self, lengths: List[int], n_per_length: int = 20) -> EvalResult:
         """Test parity at various lengths."""
