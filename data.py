@@ -319,7 +319,10 @@ class AlgorithmicDataset(IterableDataset):
         rng = random.Random(seed)
         generators = AlgorithmicGenerator._get_generators()
 
-        for _ in range(self.num_examples):
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+
+        for _ in range(worker_id, self.num_examples, num_workers):
             example = AlgorithmicGenerator.generate_example(
                 tasks=self.tasks, rng=rng, generators=generators
             )
