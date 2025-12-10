@@ -390,7 +390,14 @@ LANGUAGE_CONFIGS = {
 
 
 def load_language_dataset(
-    config: LanguageDataConfig, tokenizer, max_seq_len: int, *, log: bool = True
+    config: LanguageDataConfig,
+    tokenizer,
+    max_seq_len: int,
+    *,
+    log: bool = True,
+    num_shards: int = 1,
+    shard_index: int = 0,
+    max_samples_override: Optional[int] = None,
 ) -> Iterable[Dict[str, str]]:
     """Stream a language dataset without loading it fully into memory."""
     from datasets import load_dataset
@@ -419,10 +426,17 @@ def load_language_dataset(
             print(f"  Failed: {e}")
         return iter(())
 
+    num_shards = max(1, num_shards)
+    shard_index = min(max(shard_index, 0), num_shards - 1)
+    if num_shards > 1:
+        ds = ds.shard(num_shards=num_shards, index=shard_index, contiguous=True)
+
+    max_samples = max_samples_override if max_samples_override is not None else config.max_samples
+
     buffer_size = 10_000
-    if config.max_samples:
-        buffer_size = min(buffer_size, config.max_samples)
-        ds = ds.shuffle(seed=42, buffer_size=buffer_size).take(config.max_samples)
+    if max_samples:
+        buffer_size = min(buffer_size, max_samples)
+        ds = ds.shuffle(seed=42, buffer_size=buffer_size).take(max_samples)
     else:
         ds = ds.shuffle(seed=42, buffer_size=buffer_size)
 
@@ -462,13 +476,20 @@ class LanguageDataset(IterableDataset):
         random.Random(42 + worker_id).shuffle(config_items)
 
         for _, config in config_items:
-            stream = load_language_dataset(
-                config, self.tokenizer, self.max_seq_len, log=(worker_id == 0)
-            )
-            for idx, example in enumerate(stream):
-                if idx % num_workers != worker_id:
-                    continue
+            worker_max_samples = None
+            if config.max_samples is not None and num_workers > 1:
+                worker_max_samples = math.ceil(config.max_samples / num_workers)
 
+            stream = load_language_dataset(
+                config,
+                self.tokenizer,
+                self.max_seq_len,
+                log=(worker_id == 0),
+                num_shards=num_workers,
+                shard_index=worker_id,
+                max_samples_override=worker_max_samples,
+            )
+            for example in stream:
                 tokens = self.tokenizer.encode(example["text"], add_special_tokens=True)
                 if len(tokens) > self.max_seq_len:
                     tokens = tokens[:self.max_seq_len]
