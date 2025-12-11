@@ -49,6 +49,43 @@ else:
         _selective_scan_fn = getattr(_module, "selective_scan_fn", None)
 
 
+@torch.jit.script
+def ssm_scan_jit(
+    B_t_exp: torch.Tensor,
+    C_t_exp: torch.Tensor,
+    dt_exp: torch.Tensor,
+    A_exp_groups: torch.Tensor,
+    state: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    JIT-compiled Selective Scan.
+    Optimizes the sequential loop to run in C++ rather than Python.
+    """
+    B_sz, T, E_flat = dt_exp.shape
+
+    # Reshape A for broadcasting: (G*group_size, N) -> (1, 1, G*group_size, N)
+    A_exp = A_exp_groups.unsqueeze(0).unsqueeze(0)
+
+    outputs: List[torch.Tensor] = []
+
+    for t in range(T):
+        dt_t = dt_exp[:, t].unsqueeze(-1)             # (B, E, 1)
+        A_bar = torch.exp(dt_t * A_exp)               # Discretization
+
+        # Recurrence: h_t = A_bar * h_{t-1} + B_bar * x_t
+        # B_t_exp[:, t] is (B, E, N)
+        state = A_bar * state + dt_t * B_t_exp[:, t]
+
+        # Readout: y_t = sum(state * C_t, dim=-1)
+        # C_t_exp[:, t] is (B, E, N)
+        y_t = (state * C_t_exp[:, t]).sum(dim=-1)     # (B, E)
+        outputs.append(y_t)
+
+    # Stack along time dimension
+    y = torch.stack(outputs, dim=1)
+    return y, state
+
+
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -475,14 +512,15 @@ class SSMBlock(nn.Module):
             v = F.pad(v, (0, pad))
         v_group = v.view(B, T, self.groups, self.group_size)
 
-        # Project inputs to SSM parameters (grouped)
+        # Project inputs to SSM parameters
         B_t = self.B_proj(v).view(B, T, self.groups, self.N)
         C_t = self.C_proj(v).view(B, T, self.groups, self.N)
         dt = F.softplus(self.dt_proj(v)).view(B, T, self.groups)
 
-        # Decay parameter (A) shared across time; ensure negative values
+        # Decay parameter (A)
         A = -torch.exp(self.A_log)  # (groups, N)
 
+        # 1. Try accelerated CUDA kernel first (if available)
         if self.use_accelerated_scan and _selective_scan_fn is not None:
             initial_state = cache_state
             if initial_state is None:
@@ -516,28 +554,25 @@ class SSMBlock(nn.Module):
                     RuntimeWarning,
                 )
 
+        # 2. Fallback: JIT-Compiled Python Loop
         if cache_state is None:
             state = v.new_zeros(B, self.groups * self.group_size, self.N, dtype=torch.float32)
         else:
             state = cache_state.float()
 
+        # Expand dimensions for the scan (B/C/dt shared across group_size)
         B_t_exp = B_t.repeat_interleave(self.group_size, dim=2)
         C_t_exp = C_t.repeat_interleave(self.group_size, dim=2)
         dt_exp = dt.repeat_interleave(self.group_size, dim=2)
         A_exp_groups = A.repeat_interleave(self.group_size, dim=0)
 
-        outputs = []
-        A_exp = A_exp_groups.unsqueeze(0).unsqueeze(0)
-        for t in range(T):
-            dt_t = dt_exp[:, t].unsqueeze(-1)             # (B,G*group_size,1)
-            A_bar = torch.exp(dt_t * A_exp)               # discretization
-            state = A_bar * state + dt_t * B_t_exp[:, t]
-            y_t_group = (state * C_t_exp[:, t]).sum(dim=-1)   # (B,G*group_size)
-            y_t = y_t_group.view(B, self.groups, self.group_size).reshape(B, -1)[..., :E]
-            outputs.append(y_t)
+        # CALL JIT FUNCTION HERE
+        y_flat, state = ssm_scan_jit(B_t_exp, C_t_exp, dt_exp, A_exp_groups, state)
 
-        y = torch.stack(outputs, dim=1).to(v.dtype)
-        return y, state.detach()
+        # Reshape output to match original dimensions
+        y = y_flat.view(B, T, self.groups, self.group_size).reshape(B, T, -1)[..., :E]
+
+        return y.to(v.dtype), state.detach()
 
     def forward(
         self,
