@@ -233,7 +233,14 @@ def train(args):
         **extra_kwargs,
     )
     model = model.to(device)
-    
+
+    # Optimize model execution
+    if hasattr(torch, "compile"):
+        print("Compiling model with torch.compile...")
+        # 'reduce-overhead' is excellent for smaller models or CPU training
+        # If this errors on your setup, try mode="default"
+        model = torch.compile(model, mode="reduce-overhead")
+
     config = model.config
     
     print(f"\nModel: {args.model_size} / {args.variant}")
