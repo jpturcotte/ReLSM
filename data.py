@@ -666,7 +666,8 @@ class CurriculumSampler:
                 return choice
         return "lang"  # Fallback
 
-    def _next_from_loader(self, loader: DataLoader, iter_name: str) -> Dict[str, torch.Tensor]:
+    def _next_from_loader(self, loader_name: str, iter_name: str) -> Dict[str, torch.Tensor]:
+        loader = getattr(self, loader_name)
         iterator = getattr(self, iter_name)
         try:
             return next(iterator)
@@ -678,11 +679,11 @@ class CurriculumSampler:
     def next_batch(self) -> Dict[str, torch.Tensor]:
         source = self._sample_source()
         if source == "alg":
-            batch = self._next_from_loader(self.alg_loader, "alg_iter")
+            batch = self._next_from_loader("alg_loader", "alg_iter")
         elif source == "lex" and self.lex_iter is not None and self.lex_loader is not None:
-            batch = self._next_from_loader(self.lex_loader, "lex_iter")
+            batch = self._next_from_loader("lex_loader", "lex_iter")
         else:
-            batch = self._next_from_loader(self.lang_loader, "lang_iter")
+            batch = self._next_from_loader("lang_loader", "lang_iter")
 
         # Count tokens (non-padding)
         n_tokens = (batch["labels"] != -100).sum().item()
@@ -692,6 +693,9 @@ class CurriculumSampler:
 
     def reset(self):
         self.tokens_seen = 0
+        self.alg_iter = iter(self.alg_loader)
+        self.lang_iter = iter(self.lang_loader)
+        self.lex_iter = iter(self.lex_loader) if self.lex_loader is not None else None
 
 
 # =============================================================================
