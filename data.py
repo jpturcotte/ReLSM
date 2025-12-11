@@ -23,7 +23,6 @@ import random
 import math
 from typing import List, Dict, Optional, Tuple, Iterator, Callable, Iterable
 from dataclasses import dataclass
-from itertools import cycle
 import torch
 from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
 
@@ -591,9 +590,13 @@ class CurriculumSampler:
                 "persistent_alg_frac must be between 0.0 and 0.9 (recommended 0.05–0.3)"
             )
 
-        self.alg_iter = cycle(iter(alg_loader))
-        self.lang_iter = cycle(iter(lang_loader))
-        self.lex_iter = cycle(iter(lex_loader)) if lex_loader is not None else None
+        self.alg_loader = alg_loader
+        self.lang_loader = lang_loader
+        self.lex_loader = lex_loader
+
+        self.alg_iter = iter(self.alg_loader)
+        self.lang_iter = iter(self.lang_loader)
+        self.lex_iter = iter(self.lex_loader) if self.lex_loader is not None else None
 
         self.total_tokens = total_tokens
         self.alg_tokens = alg_tokens
@@ -663,14 +666,24 @@ class CurriculumSampler:
                 return choice
         return "lang"  # Fallback
 
+    def _next_from_loader(self, loader_name: str, iter_name: str) -> Dict[str, torch.Tensor]:
+        loader = getattr(self, loader_name)
+        iterator = getattr(self, iter_name)
+        try:
+            return next(iterator)
+        except StopIteration:
+            iterator = iter(loader)
+            setattr(self, iter_name, iterator)
+            return next(iterator)
+
     def next_batch(self) -> Dict[str, torch.Tensor]:
         source = self._sample_source()
         if source == "alg":
-            batch = next(self.alg_iter)
-        elif source == "lex" and self.lex_iter is not None:
-            batch = next(self.lex_iter)
+            batch = self._next_from_loader("alg_loader", "alg_iter")
+        elif source == "lex" and self.lex_iter is not None and self.lex_loader is not None:
+            batch = self._next_from_loader("lex_loader", "lex_iter")
         else:
-            batch = next(self.lang_iter)
+            batch = self._next_from_loader("lang_loader", "lang_iter")
 
         # Count tokens (non-padding)
         n_tokens = (batch["labels"] != -100).sum().item()
@@ -680,6 +693,9 @@ class CurriculumSampler:
 
     def reset(self):
         self.tokens_seen = 0
+        self.alg_iter = iter(self.alg_loader)
+        self.lang_iter = iter(self.lang_loader)
+        self.lex_iter = iter(self.lex_loader) if self.lex_loader is not None else None
 
 
 # =============================================================================
