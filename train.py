@@ -169,6 +169,51 @@ def evaluate_perplexity(model, val_loader, device, ctx, max_batches: int = 50) -
     return math.exp(min(avg_loss, 20))
 
 
+def build_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> torch.optim.Optimizer:
+    """Create AdamW optimizer with decay and no-decay parameter groups."""
+
+    decay_params = []
+    no_decay_params = []
+
+    ssm_terms = ["a_log", "dt_bias"]
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        name_lower = name.lower()
+        if (
+            name.endswith(".bias")
+            or "norm" in name_lower
+            or "tok_emb" in name_lower
+            or "lm_head" in name_lower
+            or name_lower.endswith(".d")
+            or any(term in name_lower for term in ssm_terms)
+        ):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    param_groups = []
+    if decay_params:
+        param_groups.append({"params": decay_params, "weight_decay": weight_decay})
+    if no_decay_params:
+        param_groups.append(
+            {
+                "params": no_decay_params,
+                # Exclude SSM internals and normalization scales from weight decay
+                # to avoid distorting their specialized parameterization.
+                "weight_decay": 0.0,
+            }
+        )
+
+    n_decay = sum(p.numel() for p in decay_params)
+    n_no_decay = sum(p.numel() for p in no_decay_params)
+    print(f"[optimizer] decay params: {n_decay:,}, no_decay params: {n_no_decay:,}")
+
+    return torch.optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.95))
+
+
 def train(args):
     """Main training loop with split curriculum."""
 
@@ -299,13 +344,8 @@ def train(args):
     # =========================================================================
     # OPTIMIZER
     # =========================================================================
-    
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.max_lr,
-        betas=(0.9, 0.95),
-        weight_decay=args.weight_decay,
-    )
+
+    optimizer = build_optimizer(model, lr=args.max_lr, weight_decay=args.weight_decay)
     
     # Mixed precision
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
