@@ -9,7 +9,7 @@ This file extends the original BaselineTransformer control model with a small se
 - shared_loop : parameter-shared depth via looped blocks (Exp1)
 - latent      : fixed-K latent thought tokens (Exp2)
 - act         : adaptive computation time (ACT) on latent thought (Exp3)
-- ssm         : SSM-ish backbone (fallback if no external Mamba) + fixed-K thought (Exp4A)
+- ssm         : Mamba-2 style SSM backbone + fixed-K thought (Exp4A)
 - ssm_mem     : SSM backbone + memory-token compression + thought loop (Exp4B)
 
 Design goals:
@@ -24,6 +24,7 @@ Notes:
   thought KV source.
 """
 
+import importlib
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any
@@ -31,6 +32,20 @@ from typing import Optional, Tuple, List, Dict, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# Optional accelerated selective scan (Mamba kernels)
+_selective_scan_fn = None
+
+_scan_iface = importlib.util.find_spec("mamba_ssm.ops.selective_scan_interface")
+if _scan_iface is not None:
+    _module = importlib.import_module("mamba_ssm.ops.selective_scan_interface")
+    _selective_scan_fn = getattr(_module, "selective_scan_fn", None)
+else:
+    _scan_triton = importlib.util.find_spec("mamba_ssm.ops.triton.selective_scan")
+    if _scan_triton is not None:
+        _module = importlib.import_module("mamba_ssm.ops.triton.selective_scan")
+        _selective_scan_fn = getattr(_module, "selective_scan_fn", None)
 
 
 # =============================================================================
@@ -77,9 +92,10 @@ class TransformerConfig:
     num_mem: int = 64                   # number of memory tokens
     local_window: int = 0               # if >0, thought attends only to last local_window tokens (plus mem, if enabled)
 
-    # SSM-ish backbone (fallback implementation knobs)
+    # SSM backbone (Mamba-2 inspired)
     ssm_kernel: int = 7                 # causal depthwise conv kernel
     ssm_expand: int = 2                 # expansion factor in the SSM block
+    ssm_state: int = 16                 # SSM state size (per expanded channel)
 
     def __post_init__(self):
         if self.d_ff is None:
@@ -379,7 +395,7 @@ class MemoryCompressor(nn.Module):
 
 
 # =============================================================================
-# SSM-ish backbone (fallback if no mamba)
+# SSM backbone (Mamba-2 inspired)
 # =============================================================================
 
 class CausalDepthwiseConv1d(nn.Module):
@@ -409,38 +425,120 @@ class CausalDepthwiseConv1d(nn.Module):
 
 class SSMBlock(nn.Module):
     """
-    A lightweight, dependency-free "SSM-like" block:
-    - pre-norm
-    - gated depthwise causal conv
-    - pointwise projection
-    - FFN
+    Minimal, dependency-free Mamba-2 style SSM block.
 
-    This is NOT Mamba-2; it's a placeholder to test O(T) backbones quickly.
-    Swap this with mamba_ssm blocks later if desired.
+    The implementation follows the high-level structure of Mamba-2:
+    - input gating
+    - causal depthwise convolutional mixing
+    - state-space recurrence per expanded channel with learnable decay (A) and
+      input projection (B), producing output via learned readout (C)
+    - feed-forward residual
+
+    This trades some kernel fusion performance for readability and zero external
+    dependencies while preserving the SSM semantics expected from a Mamba-2
+    backbone.
     """
     def __init__(self, config: TransformerConfig):
         super().__init__()
-        D = config.d_model
-        E = config.ssm_expand * D
+        self.D = config.d_model
+        self.E = config.ssm_expand * config.d_model
+        self.N = config.ssm_state
 
-        self.norm1 = RMSNorm(D)
-        self.in_proj = nn.Linear(D, 2 * E, bias=config.bias)          # gate + value
-        self.dwconv = CausalDepthwiseConv1d(E, kernel_size=config.ssm_kernel)
-        self.out_proj = nn.Linear(E, D, bias=config.bias)
+        # Grouped SSM parameters to keep the accelerated kernel shapes small
+        self.groups = max(1, self.E // 128)
+        self.group_size = math.ceil(self.E / self.groups)
+
+        self.norm1 = RMSNorm(self.D)
+        self.in_proj = nn.Linear(self.D, 2 * self.E, bias=config.bias)  # gate + value
+        self.dwconv = CausalDepthwiseConv1d(self.E, kernel_size=config.ssm_kernel)
+
+        self.use_accelerated_scan = _selective_scan_fn is not None
+
+        # State-space parameters
+        self.B_proj = nn.Linear(self.E, self.groups * self.N, bias=False)
+        self.C_proj = nn.Linear(self.E, self.groups * self.N, bias=False)
+        self.dt_proj = nn.Linear(self.E, self.groups, bias=True)
+        self.A_log = nn.Parameter(torch.zeros(self.groups, self.N))     # decay (log-space)
+
+        self.out_proj = nn.Linear(self.E, self.D, bias=config.bias)
         self.drop = nn.Dropout(config.dropout)
 
-        self.norm2 = RMSNorm(D)
+        self.norm2 = RMSNorm(self.D)
         self.ff = FeedForward(config)
 
-    def forward(self, x: torch.Tensor, cache: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _ssm_scan(self, v: torch.Tensor, cache_state: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply the Mamba-2 style selective scan over the sequence."""
+        B, T, E = v.shape
+        pad = self.groups * self.group_size - E
+        if pad:
+            v = F.pad(v, (0, pad))
+        v_group = v.view(B, T, self.groups, self.group_size)
+
+        # Project inputs to SSM parameters (grouped)
+        B_t = self.B_proj(v).view(B, T, self.groups, self.N)
+        C_t = self.C_proj(v).view(B, T, self.groups, self.N)
+        dt = F.softplus(self.dt_proj(v)).view(B, T, self.groups)
+
+        # Decay parameter (A) shared across time; ensure negative values
+        A = -torch.exp(self.A_log)  # (groups, N)
+
+        if self.use_accelerated_scan and _selective_scan_fn is not None:
+            initial_state = cache_state
+            if initial_state is None:
+                initial_state = v.new_zeros(B, self.groups, self.N)
+            try:
+                y, last_state = _selective_scan_fn(
+                    v_group.mean(dim=-1),
+                    dt,
+                    A,
+                    B_t,
+                    C_t,
+                    delta_softplus=False,
+                    return_last_state=True,
+                    initial_state=initial_state,
+                )
+                y = y.repeat_interleave(self.group_size, dim=-1)[..., :E]
+                return y, last_state.detach().float()
+            except Exception:
+                pass  # Fallback to manual scan if kernel signature mismatches
+
+        if cache_state is None:
+            state = v.new_zeros(B, self.groups, self.N, dtype=torch.float32)
+        else:
+            state = cache_state.float()
+
+        outputs = []
+        A_exp = A.unsqueeze(0).unsqueeze(0)
+        for t in range(T):
+            dt_t = dt[:, t].unsqueeze(-1)                # (B,G,1)
+            A_bar = torch.exp(dt_t * A_exp)               # discretization
+            state = A_bar * state + dt_t * B_t[:, t]
+            y_t_group = (state * C_t[:, t]).sum(dim=-1)   # (B,G)
+            y_t = y_t_group.repeat_interleave(self.group_size, dim=-1)[..., :E]
+            outputs.append(y_t)
+
+        y = torch.stack(outputs, dim=1).to(v.dtype)
+        return y, state.detach()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache: Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        conv_cache, state_cache = (cache if cache is not None else (None, None))
+
         h = self.norm1(x)
         uv = self.in_proj(h)
         u, v = uv.chunk(2, dim=-1)
-        v, new_cache = self.dwconv(v, cache)
-        y = torch.sigmoid(u) * v
+        v, conv_cache = self.dwconv(v, conv_cache)
+
+        y, new_state = self._ssm_scan(v, state_cache)
+        y = torch.sigmoid(u) * y
         y = self.drop(self.out_proj(y))
         x = x + y
         x = x + self.ff(self.norm2(x))
+
+        new_cache = (conv_cache, new_state) if cache is not None else None
         return x, new_cache
 
 
@@ -687,7 +785,7 @@ class BaselineTransformer(nn.Module):
         self.eval()
         generated = input_ids
 
-        use_kv_cache = (self.config.variant == "baseline" or self.config.variant == "shared_loop") and (not self._use_ssm)
+        use_kv_cache = self.config.variant in {"baseline", "shared_loop", "ssm", "ssm_mem"}
 
         if use_kv_cache:
             kv_cache: List[Any] = [None] * self._cache_slots

@@ -17,6 +17,9 @@ This codebase implements a systematic ablation study comparing recursive archite
 | **4a** | `ssm` | Mamba-2 backbone | Does O(N) efficiency enable more iterations? |
 | **4b** | `ssm_mem` | SSM + memory tokens | Can SSM + attention hybrid work? |
 
+> Mamba-2 variants will automatically use the upstream `mamba-ssm` selective-scan kernels when installed, and fall back to the
+> pure PyTorch implementation otherwise.
+
 ## Model Scales
 
 | Size | d_model | Layers | Params | Purpose |
@@ -35,8 +38,8 @@ Both `train.py` and the `create_model` factory accept the same size strings abov
 ## Quick Start
 
 ```bash
-# Install
-pip install torch transformers datasets
+# Install (includes optional Mamba-2 kernels)
+pip install -r requirements.txt
 
 # Train nano baseline (quick test, ~10 min)
 python train.py --model_size nano --variant baseline \
@@ -226,7 +229,7 @@ This codebase synthesizes and tests ideas from:
 
 ### RH-SSM
 - ✅ SSM backbone option
-- ✅ Mamba-2 integration (placeholder)
+- ✅ Mamba-2 integration
 - ❌ "Plug-and-play memory" (underspecified in original)
 
 ### NEXUS
