@@ -26,6 +26,7 @@ Notes:
 
 import importlib
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -485,36 +486,54 @@ class SSMBlock(nn.Module):
         if self.use_accelerated_scan and _selective_scan_fn is not None:
             initial_state = cache_state
             if initial_state is None:
-                initial_state = v.new_zeros(B, self.groups, self.N)
+                initial_state = v.new_zeros(B, self.groups * self.group_size, self.N)
+
+            # Broadcast SSM parameters across the per-group channels instead of
+            # compressing the value streams. This mirrors the typical
+            # multi-head treatment where B/C are shared and expanded to match v.
+            B_t_exp = B_t.repeat_interleave(self.group_size, dim=2)
+            C_t_exp = C_t.repeat_interleave(self.group_size, dim=2)
+            dt_exp = dt.repeat_interleave(self.group_size, dim=2)
+            A_exp_groups = A.repeat_interleave(self.group_size, dim=0)
+
+            v_flat = v_group.reshape(B, T, -1)
             try:
                 y, last_state = _selective_scan_fn(
-                    v_group.mean(dim=-1),
-                    dt,
-                    A,
-                    B_t,
-                    C_t,
+                    v_flat,
+                    dt_exp,
+                    A_exp_groups,
+                    B_t_exp,
+                    C_t_exp,
                     delta_softplus=False,
                     return_last_state=True,
                     initial_state=initial_state,
                 )
-                y = y.repeat_interleave(self.group_size, dim=-1)[..., :E]
+                y = y.view(B, T, self.groups, self.group_size).reshape(B, T, -1)[..., :E]
                 return y, last_state.detach().float()
-            except Exception:
-                pass  # Fallback to manual scan if kernel signature mismatches
+            except Exception as exc:
+                warnings.warn(
+                    f"Falling back to Python selective scan due to kernel error: {exc}",
+                    RuntimeWarning,
+                )
 
         if cache_state is None:
-            state = v.new_zeros(B, self.groups, self.N, dtype=torch.float32)
+            state = v.new_zeros(B, self.groups * self.group_size, self.N, dtype=torch.float32)
         else:
             state = cache_state.float()
 
+        B_t_exp = B_t.repeat_interleave(self.group_size, dim=2)
+        C_t_exp = C_t.repeat_interleave(self.group_size, dim=2)
+        dt_exp = dt.repeat_interleave(self.group_size, dim=2)
+        A_exp_groups = A.repeat_interleave(self.group_size, dim=0)
+
         outputs = []
-        A_exp = A.unsqueeze(0).unsqueeze(0)
+        A_exp = A_exp_groups.unsqueeze(0).unsqueeze(0)
         for t in range(T):
-            dt_t = dt[:, t].unsqueeze(-1)                # (B,G,1)
+            dt_t = dt_exp[:, t].unsqueeze(-1)             # (B,G*group_size,1)
             A_bar = torch.exp(dt_t * A_exp)               # discretization
-            state = A_bar * state + dt_t * B_t[:, t]
-            y_t_group = (state * C_t[:, t]).sum(dim=-1)   # (B,G)
-            y_t = y_t_group.repeat_interleave(self.group_size, dim=-1)[..., :E]
+            state = A_bar * state + dt_t * B_t_exp[:, t]
+            y_t_group = (state * C_t_exp[:, t]).sum(dim=-1)   # (B,G*group_size)
+            y_t = y_t_group.view(B, self.groups, self.group_size).reshape(B, -1)[..., :E]
             outputs.append(y_t)
 
         y = torch.stack(outputs, dim=1).to(v.dtype)
