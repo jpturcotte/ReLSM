@@ -337,8 +337,13 @@ def train(args):
     curriculum = CurriculumSampler(
         alg_loader=alg_loader,
         lang_loader=lang_loader,
-        alg_tokens=args.alg_tokens,
         total_tokens=args.total_tokens,
+        alg_tokens=args.alg_tokens,
+        mix_band_tokens=args.mix_band_tokens,
+        persistent_alg_frac=args.persistent_alg_frac,
+        lexical_frac_phase1=args.lexical_frac_phase1,
+        seed=args.seed,
+        lex_loader=None,
     )
     
     # =========================================================================
@@ -360,6 +365,9 @@ def train(args):
     print(f"  Phase 1 (algorithmic): {args.alg_tokens/1e6:.1f}M tokens")
     print(f"  Phase 2 (language): {(args.total_tokens - args.alg_tokens)/1e6:.1f}M tokens")
     print(f"  Total: {args.total_tokens/1e6:.1f}M tokens")
+    print(f"  Mix band: {args.mix_band_tokens/1e6:.2f}M tokens")
+    print(f"  Persistent alg frac: {args.persistent_alg_frac:.2f}")
+    print(f"  Lexical frac (phase1): {args.lexical_frac_phase1:.2f}")
     print(f"  Variant: {args.variant}")
     
     global_step = 0
@@ -554,6 +562,12 @@ def main():
                        help="Tokens for Phase 1 (algorithmic)")
     parser.add_argument("--total_tokens", type=int, default=500_000_000,
                        help="Total token budget")
+    parser.add_argument("--mix_band_tokens", type=int, default=None,
+                       help="Transition band (tokens) between algorithmic and language phases")
+    parser.add_argument("--persistent_alg_frac", type=float, default=0.15,
+                       help="Long-run fraction of algorithmic data after transition (recommended 0.05–0.3)")
+    parser.add_argument("--lexical_frac_phase1", type=float, default=0.05,
+                       help="Lexical noise fraction during initial algorithmic phase")
     
     # Data
     parser.add_argument("--alg_examples", type=int, default=100_000)
@@ -577,6 +591,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 
     args = parser.parse_args()
+
+    if args.mix_band_tokens is None:
+        args.mix_band_tokens = int(0.5 * args.alg_tokens)
     train(args)
 
 

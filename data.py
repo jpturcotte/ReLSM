@@ -570,44 +570,114 @@ class LanguageDataset(IterableDataset):
 
 class CurriculumSampler:
     """
-    Implements the split curriculum:
-    - First N tokens: algorithmic data (Phase 1)
-    - Remaining tokens: language data (Phase 2)
+    Flexible curriculum sampler that blends algorithmic, language, and optional
+    lexical noise data according to token-based schedules.
     """
-    
+
     def __init__(
         self,
         alg_loader: DataLoader,
         lang_loader: DataLoader,
-        alg_tokens: int,      # Tokens for Phase 1
-        total_tokens: int,    # Total token budget
+        total_tokens: int,
+        alg_tokens: int,
+        mix_band_tokens: int,
+        persistent_alg_frac: float = 0.15,
+        lexical_frac_phase1: float = 0.05,
+        seed: int = 42,
+        lex_loader: Optional[DataLoader] = None,
     ):
+        if not 0.0 <= persistent_alg_frac <= 0.9:
+            raise ValueError(
+                "persistent_alg_frac must be between 0.0 and 0.9 (recommended 0.05–0.3)"
+            )
+
         self.alg_iter = cycle(iter(alg_loader))
         self.lang_iter = cycle(iter(lang_loader))
-        self.alg_tokens = alg_tokens
+        self.lex_iter = cycle(iter(lex_loader)) if lex_loader is not None else None
+
         self.total_tokens = total_tokens
+        self.alg_tokens = alg_tokens
+        self.mix_band_tokens = int(min(max(mix_band_tokens, 0), self.alg_tokens))
+        self.persistent_alg_frac = persistent_alg_frac
+        self.lexical_frac_phase1 = lexical_frac_phase1 if lex_loader is not None else 0.0
         self.tokens_seen = 0
-    
+
+        self.rng = random.Random(seed)
+
     @property
     def phase(self) -> str:
-        return "algorithmic" if self.tokens_seen < self.alg_tokens else "language"
-    
+        # Phase indicator is approximate; probabilities may mix.
+        if self.tokens_seen < self.alg_tokens - self.mix_band_tokens:
+            return "algorithmic"
+        if self.tokens_seen < self.alg_tokens + self.mix_band_tokens:
+            return "mix"
+        return "language"
+
     @property
     def progress(self) -> float:
         return self.tokens_seen / self.total_tokens
-    
+
+    def _compute_probs(self) -> Dict[str, float]:
+        t = self.tokens_seen
+
+        if t < self.alg_tokens - self.mix_band_tokens:
+            # Region A: early algorithmic focus with optional lexical noise.
+            p_alg = 1.0 - self.lexical_frac_phase1
+            p_lex = self.lexical_frac_phase1
+            p_lang = 0.0
+        elif t < self.alg_tokens + self.mix_band_tokens:
+            # Region B: linear transition from algorithmic to language.
+            if self.mix_band_tokens == 0:
+                u = 1.0
+            else:
+                u = (t - (self.alg_tokens - self.mix_band_tokens)) / (2.0 * self.mix_band_tokens)
+                u = min(max(u, 0.0), 1.0)
+
+            p_alg = (1.0 - self.lexical_frac_phase1) * (1.0 - u) + self.persistent_alg_frac * u
+            p_lex = self.lexical_frac_phase1 * (1.0 - u)
+            p_lang = 1.0 - p_alg - p_lex
+        else:
+            # Region C: predominantly language with persistent algorithmic fraction.
+            p_alg = self.persistent_alg_frac
+            p_lex = 0.0
+            p_lang = 1.0 - p_alg
+
+        # If no lexical loader, renormalize to exclude lexical probability.
+        if self.lex_iter is None:
+            p_lex = 0.0
+            total = p_alg + p_lang
+            if total > 0:
+                p_alg /= total
+                p_lang /= total
+
+        return {"alg": p_alg, "lang": p_lang, "lex": p_lex}
+
+    def _sample_source(self) -> str:
+        probs = self._compute_probs()
+        choices = ["alg", "lang", "lex"]
+        cumulative = 0.0
+        pick = self.rng.random()
+        for choice in choices:
+            cumulative += probs[choice]
+            if pick <= cumulative:
+                return choice
+        return "lang"  # Fallback
+
     def next_batch(self) -> Dict[str, torch.Tensor]:
-        if self.tokens_seen < self.alg_tokens:
+        source = self._sample_source()
+        if source == "alg":
             batch = next(self.alg_iter)
+        elif source == "lex" and self.lex_iter is not None:
+            batch = next(self.lex_iter)
         else:
             batch = next(self.lang_iter)
-        
+
         # Count tokens (non-padding)
         n_tokens = (batch["labels"] != -100).sum().item()
         self.tokens_seen += n_tokens
-        
+
         return batch
-    
+
     def reset(self):
         self.tokens_seen = 0
 
