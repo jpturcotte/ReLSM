@@ -56,6 +56,21 @@ python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --tasks algor
 python eval_hub.py --checkpoint ./runs/nano_latent/best_model.pt --tasks algorithmic parity_ood addition_ood needle tinystories
 ```
 
+### Evaluation: one command, one JSON
+
+All evaluations now flow through `eval_hub.py` with a unified schema and deterministic decoding. Example:
+
+```
+python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --all \
+    --output_dir ./runs/nano_baseline/eval_results
+```
+
+Artifacts written to `--output_dir`:
+
+- `results.json`: full metadata, algorithmic IID/OOD grid, needle sweep, and TinyStories perplexity
+- `results_ood.csv`: one row per OOD condition from `eval/ood_grid.py`
+- `summary.md`: human-readable summary for quick inspection
+
 ### Nano Baseline Control
 
 Note that `nano_baseline.py` is a standalone script that implements a control model with learned **absolute positional embeddings**. This is distinct from running `train.py --variant baseline`, which uses the main model codebase with RoPE. Use `nano_baseline.py` specifically to test the hypothesis that absolute embeddings fail out-of-distribution length generalization.

@@ -1,284 +1,31 @@
-"""Unified evaluation entrypoint for algorithmic, long-context, and PPL tasks.
+"""Canonical evaluation hub for ReLSM models.
 
-Example usage:
-    python eval_hub.py \
-        --checkpoint checkpoints/model.pt \
-        --tokenizer gpt2 \
-        --tasks algorithmic parity_ood addition_ood needle tinystories \
-        --context_lengths 512 1024 2048 \
-        --algorithmic_examples 100 \
-        --output_dir eval_results/ \
-        --max_examples 200
+Usage:
+    python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --all
 """
+
 import argparse
-import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import torch
 
-from data import AlgorithmicGenerator
+from eval.run_algorithmic_eval import run_evaluation as run_algo_ood
+from evaluate_longctx import run_longctx_eval
 from utils import (
-    NeedleInHaystackGenerator,
-    batch_generate,
+    EvalResult,
     compute_perplexity,
-    generate_text,
+    gather_metadata,
+    get_eval_generation_kwargs,
     load_model_and_tokenizer,
     save_json,
     seed_all,
     select_device,
+    write_ood_csv,
+    write_summary_md,
 )
 
-
-def _extract_answer(text: str) -> str:
-    """Extract a conservative answer token from model output."""
-    if not text:
-        return ""
-    first_line = text.split("\n")[0].strip()
-    import re
-
-    numbers = re.findall(r"-?\d+", first_line)
-    if numbers:
-        return numbers[0]
-    words = first_line.split()
-    return words[0] if words else ""
-
-
-def evaluate_algorithmic_task(
-    model,
-    tokenizer,
-    device: torch.device,
-    task: str,
-    n_examples: int,
-    max_new_tokens: int,
-) -> Dict:
-    """Evaluate a single algorithmic task with exact-match accuracy."""
-    examples = AlgorithmicGenerator.generate_batch(n_examples, tasks=[task])
-    prompts = [ex["input"] for ex in examples]
-    targets = [ex["target"].strip() for ex in examples]
-
-    generations = batch_generate(
-        model,
-        tokenizer,
-        prompts,
-        device=device,
-        max_new_tokens=max_new_tokens,
-    )
-    correct = 0
-    for pred, tgt in zip(generations, targets):
-        if _extract_answer(pred) == _extract_answer(tgt):
-            correct += 1
-
-    accuracy = correct / max(len(targets), 1)
-    return {
-        "task": task,
-        "metrics": {"accuracy": accuracy},
-        "config": {
-            "n_examples": n_examples,
-            "max_new_tokens": max_new_tokens,
-        },
-    }
-
-
-def evaluate_algorithmic_suite(
-    model,
-    tokenizer,
-    device: torch.device,
-    tasks: Sequence[str],
-    n_examples: int,
-    max_new_tokens: int,
-) -> List[Dict]:
-    """Run all requested algorithmic tasks and compute an overall score."""
-
-    results: List[Dict] = []
-    total_correct = 0
-    total_seen = 0
-
-    for task in tasks:
-        res = evaluate_algorithmic_task(
-            model,
-            tokenizer,
-            device,
-            task=task,
-            n_examples=n_examples,
-            max_new_tokens=max_new_tokens,
-        )
-        results.append(res)
-        total_correct += res["metrics"]["accuracy"] * n_examples
-        total_seen += n_examples
-
-    results.append(
-        {
-            "task": "algorithmic_overall",
-            "metrics": {"accuracy": total_correct / max(total_seen, 1)},
-            "config": {
-                "tasks": list(tasks),
-                "n_examples_per_task": n_examples,
-                "max_new_tokens": max_new_tokens,
-            },
-        }
-    )
-
-    return results
-
-
-def evaluate_longctx_needle(
-    model,
-    tokenizer,
-    device: torch.device,
-    context_lengths: Sequence[int],
-    depths: Sequence[float],
-    samples_per_depth: int,
-    max_new_tokens: int = 10,
-) -> List[Dict]:
-    """Evaluate needle retrieval across multiple context lengths."""
-    results: List[Dict] = []
-    for ctx_len in context_lengths:
-        if ctx_len > model.config.max_seq_len:
-            continue
-        generator = NeedleInHaystackGenerator(tokenizer, context_length=ctx_len)
-        by_depth: Dict[float, float] = {}
-        total_correct = 0
-        total_seen = 0
-        for depth in depths:
-            depth_correct = 0
-            for _ in range(samples_per_depth):
-                ex = generator.generate(needle_depth=depth)
-                input_ids = ex["input_ids"].to(device).unsqueeze(0)
-                outputs = model.generate(
-                    input_ids,
-                    max_new_tokens=max_new_tokens,
-                    temperature=0.1,
-                    top_k=1,
-                )
-                decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                if "Answer:" in decoded:
-                    tail = decoded.split("Answer:")[-1].strip().split()
-                else:
-                    tail = decoded.split()
-                predicted = tail[0] if tail else ""
-                if predicted == ex["answer"]:
-                    depth_correct += 1
-                    total_correct += 1
-                total_seen += 1
-            by_depth[depth] = depth_correct / max(samples_per_depth, 1)
-
-        retrieval_acc = total_correct / max(total_seen, 1)
-        results.append(
-            {
-                "task": "needle",
-                "metrics": {
-                    "retrieval_accuracy": retrieval_acc,
-                    "by_depth": by_depth,
-                },
-                "config": {
-                    "context_length": ctx_len,
-                    "depths": list(depths),
-                    "samples_per_depth": samples_per_depth,
-                    "max_new_tokens": max_new_tokens,
-                },
-            }
-        )
-    return results
-
-
-def evaluate_parity_ood(
-    model,
-    tokenizer,
-    device: torch.device,
-    lengths: Sequence[int],
-    samples_per_length: int,
-    max_new_tokens: int,
-) -> Dict:
-    """Evaluate parity extrapolation to longer bit strings."""
-
-    results_by_length: Dict[int, float] = {}
-    total_correct = 0
-    total_seen = 0
-
-    for length in lengths:
-        correct = 0
-        for _ in range(samples_per_length):
-            bits = [torch.randint(0, 2, ()).item() for _ in range(length)]
-            expected = str(sum(bits) % 2)
-            prompt = f"parity({''.join(map(str, bits))}) ="
-            response = generate_text(
-                model,
-                tokenizer,
-                prompt,
-                device=device,
-                max_new_tokens=max_new_tokens,
-                generation_kwargs={"temperature": 0.1, "top_k": 1},
-            )
-            predicted = _extract_answer(response)
-            if predicted == expected:
-                correct += 1
-                total_correct += 1
-            total_seen += 1
-        results_by_length[length] = correct / max(samples_per_length, 1)
-
-    return {
-        "task": "parity_ood",
-        "metrics": {
-            "accuracy": total_correct / max(total_seen, 1),
-            "by_length": results_by_length,
-        },
-        "config": {
-            "lengths": list(lengths),
-            "samples_per_length": samples_per_length,
-            "max_new_tokens": max_new_tokens,
-        },
-    }
-
-
-def evaluate_addition_ood(
-    model,
-    tokenizer,
-    device: torch.device,
-    digit_counts: Sequence[int],
-    samples_per_count: int,
-    max_new_tokens: int,
-) -> Dict:
-    """Evaluate multi-digit addition beyond training lengths."""
-
-    results_by_digits: Dict[int, float] = {}
-    total_correct = 0
-    total_seen = 0
-
-    for n_digits in digit_counts:
-        correct = 0
-        for _ in range(samples_per_count):
-            a = torch.randint(10 ** (n_digits - 1), 10**n_digits, ()).item()
-            b = torch.randint(10 ** (n_digits - 1), 10**n_digits, ()).item()
-            expected = str(a + b)
-            prompt = f"{a} + {b} ="
-            response = generate_text(
-                model,
-                tokenizer,
-                prompt,
-                device=device,
-                max_new_tokens=max_new_tokens,
-                generation_kwargs={"temperature": 0.1, "top_k": 1},
-            )
-            predicted = _extract_answer(response)
-            if predicted == expected:
-                correct += 1
-                total_correct += 1
-            total_seen += 1
-        results_by_digits[n_digits] = correct / max(samples_per_count, 1)
-
-    return {
-        "task": "addition_ood",
-        "metrics": {
-            "accuracy": total_correct / max(total_seen, 1),
-            "by_digits": results_by_digits,
-        },
-        "config": {
-            "digit_counts": list(digit_counts),
-            "samples_per_count": samples_per_count,
-            "max_new_tokens": max_new_tokens,
-        },
-    }
+DEFAULT_TASKS = ["algorithmic", "ood", "needle", "tinystories"]
 
 
 def evaluate_tinystories_ppl(
@@ -286,28 +33,33 @@ def evaluate_tinystories_ppl(
     tokenizer,
     device: torch.device,
     n_examples: int,
-) -> Dict:
-    """Compute perplexity on a subset of TinyStories validation split."""
-    from datasets import load_dataset
+    seed: int,
+    texts: Optional[Sequence[str]] = None,
+) -> Dict[str, float]:
+    """Compute TinyStories perplexity on a small subset."""
 
-    try:
-        dataset = load_dataset("roneneldan/TinyStories", split="validation")
-        texts = [dataset[i]["text"] for i in range(min(n_examples, len(dataset)))]
-        ppl = compute_perplexity(model, tokenizer, texts, device)
-    except Exception as exc:  # noqa: BLE001
-        ppl = float("inf")
-        texts = []
-        print(f"Failed to compute TinyStories perplexity: {exc}")
+    seed_all(seed)
+    samples: List[str] = []
+    if texts is not None:
+        samples = list(texts)[:n_examples]
+    else:
+        try:
+            from datasets import load_dataset
 
-    return {
-        "task": "tinystories",
-        "metrics": {"perplexity": ppl},
-        "config": {"n_examples": len(texts)},
-    }
+            dataset = load_dataset("roneneldan/TinyStories", split="validation")
+            samples = [dataset[i]["text"] for i in range(min(n_examples, len(dataset)))]
+        except Exception:
+            samples = []
+
+    ppl = float("inf")
+    if samples:
+        ppl = compute_perplexity(model, tokenizer, samples, device)
+
+    return {"perplexity": ppl, "n": len(samples)}
 
 
 class EvaluatorHub:
-    """Coordinated dispatcher for multiple evaluation tasks."""
+    """Unified dispatcher over algorithmic IID/OOD, long-context, and PPL tasks."""
 
     def __init__(
         self,
@@ -315,221 +67,225 @@ class EvaluatorHub:
         tokenizer_name: str,
         device: torch.device,
         tasks: Sequence[str],
-        context_lengths: Sequence[int],
+        grid_tasks: Sequence[str],
         output_dir: Path,
-        max_examples: int,
-        algorithmic_tasks: Sequence[str],
-        algorithmic_examples: int,
-        ood_lengths: Sequence[int],
-        ood_digit_counts: Sequence[int],
-        ood_examples: int,
-        max_new_tokens: int = 32,
-        log_to_wandb: bool = False,
+        seed: int,
+        batch_size: int,
+        n_override: Optional[int],
+        needle_contexts: Sequence[int],
+        needle_depths: Sequence[float],
+        needle_samples: int,
+        ppl_samples: int,
+        max_new_tokens: int,
     ) -> None:
         self.device = device
-        self.output_dir = output_dir
         self.tasks = list(tasks)
-        self.context_lengths = list(context_lengths)
-        self.max_examples = max_examples
-        self.algorithmic_tasks = list(algorithmic_tasks)
-        self.algorithmic_examples = algorithmic_examples
-        self.ood_lengths = list(ood_lengths)
-        self.ood_digit_counts = list(ood_digit_counts)
-        self.ood_examples = ood_examples
+        self.grid_tasks = list(grid_tasks)
+        self.output_dir = output_dir
+        self.seed = seed
+        self.batch_size = batch_size
+        self.n_override = n_override
+        self.needle_contexts = list(needle_contexts)
+        self.needle_depths = list(needle_depths)
+        self.needle_samples = needle_samples
+        self.ppl_samples = ppl_samples
         self.max_new_tokens = max_new_tokens
-        self.log_to_wandb = log_to_wandb
 
         self.model, self.config, self.tokenizer = load_model_and_tokenizer(
             checkpoint, tokenizer_name, device
         )
+        self.generation_overrides = get_eval_generation_kwargs(tokenizer=self.tokenizer)
+        self.generation_overrides.pop("max_new_tokens", None)
+        self.metadata = gather_metadata(
+            checkpoint=checkpoint,
+            tokenizer_name=tokenizer_name,
+            device=device,
+            model_config=self.config,
+            generation_kwargs={"do_sample": False, "top_k": 1, "top_p": None, "temperature": 1.0},
+        )
 
-        if log_to_wandb:
-            import wandb
+    def _convert_algo_results(self, results: List[EvalResult]) -> Dict:
+        per_task_iid: Dict[str, float] = {}
+        details = []
+        total_iid = 0.0
+        total_tasks = 0
 
-            wandb.init(project="relsm-eval", config={"checkpoint": checkpoint, "tasks": tasks})
-            self.wandb = wandb
-        else:
-            self.wandb = None
+        for res in results:
+            row = {
+                "task": res.task,
+                "condition": res.condition,
+                "accuracy": res.accuracy,
+                "n": res.n,
+                "avg_gen_len": res.avg_gen_len,
+                "tokens_per_sec": res.tokens_per_sec,
+            }
+            details.append(row)
+            if res.condition == "iid":
+                per_task_iid[res.task] = res.accuracy
+                total_iid += res.accuracy
+                total_tasks += 1
 
-    def _record(self, result: Dict) -> None:
-        if self.wandb:
-            self.wandb.log({f"{result['task']}/{k}": v for k, v in result["metrics"].items()})
+        overall_iid = total_iid / total_tasks if total_tasks else 0.0
+        overall_all = sum(r.correct for r in results) / max(
+            sum(r.n for r in results), 1
+        )
+        return {
+            "per_task": per_task_iid,
+            "overall_accuracy": overall_iid,
+            "overall_all_conditions": overall_all,
+            "details": details,
+        }
 
-    def _print_summary(self, aggregated: List[Dict]) -> None:
-        print("\n" + "=" * 60)
-        print("EVALUATION SUMMARY")
-        print("=" * 60)
+    def _ood_table(self, results: List[EvalResult]) -> Dict:
+        table = [
+            {
+                "task": res.task,
+                "condition": res.condition,
+                "accuracy": res.accuracy,
+                "n": res.n,
+                "avg_gen_len": res.avg_gen_len,
+                "tokens_per_sec": res.tokens_per_sec,
+            }
+            for res in results
+        ]
+        per_task: Dict[str, float] = {}
+        for res in results:
+            per_task[res.task] = max(per_task.get(res.task, 0.0), res.accuracy)
+        overall = sum(r.correct for r in results) / max(sum(r.n for r in results), 1)
+        return {"table": table, "per_task_max": per_task, "overall_accuracy": overall}
 
-        overall = next((r for r in aggregated if r["task"] == "algorithmic_overall"), None)
-        if overall:
-            print(f"Algorithmic accuracy: {overall['metrics']['accuracy']*100:.1f}%")
+    def run_algorithmic_and_ood(self) -> Dict:
+        output = run_algo_ood(
+            ckpt_path=None,
+            tokenizer_name=None,
+            device=str(self.device),
+            seed=self.seed,
+            tasks=self.grid_tasks,
+            out_path=None,
+            batch_size=self.batch_size,
+            n_override=self.n_override,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            verbose=False,
+            iid_only="ood" not in self.tasks,
+        )
+        results: List[EvalResult] = output["results"]
+        algorithmic = self._convert_algo_results(results)
+        ood = self._ood_table(results)
+        return {"algorithmic": algorithmic, "ood": ood}
 
-        parity = next((r for r in aggregated if r["task"] == "parity_ood"), None)
-        if parity:
-            print(f"Parity OOD: {parity['metrics']['accuracy']*100:.1f}%")
-            for length, acc in parity["metrics"].get("by_length", {}).items():
-                print(f"  len={length}: {acc*100:.1f}%")
+    def run_longctx(self) -> Dict:
+        longctx = run_longctx_eval(
+            self.model,
+            self.tokenizer,
+            self.device,
+            ctx_lengths=self.needle_contexts,
+            depths=self.needle_depths,
+            samples_per_depth=self.needle_samples,
+            seed=self.seed,
+            max_new_tokens=min(10, self.max_new_tokens),
+        )
+        return longctx
 
-        addition = next((r for r in aggregated if r["task"] == "addition_ood"), None)
-        if addition:
-            print(f"Addition OOD: {addition['metrics']['accuracy']*100:.1f}%")
-            for digits, acc in addition["metrics"].get("by_digits", {}).items():
-                print(f"  {digits}-digit: {acc*100:.1f}%")
-
-        for res in aggregated:
-            if res["task"] == "needle":
-                ctx = res["config"].get("context_length", "?")
-                print(f"Needle @{ctx}: {res['metrics']['retrieval_accuracy']*100:.1f}%")
-
-        for res in aggregated:
-            if res["task"].startswith("tinystories"):
-                print(f"TinyStories perplexity: {res['metrics']['perplexity']:.2f}")
-
-        print("=" * 60)
+    def run_ppl(self) -> Dict:
+        return evaluate_tinystories_ppl(
+            self.model,
+            self.tokenizer,
+            self.device,
+            n_examples=self.ppl_samples,
+            seed=self.seed,
+        )
 
     def run_all(self) -> Dict:
-        """Dispatch requested tasks and aggregate results."""
-        aggregated: List[Dict] = []
-        for task in self.tasks:
-            if task == "algorithmic":
-                print("[Algorithmic Exact-Match]")
-                algo_results = evaluate_algorithmic_suite(
-                    self.model,
-                    self.tokenizer,
-                    self.device,
-                    tasks=self.algorithmic_tasks,
-                    n_examples=self.algorithmic_examples,
-                    max_new_tokens=self.max_new_tokens,
-                )
-                for res in algo_results:
-                    aggregated.append(res)
-                    self._record(res)
-                    if res["task"] != "algorithmic_overall":
-                        print(f"  {res['task']}: {res['metrics']['accuracy']*100:.2f}%")
-                overall = next(r for r in algo_results if r["task"] == "algorithmic_overall")
-                print(f"  Overall: {overall['metrics']['accuracy']*100:.2f}%")
-            elif task in set(self.algorithmic_tasks):
-                print(f"[Algorithmic] {task}")
-                res = evaluate_algorithmic_task(
-                    self.model,
-                    self.tokenizer,
-                    self.device,
-                    task=task,
-                    n_examples=self.algorithmic_examples,
-                    max_new_tokens=self.max_new_tokens,
-                )
-                aggregated.append(res)
-                self._record(res)
-                print(f"  accuracy: {res['metrics']['accuracy']*100:.2f}%")
-            elif task == "parity_ood":
-                print("[OOD Length] Parity")
-                res = evaluate_parity_ood(
-                    self.model,
-                    self.tokenizer,
-                    self.device,
-                    lengths=self.ood_lengths,
-                    samples_per_length=self.ood_examples,
-                    max_new_tokens=self.max_new_tokens,
-                )
-                aggregated.append(res)
-                self._record(res)
-                print(f"  overall: {res['metrics']['accuracy']*100:.2f}%")
-            elif task == "addition_ood":
-                print("[OOD Length] Addition")
-                res = evaluate_addition_ood(
-                    self.model,
-                    self.tokenizer,
-                    self.device,
-                    digit_counts=self.ood_digit_counts,
-                    samples_per_count=self.ood_examples,
-                    max_new_tokens=self.max_new_tokens,
-                )
-                aggregated.append(res)
-                self._record(res)
-                print(f"  overall: {res['metrics']['accuracy']*100:.2f}%")
-            elif task == "needle":
-                print("[Needle retrieval]")
-                needle_results = evaluate_longctx_needle(
-                    self.model,
-                    self.tokenizer,
-                    self.device,
-                    context_lengths=self.context_lengths,
-                    depths=[0.25, 0.5, 0.75, 0.9],
-                    samples_per_depth=max(1, self.max_examples // len(self.context_lengths) // 4),
-                )
-                for res in needle_results:
-                    aggregated.append(res)
-                    self._record(res)
-                    ctx = res["config"]["context_length"]
-                    print(f"  ctx={ctx} retrieval: {res['metrics']['retrieval_accuracy']*100:.2f}%")
-            elif task == "tinystories":
-                print("[Perplexity] TinyStories")
-                res = evaluate_tinystories_ppl(
-                    self.model, self.tokenizer, self.device, n_examples=self.max_examples
-                )
-                aggregated.append(res)
-                self._record(res)
-                print(f"  ppl: {res['metrics']['perplexity']:.2f}")
-            else:
-                print(f"Unknown task '{task}', skipping")
+        seed_all(self.seed)
+        results: Dict[str, Dict] = {}
 
-        summary = {
-            "results": aggregated,
-            "model": json.loads(json.dumps(getattr(self.config, "__dict__", str(self.config)), default=str)),
-            "tasks": self.tasks,
-        }
-        output_path = self.output_dir / "results.json"
-        save_json(summary, output_path)
-        print(f"Saved results to {output_path}")
-        self._print_summary(aggregated)
+        if "algorithmic" in self.tasks or "ood" in self.tasks:
+            algo_payload = self.run_algorithmic_and_ood()
+            results.update(algo_payload)
+
+        if "needle" in self.tasks:
+            results["longctx"] = self.run_longctx()
+
+        if "tinystories" in self.tasks:
+            results["ppl"] = self.run_ppl()
+
+        summary = {"metadata": self.metadata, "results": results}
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        save_json(summary, self.output_dir / "results.json")
+
+        if "ood" in results:
+            write_ood_csv(self.output_dir / "results_ood.csv", results["ood"].get("table", []))
+        write_summary_md(self.output_dir / "summary.md", summary)
+
+        self._print_summary(summary)
         return summary
+
+    def _print_summary(self, summary: Dict) -> None:
+        print("\n=== Evaluation Summary ===")
+        algo = summary.get("results", {}).get("algorithmic", {})
+        if algo:
+            print(f"Algorithmic IID overall: {algo.get('overall_accuracy', 0.0)*100:.2f}%")
+            for task, acc in sorted(algo.get("per_task", {}).items()):
+                print(f"  {task}: {acc*100:.2f}%")
+        ood = summary.get("results", {}).get("ood", {})
+        if ood:
+            print(f"OOD overall: {ood.get('overall_accuracy', 0.0)*100:.2f}% across {len(ood.get('table', []))} conditions")
+        longctx = summary.get("results", {}).get("longctx", {})
+        if longctx:
+            print(f"Needle AUC: {longctx.get('auc', 0.0)*100:.2f}%")
+            for ctx in longctx.get("per_context", []):
+                print(
+                    f"  ctx={ctx['context_length']}: {ctx['metrics']['retrieval_accuracy']*100:.2f}%"
+                )
+        ppl = summary.get("results", {}).get("ppl", {})
+        if ppl:
+            print(f"TinyStories PPL: {ppl.get('perplexity', float('inf')):.2f} (n={ppl.get('n', 0)})")
+        print("==========================\n")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified evaluation hub")
     parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint")
     parser.add_argument("--tokenizer", default="gpt2", help="Tokenizer name or path")
-    parser.add_argument(
-        "--tasks",
-        nargs="*",
-        default=["algorithmic", "parity_ood", "addition_ood", "needle", "tinystories"],
-        help="Tasks to run",
-    )
-    parser.add_argument("--context_lengths", nargs="*", type=int, default=[512, 1024, 2048], help="Context lengths for needle task")
+    parser.add_argument("--tasks", nargs="*", default=DEFAULT_TASKS, help="Tasks to run: algorithmic ood needle tinystories")
+    parser.add_argument("--all", action="store_true", help="Convenience flag for all tasks")
+    parser.add_argument("--grid_tasks", nargs="*", default=None, help="Subset of algorithmic/OOD tasks to evaluate")
     parser.add_argument("--output_dir", type=Path, default=Path("eval_results"))
-    parser.add_argument("--max_examples", type=int, default=500, help="Examples for needle/tinystories")
-    parser.add_argument("--algorithmic_tasks", nargs="*", default=["mod_add", "parity", "addition", "multiplication", "copy", "reverse", "chain", "compare", "successor"], help="Algorithmic tasks to include")
-    parser.add_argument("--algorithmic_examples", type=int, default=100, help="Examples per algorithmic task")
-    parser.add_argument("--ood_lengths", nargs="*", type=int, default=[8, 16, 24, 32, 48, 64], help="Lengths for parity OOD evaluation")
-    parser.add_argument("--ood_digit_counts", nargs="*", type=int, default=[2, 4, 5, 6, 7, 8], help="Digit counts for addition OOD evaluation")
-    parser.add_argument("--ood_examples", type=int, default=20, help="Examples per OOD setting")
-    parser.add_argument("--max_new_tokens", type=int, default=32)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--n", type=int, default=None, help="Override per-condition example count for algorithmic/OOD")
+    parser.add_argument("--needle_contexts", nargs="*", type=int, default=[1024, 2048, 4096])
+    parser.add_argument("--needle_depths", nargs="*", type=float, default=[0.25, 0.5, 0.75, 0.9])
+    parser.add_argument("--needle_samples", type=int, default=8)
+    parser.add_argument("--ppl_samples", type=int, default=32)
+    parser.add_argument("--max_new_tokens", type=int, default=32)
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_args()
-    seed_all(args.seed)
+    tasks = DEFAULT_TASKS if args.all else args.tasks
     device = select_device(args.device)
-    EvaluatorHub(
+
+    hub = EvaluatorHub(
         checkpoint=args.checkpoint,
         tokenizer_name=args.tokenizer,
         device=device,
-        tasks=args.tasks,
-        context_lengths=args.context_lengths,
+        tasks=tasks,
+        grid_tasks=args.grid_tasks or [],
         output_dir=args.output_dir,
-        max_examples=args.max_examples,
-        algorithmic_tasks=args.algorithmic_tasks,
-        algorithmic_examples=args.algorithmic_examples,
-        ood_lengths=args.ood_lengths,
-        ood_digit_counts=args.ood_digit_counts,
-        ood_examples=args.ood_examples,
+        seed=args.seed,
+        batch_size=args.batch_size,
+        n_override=args.n,
+        needle_contexts=args.needle_contexts,
+        needle_depths=args.needle_depths,
+        needle_samples=args.needle_samples,
+        ppl_samples=args.ppl_samples,
         max_new_tokens=args.max_new_tokens,
-        log_to_wandb=args.wandb,
-    ).run_all()
+    )
+    hub.run_all()
 
 
 if __name__ == "__main__":

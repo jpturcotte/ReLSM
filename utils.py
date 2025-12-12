@@ -3,21 +3,33 @@
 This module centralizes model/tokenizer loading, generation helpers,
 random seeding, long-context data generation, and algorithmic
 evaluation utilities so that individual scripts remain lightweight.
+"""Utility helpers shared across evaluation entrypoints.
+
+This module centralizes model/tokenizer loading, deterministic generation
+defaults, random seeding, long-context data creation, algorithmic scoring,
+and metadata recording so that all evaluation paths share consistent
+behavior and output schemas.
 """
+
 import json
 import math
+import os
+import platform
 import random
 import re
+import socket
+import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from transformers import AutoTokenizer
 
 from data import AlgorithmicGenerator
-from model import BaselineTransformer
+from model import BaselineTransformer, TransformerConfig
 
 
 def seed_all(seed: int) -> None:
@@ -57,7 +69,7 @@ def load_model_and_tokenizer(
     checkpoint_path: str,
     tokenizer_name: str,
     device: torch.device,
-) -> Tuple[BaselineTransformer, any, any]:
+) -> Tuple[BaselineTransformer, Any, Any]:
     """Load a BaselineTransformer checkpoint and matching tokenizer.
 
     Returns
@@ -80,6 +92,31 @@ def load_model_and_tokenizer(
     return model, config, tokenizer
 
 
+def get_eval_generation_kwargs(
+    tokenizer=None,
+    max_new_tokens: int = 32,
+    extra_kwargs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return deterministic generation settings for evaluation.
+
+    All evaluation code paths should call this helper to guarantee greedy
+    decoding regardless of the model's default sampling configuration.
+    """
+
+    kwargs = {
+        "do_sample": False,
+        "top_k": 1,
+        "top_p": None,
+        "temperature": 1.0,
+        "max_new_tokens": max_new_tokens,
+    }
+    if tokenizer is not None:
+        kwargs["pad_token_id"] = getattr(tokenizer, "pad_token_id", None)
+    if extra_kwargs:
+        kwargs.update(extra_kwargs)
+    return kwargs
+
+
 def generate_text(
     model: BaselineTransformer,
     tokenizer,
@@ -89,16 +126,15 @@ def generate_text(
     generation_kwargs: Optional[Dict] = None,
 ) -> str:
     """Generate a continuation for a single prompt."""
-    generation_kwargs = generation_kwargs or {}
+    generation_kwargs = get_eval_generation_kwargs(
+        tokenizer=tokenizer,
+        max_new_tokens=max_new_tokens,
+        extra_kwargs=generation_kwargs,
+    )
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
     input_len = input_ids.shape[1]
 
-    output_ids = model.generate(
-        input_ids,
-        max_new_tokens=max_new_tokens,
-        pad_token_id=getattr(tokenizer, "pad_token_id", None),
-        **generation_kwargs,
-    )
+    output_ids = model.generate(input_ids, **generation_kwargs)
     generated_tokens = output_ids[0, input_len:]
     return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
@@ -118,11 +154,10 @@ def batch_generate(
         return_tensors="pt",
     ).to(device)
     input_ids = tokenized["input_ids"]
-    output_ids = model.generate(
-        **tokenized,
-        max_new_tokens=max_new_tokens,
-        pad_token_id=getattr(tokenizer, "pad_token_id", None),
+    gen_kwargs = get_eval_generation_kwargs(
+        tokenizer=tokenizer, max_new_tokens=max_new_tokens
     )
+    output_ids = model.generate(**tokenized, **gen_kwargs)
     prompt_lengths = tokenized.get("attention_mask", torch.ones_like(input_ids)).sum(dim=1)
     generations: List[str] = []
     for i, prompt_len in enumerate(prompt_lengths):
@@ -313,15 +348,17 @@ def generate_outputs(
     device: torch.device,
     use_autocast: bool,
     task: str,
+    generation_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[str], int, float]:
     """Generate model completions and return predictions and throughput stats."""
 
     tokenized = batch_tokenize(tokenizer, prompts, device)
     input_ids = tokenized["input_ids"]
-    gen_kwargs = {
-        "max_new_tokens": max_new_tokens,
-        "pad_token_id": getattr(tokenizer, "pad_token_id", None),
-    }
+    gen_kwargs = get_eval_generation_kwargs(
+        tokenizer=tokenizer,
+        max_new_tokens=max_new_tokens,
+        extra_kwargs=generation_kwargs,
+    )
     start = time.time()
     with torch.no_grad():
         if use_autocast:
@@ -349,9 +386,11 @@ def evaluate_condition(
     max_new_tokens: int,
     seed: int,
     batch_size: int = 16,
+    generation_kwargs: Optional[Dict[str, Any]] = None,
 ) -> EvalResult:
     """Evaluate a single algorithmic condition (IID or OOD)."""
 
+    seed_all(seed)
     dataset = build_dataset(task, n, params, seed)
     use_autocast = device.type == "cuda"
 
@@ -374,6 +413,7 @@ def evaluate_condition(
             device=device,
             use_autocast=use_autocast,
             task=task,
+            generation_kwargs=generation_kwargs,
         )
         total_tokens += tok_count
         total_time += elapsed
@@ -409,3 +449,145 @@ def evaluate_condition(
         examples=collected_examples,
         correct=total_correct,
     )
+
+
+def gather_metadata(
+    checkpoint: Optional[str],
+    tokenizer_name: Optional[str],
+    device: torch.device,
+    model_config: Optional[TransformerConfig],
+    generation_kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Collect run metadata for auditing and reproducibility."""
+
+    commit = None
+    try:
+        commit = (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=os.getcwd())
+            .decode()
+            .strip()
+        )
+    except Exception:
+        commit = None
+
+    cuda_version = torch.version.cuda or None
+    torch_version = torch.__version__
+
+    model_summary = None
+    if model_config is not None:
+        getter = (
+            (lambda k: getattr(model_config, k))
+            if not isinstance(model_config, dict)
+            else (lambda k: model_config.get(k))
+        )
+        try:
+            model_summary = {
+                "variant": getter("variant"),
+                "d_model": getter("d_model"),
+                "n_layers": getter("n_layers"),
+                "n_heads": getter("n_heads"),
+                "max_seq_len": getter("max_seq_len"),
+            }
+        except Exception:
+            model_summary = None
+
+    return {
+        "timestamp": datetime.utcnow().isoformat(),
+        "commit": commit,
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "cuda": cuda_version,
+        "torch": torch_version,
+        "checkpoint": checkpoint,
+        "tokenizer": tokenizer_name,
+        "device": str(device),
+        "model": model_summary,
+        "decoding": generation_kwargs,
+    }
+
+
+def area_under_depth_curve(by_depth: Dict[float, float]) -> float:
+    """Compute the average retrieval accuracy across depths."""
+
+    if not by_depth:
+        return 0.0
+    depths = sorted(by_depth)
+    total = 0.0
+    for depth in depths:
+        total += by_depth[depth]
+    return total / len(depths)
+
+
+def write_summary_md(output_path: Path, summary: Dict[str, Any]) -> None:
+    """Write a lightweight human-readable summary file."""
+
+    lines = ["# Evaluation Summary", ""]
+    metadata = summary.get("metadata", {})
+    if metadata:
+        lines.append("## Metadata")
+        for k in ["checkpoint", "commit", "device", "tokenizer", "timestamp"]:
+            if metadata.get(k) is not None:
+                lines.append(f"- **{k}**: {metadata[k]}")
+        lines.append("")
+
+    algo = summary.get("results", {}).get("algorithmic", {})
+    if algo:
+        lines.append("## Algorithmic (IID)")
+        overall = algo.get("overall_accuracy")
+        if overall is not None:
+            lines.append(f"- Overall accuracy: {overall*100:.2f}%")
+        for task, acc in sorted(algo.get("per_task", {}).items()):
+            lines.append(f"- {task}: {acc*100:.2f}%")
+        lines.append("")
+
+    ood = summary.get("results", {}).get("ood", {})
+    if ood:
+        lines.append("## OOD Grid")
+        overall = ood.get("overall_accuracy")
+        if overall is not None:
+            lines.append(f"- Overall accuracy: {overall*100:.2f}%")
+        lines.append("- Conditions: {}".format(len(ood.get("table", []))))
+        lines.append("")
+
+    longctx = summary.get("results", {}).get("longctx", {})
+    if longctx:
+        lines.append("## Needle Retrieval")
+        auc = longctx.get("auc")
+        if auc is not None:
+            lines.append(f"- Avg depth accuracy: {auc*100:.2f}%")
+        for ctx in longctx.get("per_context", []):
+            lines.append(
+                f"- ctx={ctx['context_length']}: {ctx['metrics']['retrieval_accuracy']*100:.2f}%"
+            )
+        lines.append("")
+
+    ppl = summary.get("results", {}).get("ppl", {})
+    if ppl:
+        lines.append("## TinyStories PPL")
+        if "perplexity" in ppl:
+            lines.append(f"- Perplexity: {ppl['perplexity']:.2f} on {ppl.get('n', 0)} samples")
+        lines.append("")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines))
+
+
+def write_ood_csv(output_path: Path, table: Sequence[Dict[str, Any]]) -> None:
+    """Write OOD grid results to CSV for convenient analysis."""
+
+    import csv
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "task",
+        "condition",
+        "accuracy",
+        "n",
+        "avg_gen_len",
+        "tokens_per_sec",
+    ]
+    with output_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in table:
+            writer.writerow({k: row.get(k) for k in fieldnames})

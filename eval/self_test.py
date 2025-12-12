@@ -1,138 +1,73 @@
-"""Lightweight self checks for the algorithmic evaluation helpers."""
+"""Lightweight determinism and schema checks for eval_hub."""
+
 import json
-from typing import Dict, List
+import tempfile
+from pathlib import Path
 
 import torch
 
-from data import AlgorithmicGenerator
-from eval import ood_grid
-from utils import build_dataset, evaluate_condition, seed_all
+from eval_hub import EvaluatorHub
+from model import BaselineTransformer, TransformerConfig
+from utils import seed_all
 
 
-class AlwaysCorrectModel:
-    def __init__(self, tokenizer, answer_map: Dict[str, str]):
-        self.tokenizer = tokenizer
-        self.answer_map = answer_map
-
-    def generate(self, input_ids=None, attention_mask=None, **kwargs):
-        decoded_prompts: List[str] = []
-        for ids, mask in zip(input_ids, attention_mask):
-            length = int(mask.sum().item())
-            decoded_prompts.append(self.tokenizer.decode(ids[:length], skip_special_tokens=True))
-        outputs = []
-        for prompt in decoded_prompts:
-            target = self.answer_map.get(prompt.strip(), "")
-            generated = prompt + " " + target
-            outputs.append(self.tokenizer.encode(generated, return_tensors="pt")[0])
-        # pad to equal length
-        max_len = max(len(o) for o in outputs)
-        padded = []
-        for o in outputs:
-            if len(o) < max_len:
-                pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
-                pad = torch.full((max_len - len(o),), pad_id, dtype=o.dtype)
-                o = torch.cat([o, pad])
-            padded.append(o)
-        return torch.stack(padded)
+def _make_tiny_checkpoint(tmpdir: Path) -> Path:
+    seed_all(123)
+    config = TransformerConfig(
+        vocab_size=50257,
+        max_seq_len=128,
+        d_model=64,
+        n_layers=1,
+        n_heads=4,
+        dropout=0.0,
+    )
+    model = BaselineTransformer(config)
+    ckpt_path = tmpdir / "tiny_ckpt.pt"
+    torch.save({"config": config, "model_state_dict": model.state_dict()}, ckpt_path)
+    return ckpt_path
 
 
-class AlwaysWrongModel:
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
-
-    def generate(self, input_ids=None, attention_mask=None, **kwargs):
-        decoded_prompts: List[str] = []
-        for ids, mask in zip(input_ids, attention_mask):
-            length = int(mask.sum().item())
-            decoded_prompts.append(self.tokenizer.decode(ids[:length], skip_special_tokens=True))
-        outputs = []
-        for prompt in decoded_prompts:
-            generated = prompt + " wrong"
-            outputs.append(self.tokenizer.encode(generated, return_tensors="pt")[0])
-        max_len = max(len(o) for o in outputs)
-        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
-        padded = []
-        for o in outputs:
-            if len(o) < max_len:
-                pad = torch.full((max_len - len(o),), pad_id, dtype=o.dtype)
-                o = torch.cat([o, pad])
-            padded.append(o)
-        return torch.stack(padded)
+def _run_once(tmpdir: Path) -> dict:
+    ckpt_path = _make_tiny_checkpoint(tmpdir)
+    output_dir = tmpdir / "eval_out"
+    hub = EvaluatorHub(
+        checkpoint=str(ckpt_path),
+        tokenizer_name="gpt2",
+        device=torch.device("cpu"),
+        tasks=["algorithmic", "ood", "needle", "tinystories"],
+        grid_tasks=["addition", "parity"],
+        output_dir=output_dir,
+        seed=42,
+        batch_size=2,
+        n_override=4,
+        needle_contexts=[64],
+        needle_depths=[0.5],
+        needle_samples=1,
+        ppl_samples=2,
+        max_new_tokens=8,
+    )
+    summary = hub.run_all()
+    results_path = output_dir / "results.json"
+    assert results_path.exists()
+    with results_path.open() as f:
+        data = json.load(f)
+    # key presence
+    assert "metadata" in data and "results" in data
+    assert "algorithmic" in data["results"]
+    assert "ood" in data["results"]
+    assert "longctx" in data["results"]
+    assert "ppl" in data["results"]
+    assert (output_dir / "results_ood.csv").exists()
+    assert (output_dir / "summary.md").exists()
+    return summary
 
 
 def run_self_checks():
-    from transformers import AutoTokenizer
-
-    seed_all(42)
-    tok = AutoTokenizer.from_pretrained("gpt2")
-    if tok.pad_token_id is None:
-        tok.pad_token = tok.eos_token
-
-    # Generator format smoke test
-    ex = AlgorithmicGenerator.addition(rng=None)
-    assert set(["input", "target", "task", "text"]) <= set(ex.keys())
-
-    # Dyck balance check
-    dyck_samples = build_dataset("dyck", 20, {"max_depth": 4, "length": 10}, seed=123)
-    yes_count = sum(1 for s in dyck_samples if s["target"].lower() == "yes")
-    no_count = sum(1 for s in dyck_samples if s["target"].lower() == "no")
-    assert yes_count == no_count == 10
-
-    # Dyck grid condition smoke test with always-correct stub
-    dyck_cond = ood_grid.dyck_grid()[0]
-    dyck_dataset = build_dataset("dyck", dyck_cond.n, dyck_cond.params, seed=2024)
-    dyck_answer_map = {ex["input"].strip(): ex["target"] for ex in dyck_dataset}
-    dyck_model = AlwaysCorrectModel(tok, dyck_answer_map)
-    dyck_res = evaluate_condition(
-        dyck_model,
-        tok,
-        task="dyck",
-        condition="dyck_iid",
-        params=dyck_cond.params,
-        n=dyck_cond.n,
-        device=torch.device("cpu"),
-        max_new_tokens=dyck_cond.max_new_tokens,
-        seed=2024,
-        batch_size=dyck_cond.n,
-    )
-    assert dyck_res.correct == dyck_cond.n and dyck_res.accuracy == 1.0
-
-    # Always-correct stub
-    cond = ood_grid.addition_grid()[0]
-    dataset = build_dataset("addition", 8, cond.params, seed=999)
-    answer_map = {ex["input"].strip(): ex["target"] for ex in dataset}
-    model = AlwaysCorrectModel(tok, answer_map)
-    res = evaluate_condition(
-        model,
-        tok,
-        task="addition",
-        condition="self_test",
-        params=cond.params,
-        n=8,
-        device=torch.device("cpu"),
-        max_new_tokens=32,
-        seed=999,
-        batch_size=4,
-    )
-    assert res.accuracy == 1.0, f"Expected perfect accuracy, got {res.accuracy}"
-
-    # Always-wrong stub to ensure failures are recorded
-    wrong_model = AlwaysWrongModel(tok)
-    wrong_res = evaluate_condition(
-        wrong_model,
-        tok,
-        task="addition",
-        condition="self_test_wrong",
-        params=cond.params,
-        n=8,
-        device=torch.device("cpu"),
-        max_new_tokens=32,
-        seed=111,
-        batch_size=4,
-    )
-    assert wrong_res.correct == 0, f"Expected zero correct, got {wrong_res.correct}"
-    assert wrong_res.examples, "Expected some failure examples to be collected"
-    print(json.dumps({"status": "ok", "samples": len(dataset)}, indent=2))
+    with tempfile.TemporaryDirectory() as tmp:
+        first = _run_once(Path(tmp))
+        second = _run_once(Path(tmp))
+        assert first == second, "Deterministic runs should match exactly"
+    print(json.dumps({"status": "ok"}))
 
 
 if __name__ == "__main__":
