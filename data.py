@@ -133,6 +133,7 @@ class AlgorithmicGenerator:
     ) -> Dict[str, str]:
         """Parity of binary string"""
         rng = rng or random
+        # NOTE: For OOD evaluation we keep training length fixed at 8 by default.
         seq_len = length if length is not None else 8
         bits = [rng.randint(0, 1) for _ in range(seq_len)]
         parity = sum(bits) % 2
@@ -159,6 +160,7 @@ class AlgorithmicGenerator:
     @staticmethod
     def addition(max_digits: int = 4, rng: Optional[random.Random] = None, difficulty: float = 0.5) -> Dict[str, str]:
         """Multi-digit addition"""
+        # NOTE: For OOD addition eval we cap training digits at 4.
         rng = rng or random
         digit_range = AlgorithmicGenerator._digit_range(difficulty, cap=max_digits)
         digits = rng.randint(digit_range[0], digit_range[1])
@@ -552,7 +554,7 @@ class AlgorithmicDataset(IterableDataset):
         chars = "0123456789()+-*=? "
         chars += "abcdefghijklmnopqrstuvwxyz"
         chars += "ABCDEFGHIJKLMNOPQRSTUVWXYZ"  # For future-proofing
-        chars += ":,"  # punctuation used in prompts
+        chars += ":,%<>'"  # punctuation used in prompts
 
         token_map = {}
         for ch in set(chars):
@@ -573,6 +575,9 @@ class AlgorithmicDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         worker_info = get_worker_info()
+
+        # Reset per-epoch token counter in case the dataset is reused across epochs.
+        self.tokens_seen = 0
 
         if self.seed is not None:
             seed = self.seed + (worker_info.id if worker_info is not None else 0)
