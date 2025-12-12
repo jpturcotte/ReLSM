@@ -79,6 +79,21 @@ class AlgorithmicGenerator:
         return rng.randint(low, high)
 
     @staticmethod
+    def _sample_int_with_digit_bounds(
+        rng: random.Random, digits: int, low_digit: int, high_digit: int
+    ) -> int:
+        """Sample an integer with a fixed digit count and per-digit bounds."""
+        digits = max(1, digits)
+        low_digit = max(0, low_digit)
+        high_digit = min(9, max(low_digit, high_digit))
+
+        first_low = max(low_digit, 1) if high_digit > 0 else 0
+        first = rng.randint(first_low, high_digit)
+        remaining = [rng.randint(low_digit, high_digit) for _ in range(digits - 1)]
+        all_digits = [first] + remaining
+        return int("".join(map(str, all_digits)))
+
+    @staticmethod
     def _choose_prompt(rng: random.Random, templates: List[str], **kwargs) -> str:
         template = rng.choice(templates)
         return template.format(**kwargs).strip()
@@ -162,10 +177,24 @@ class AlgorithmicGenerator:
         """Multi-digit addition"""
         # NOTE: For OOD addition eval we cap training digits at 4.
         rng = rng or random
-        digit_range = AlgorithmicGenerator._digit_range(difficulty, cap=max_digits)
-        digits = rng.randint(digit_range[0], digit_range[1])
-        a = AlgorithmicGenerator._sample_int_with_digits(rng, digits)
-        b = AlgorithmicGenerator._sample_int_with_digits(rng, digits)
+        bucket = AlgorithmicGenerator._difficulty_bucket(difficulty)
+        if bucket == "easy":
+            digit_range = (1, 2)
+            digit_bounds = (0, 4)  # low carry pressure
+        elif bucket == "medium":
+            digit_range = (2, 3)
+            digit_bounds = (0, 9)  # neutral carry pressure
+        else:
+            digit_range = (4, 4)
+            digit_bounds = (5, 9)  # high carry pressure
+
+        digits = rng.randint(digit_range[0], min(digit_range[1], max_digits))
+        a = AlgorithmicGenerator._sample_int_with_digit_bounds(
+            rng, digits, *digit_bounds
+        )
+        b = AlgorithmicGenerator._sample_int_with_digit_bounds(
+            rng, digits, *digit_bounds
+        )
         result = a + b
 
         prompt = AlgorithmicGenerator._choose_prompt(
@@ -306,11 +335,12 @@ class AlgorithmicGenerator:
         len_range = AlgorithmicGenerator._length_range(
             difficulty,
             easy=(6, 10),
-            medium=(10, 14),
-            hard=(14, 18),
+            medium=(10, 18),
+            hard=(18, 30),
         )
         seq_len = length if length is not None else rng.randint(len_range[0], len_range[1])
         depth_bucket = AlgorithmicGenerator._difficulty_bucket(difficulty)
+        bucket = AlgorithmicGenerator._difficulty_bucket(difficulty)
         if depth_bucket == "easy":
             depth_cap = min(2, max_depth)
         elif depth_bucket == "medium":
@@ -335,29 +365,63 @@ class AlgorithmicGenerator:
                 else:
                     seq.append(")")
                     depth -= 1
-        
+
         # Close remaining
         while depth > 0:
             seq.append(")")
             depth -= 1
-        
+
         seq_str = "".join(seq)
+
+        def _is_balanced(s: str) -> bool:
+            depth = 0
+            for ch in s:
+                depth += 1 if ch == "(" else -1
+                if depth < 0:
+                    return False
+            return depth == 0
+
+        # Optionally corrupt to create invalid strings for decision task
+        is_valid = rng.random() < 0.5
+        if not is_valid:
+            def _corruption_idx(length: int) -> int:
+                if length <= 1:
+                    return 0
+                if bucket == "hard":
+                    # Bias toward early prefix violations at higher difficulty
+                    return min(length - 1, int(rng.random() ** 2 * length))
+                return rng.randint(0, length - 1)
+
+            corruption_type = rng.choice(["drop", "flip", "append"])
+            seq_list = list(seq_str)
+            if corruption_type == "drop" and len(seq_list) > 1:
+                drop_idx = _corruption_idx(len(seq_list))
+                seq_list.pop(drop_idx)
+            elif corruption_type == "flip":
+                flip_idx = _corruption_idx(len(seq_list))
+                seq_list[flip_idx] = "(" if seq_list[flip_idx] == ")" else ")"
+            else:
+                seq_list.append(")")
+
+            seq_str = "".join(seq_list)
+            if _is_balanced(seq_str):
+                seq_str += "("  # force imbalance
 
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "dyck: {seq}",
-                "Is '{seq}' balanced?",
-                "Check Dyck validity for: {seq}",
+                "Is '{seq}' balanced? Answer yes or no.",
                 "Does {seq} form a correct parentheses string?",
+                "dyck: {seq} -> valid?",
+                "Check Dyck validity for: {seq}",
             ],
             seq=seq_str,
         )
 
         return {
-            "text": f"{prompt} valid",
+            "text": f"{prompt} {'yes' if is_valid else 'no'}",
             "input": prompt,
-            "target": "valid",
+            "target": "yes" if is_valid else "no",
             "task": "dyck",
         }
 
@@ -372,17 +436,33 @@ class AlgorithmicGenerator:
         op_counts = AlgorithmicGenerator._length_range(
             difficulty,
             easy=(2, 3),
-            medium=(3, 4),
-            hard=(4, 6),
+            medium=(3, 5),
+            hard=(5, 8),
         )
+        bucket = AlgorithmicGenerator._difficulty_bucket(difficulty)
+        if bucket == "easy":
+            operand_high = 9
+            start_range = (5, 40)
+            allow_negative = False
+        elif bucket == "medium":
+            operand_high = 20
+            start_range = (10, 60)
+            allow_negative = rng.random() < 0.5
+        else:
+            operand_high = 50
+            start_range = (20, 100)
+            allow_negative = True
+
         sampled_ops = rng.randint(op_counts[0], op_counts[1])
         ops = n_ops if n_ops is not None else sampled_ops
-        val = rng.randint(1, 50)
+        val = rng.randint(start_range[0], start_range[1])
         expr = str(val)
 
         for _ in range(ops):
             op = rng.choice(["+", "-"])
-            operand = rng.randint(1, 20)
+            operand = rng.randint(1, operand_high)
+            if not allow_negative and op == "-" and val - operand < 0:
+                op = "+"
             expr += f" {op} {operand}"
             val = val + operand if op == "+" else val - operand
 
@@ -537,12 +617,14 @@ class AlgorithmicDataset(IterableDataset):
         max_seq_len: int = 128,
         tasks: Optional[List[str]] = None,
         seed: Optional[int] = None,
+        difficulty_value=None,
     ):
         self.tokenizer = tokenizer
         self.num_examples = num_examples
         self.max_seq_len = max_seq_len
         self.tasks = tasks
         self.seed = seed
+        self.difficulty_value = difficulty_value
         self.tokens_seen = 0
         self._token_budget = max(1, self.num_examples * max(self.max_seq_len - 1, 1))
         self._worker_token_budget = self._token_budget
@@ -576,8 +658,8 @@ class AlgorithmicDataset(IterableDataset):
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         worker_info = get_worker_info()
 
-        # Reset per-epoch token counter in case the dataset is reused across epochs.
-        self.tokens_seen = 0
+        # Keep tokens_seen cumulative across epochs so difficulty schedules carry
+        # forward instead of resetting each pass over the dataset.
 
         if self.seed is not None:
             seed = self.seed + (worker_info.id if worker_info is not None else 0)
@@ -623,6 +705,13 @@ class AlgorithmicDataset(IterableDataset):
             }
 
     def _sample_difficulty(self, rng: random.Random) -> float:
+        if self.difficulty_value is not None:
+            try:
+                value = float(self.difficulty_value.value)
+            except Exception:
+                value = 0.0
+            return min(max(value, 0.0), 1.0)
+
         budget = getattr(self, "_worker_token_budget", self._token_budget)
         progress = min(self.tokens_seen / budget, 1.0)
         upper = min(1.0, 0.5 + 0.5 * progress)
@@ -950,24 +1039,30 @@ class CurriculumSampler:
                 return choice
         return "lang"  # Fallback
 
-    def _next_from_loader(self, loader_name: str, iter_name: str) -> Dict[str, torch.Tensor]:
-        loader = getattr(self, loader_name)
-        iterator = getattr(self, iter_name)
+    def _next_from(self, which: str) -> Dict[str, torch.Tensor]:
+        if which == "alg":
+            loader, iter_attr = self.alg_loader, "alg_iter"
+        elif which == "lang":
+            loader, iter_attr = self.lang_loader, "lang_iter"
+        else:
+            loader, iter_attr = self.lex_loader, "lex_iter"
+
+        iterator = getattr(self, iter_attr)
         try:
             return next(iterator)
         except StopIteration:
             iterator = iter(loader)
-            setattr(self, iter_name, iterator)
+            setattr(self, iter_attr, iterator)
             return next(iterator)
 
     def next_batch(self) -> Dict[str, torch.Tensor]:
         source = self._sample_source()
         if source == "alg":
-            batch = self._next_from_loader("alg_loader", "alg_iter")
+            batch = self._next_from("alg")
         elif source == "lex" and self.lex_iter is not None and self.lex_loader is not None:
-            batch = self._next_from_loader("lex_loader", "lex_iter")
+            batch = self._next_from("lex")
         else:
-            batch = self._next_from_loader("lang_loader", "lang_iter")
+            batch = self._next_from("lang")
 
         # Count tokens (non-padding)
         n_tokens = (batch["labels"] != -100).sum().item()
