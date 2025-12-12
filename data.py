@@ -133,13 +133,7 @@ class AlgorithmicGenerator:
     ) -> Dict[str, str]:
         """Parity of binary string"""
         rng = rng or random
-        len_range = AlgorithmicGenerator._length_range(
-            difficulty,
-            easy=(6, 10),
-            medium=(12, 20),
-            hard=(24, 32),
-        )
-        seq_len = length if length is not None else rng.randint(len_range[0], len_range[1])
+        seq_len = length if length is not None else 8
         bits = [rng.randint(0, 1) for _ in range(seq_len)]
         parity = sum(bits) % 2
         bit_str = "".join(map(str, bits))
@@ -549,6 +543,7 @@ class AlgorithmicDataset(IterableDataset):
         self.seed = seed
         self.tokens_seen = 0
         self._token_budget = max(1, self.num_examples * max(self.max_seq_len - 1, 1))
+        self._worker_token_budget = self._token_budget
 
         self._char_token_map = self._build_char_token_map()
 
@@ -592,6 +587,8 @@ class AlgorithmicDataset(IterableDataset):
         worker_id = worker_info.id if worker_info is not None else 0
         num_workers = worker_info.num_workers if worker_info is not None else 1
 
+        self._worker_token_budget = max(1, self._token_budget / num_workers)
+
         for _ in range(worker_id, self.num_examples, num_workers):
             difficulty = self._sample_difficulty(rng)
             example = AlgorithmicGenerator.generate_example(
@@ -621,7 +618,8 @@ class AlgorithmicDataset(IterableDataset):
             }
 
     def _sample_difficulty(self, rng: random.Random) -> float:
-        progress = min(self.tokens_seen / self._token_budget, 1.0)
+        budget = getattr(self, "_worker_token_budget", self._token_budget)
+        progress = min(self.tokens_seen / budget, 1.0)
         upper = min(1.0, 0.5 + 0.5 * progress)
         lower = 0.0
         return rng.uniform(lower, upper)
