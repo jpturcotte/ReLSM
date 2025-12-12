@@ -11,18 +11,7 @@ from typing import List
 
 import torch
 
-from data import NeedleInHaystackGenerator
-from model import BaselineTransformer
-
-
-@torch.no_grad()
-def load_model(checkpoint: str, device: torch.device) -> BaselineTransformer:
-    ckpt = torch.load(checkpoint, map_location=device)
-    model = BaselineTransformer(ckpt["config"])
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device)
-    model.eval()
-    return model
+from utils import NeedleInHaystackGenerator, load_model_and_tokenizer, prepare_tokenizer, select_device
 
 
 @torch.no_grad()
@@ -65,24 +54,20 @@ def main():
     parser = argparse.ArgumentParser(description="Needle-in-haystack long-context evaluation")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint (.pt)")
     parser.add_argument("--tokenizer", type=str, default="gpt2")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--ctx", type=int, nargs="*", default=[4096, 16384], help="Context lengths to test")
     parser.add_argument("--samples", type=int, default=20, help="Examples per depth")
     parser.add_argument("--depths", type=float, nargs="*", default=[0.25, 0.5, 0.75, 0.9])
 
     args = parser.parse_args()
 
-    device = torch.device(args.device)
+    device = select_device(args.device)
 
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = prepare_tokenizer(args.tokenizer)
 
     print(f"Loading model from {args.checkpoint} on {device}...")
-    model = load_model(args.checkpoint, device)
-    print(f"Variant: {model.config.variant}, max_seq_len: {model.config.max_seq_len}")
+    model, config, _ = load_model_and_tokenizer(args.checkpoint, args.tokenizer, device)
+    print(f"Variant: {config.variant}, max_seq_len: {config.max_seq_len}")
 
     for ctx_len in args.ctx:
         if ctx_len > model.config.max_seq_len:
