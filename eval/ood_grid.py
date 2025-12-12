@@ -2,6 +2,8 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
+OOD_GRID_VERSION = "2024-06-01"
+
 
 @dataclass
 class Condition:

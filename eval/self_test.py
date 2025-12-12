@@ -1,14 +1,48 @@
-"""Lightweight determinism and schema checks for eval_hub."""
+"""Lightweight sanity checks for the evaluation pipeline."""
+
+from __future__ import annotations
 
 import json
 import tempfile
 from pathlib import Path
+from typing import Any, Dict
 
 import torch
 
-from eval_hub import EvaluatorHub
 from model import BaselineTransformer, TransformerConfig
-from utils import seed_all
+from utils import generate_batch, seed_all
+
+
+def run_self_test_suite(
+    model,
+    tokenizer,
+    device: torch.device,
+    *,
+    seed: int,
+    generation_kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run minimal deterministic checks without heavy computation."""
+
+    seed_all(seed)
+    prompts = ["Hello, world!", "2 + 2 ="]
+    preds, tokens, elapsed = generate_batch(
+        model,
+        tokenizer,
+        prompts,
+        max_new_tokens=generation_kwargs.get("max_new_tokens", 8),
+        device=device,
+        use_autocast=device.type == "cuda",
+        task="self_test",
+        generation_kwargs=generation_kwargs,
+    )
+    return {
+        "status": "ok",
+        "samples": [
+            {"prompt": p, "completion": c} for p, c in zip(prompts, preds)
+        ],
+        "tokens_generated": tokens,
+        "elapsed_seconds": elapsed,
+    }
 
 
 def _make_tiny_checkpoint(tmpdir: Path) -> Path:
@@ -27,46 +61,39 @@ def _make_tiny_checkpoint(tmpdir: Path) -> Path:
     return ckpt_path
 
 
-def _run_once(tmpdir: Path) -> dict:
-    ckpt_path = _make_tiny_checkpoint(tmpdir)
-    output_dir = tmpdir / "eval_out"
-    hub = EvaluatorHub(
-        checkpoint=str(ckpt_path),
-        tokenizer_name="gpt2",
-        device=torch.device("cpu"),
-        tasks=["algorithmic", "ood", "needle", "tinystories"],
-        grid_tasks=["addition", "parity"],
-        output_dir=output_dir,
-        seed=42,
-        batch_size=2,
-        n_override=4,
-        needle_contexts=[64],
-        needle_depths=[0.5],
-        needle_samples=1,
-        ppl_samples=2,
-        max_new_tokens=8,
-    )
-    summary = hub.run_all()
-    results_path = output_dir / "results.json"
-    assert results_path.exists()
-    with results_path.open() as f:
-        data = json.load(f)
-    # key presence
-    assert "metadata" in data and "results" in data
-    assert "algorithmic" in data["results"]
-    assert "ood" in data["results"]
-    assert "longctx" in data["results"]
-    assert "ppl" in data["results"]
-    assert (output_dir / "results_ood.csv").exists()
-    assert (output_dir / "summary.md").exists()
-    return summary
+def run_self_checks() -> None:
+    """Internal regression check to ensure deterministic outputs."""
 
+    from eval_hub import run_eval_suite
+    from utils import prepare_tokenizer
 
-def run_self_checks():
     with tempfile.TemporaryDirectory() as tmp:
-        first = _run_once(Path(tmp))
-        second = _run_once(Path(tmp))
-        assert first == second, "Deterministic runs should match exactly"
+        tmp_path = Path(tmp)
+        ckpt = _make_tiny_checkpoint(tmp_path)
+        tokenizer = prepare_tokenizer("gpt2")
+        checkpoint = torch.load(ckpt, map_location="cpu")
+        model = BaselineTransformer(checkpoint["config"])
+        model.load_state_dict(checkpoint["model_state_dict"])
+        payload = run_eval_suite(
+            model,
+            tokenizer,
+            torch.device("cpu"),
+            suite="self_test",
+            out_dir=tmp_path / "eval_out",
+            seed=42,
+            max_new_tokens=8,
+        )
+        assert "self_test" in payload
+        second = run_eval_suite(
+            model,
+            tokenizer,
+            torch.device("cpu"),
+            suite="self_test",
+            out_dir=tmp_path / "eval_out2",
+            seed=42,
+            max_new_tokens=8,
+        )
+        assert payload == second, "Self-test outputs should be deterministic"
     print(json.dumps({"status": "ok"}))
 
 

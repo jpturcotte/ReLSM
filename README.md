@@ -51,27 +51,25 @@ python train.py --model_size nano --variant latent \
     --alg_tokens 10000000 --total_tokens 20000000 \
     --output_dir ./runs/nano_latent
 
-# Evaluate
-python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --tasks algorithmic parity_ood addition_ood needle tinystories
-python eval_hub.py --checkpoint ./runs/nano_latent/best_model.pt --tasks algorithmic parity_ood addition_ood needle tinystories
+# Evaluation
+
+All evaluations now flow through `eval_hub.py` with a unified schema and deterministic decoding. Recommended commands:
+
+```bash
+# Algorithmic IID/OOD grid only
+python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --suite algorithmic --out_dir ./runs/nano_baseline/eval
+
+# Needle-in-haystack long-context sweep
+python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --suite longctx --out_dir ./runs/nano_baseline/eval
+
+# Full suite (algorithmic + longctx + self-test)
+python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --suite all --out_dir ./runs/nano_baseline/eval
 ```
 
-### Evaluation: one command, one JSON
+Outputs are written to `--out_dir` with standardized filenames:
 
-All evaluations now flow through `eval_hub.py` with a unified schema and deterministic decoding. Example:
-
-```
-python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --all \
-    --output_dir ./runs/nano_baseline/eval_results
-```
-
-`eval_hub.py` is the only supported entrypoint; the legacy `evaluate.py` wrapper has been removed.
-
-Artifacts written to `--output_dir`:
-
-- `results.json`: full metadata, algorithmic IID/OOD grid, needle sweep, and TinyStories perplexity
-- `results_ood.csv`: one row per OOD condition from `eval/ood_grid.py`
-- `summary.md`: human-readable summary for quick inspection
+- `results_algorithmic.json`, `results_longctx.json`, or `results_all.json` depending on the selected suite
+- Each JSON includes metadata (commit hash, seed, decoding parameters, grid version) and the relevant results payload
 
 ### Nano Baseline Control
 

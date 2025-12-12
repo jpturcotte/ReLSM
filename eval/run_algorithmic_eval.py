@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import hashlib
 import os
 import subprocess
 from collections import defaultdict
@@ -88,8 +89,7 @@ def run_evaluation(
     grid = ood_grid.build_grid(tasks)
     if iid_only:
         grid = [c for c in grid if c.name == "iid"]
-    gen_kwargs = get_eval_generation_kwargs(tokenizer=tokenizer)
-    gen_kwargs.pop("max_new_tokens", None)
+    gen_kwargs = get_eval_generation_kwargs(tokenizer=tokenizer, max_new_tokens=0)
     results: List[EvalResult] = []
 
     for cond in grid:
