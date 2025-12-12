@@ -163,7 +163,7 @@ class AlgorithmicGenerator:
         }
 
     @staticmethod
-    def addition(max_digits: int = 8, rng: Optional[random.Random] = None, difficulty: float = 0.5) -> Dict[str, str]:
+    def addition(max_digits: int = 4, rng: Optional[random.Random] = None, difficulty: float = 0.5) -> Dict[str, str]:
         """Multi-digit addition"""
         rng = rng or random
         digit_range = AlgorithmicGenerator._digit_range(difficulty, cap=max_digits)
