@@ -1,10 +1,5 @@
 """Utility helpers shared across evaluation entrypoints.
 
-This module centralizes model/tokenizer loading, generation helpers,
-random seeding, long-context data generation, and algorithmic
-evaluation utilities so that individual scripts remain lightweight.
-"""Utility helpers shared across evaluation entrypoints.
-
 This module centralizes model/tokenizer loading, deterministic generation
 defaults, random seeding, long-context data creation, algorithmic scoring,
 and metadata recording so that all evaluation paths share consistent
@@ -95,19 +90,24 @@ def load_model_and_tokenizer(
 def get_eval_generation_kwargs(
     tokenizer=None,
     max_new_tokens: int = 32,
+    do_sample: bool = False,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
     extra_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Return deterministic generation settings for evaluation.
 
     All evaluation code paths should call this helper to guarantee greedy
-    decoding regardless of the model's default sampling configuration.
+    decoding unless explicitly overridden. Defaults match the deterministic
+    decoding contract used by ``run_eval_suite``.
     """
 
-    kwargs = {
-        "do_sample": False,
-        "top_k": 1,
-        "top_p": None,
-        "temperature": 1.0,
+    kwargs: Dict[str, Any] = {
+        "do_sample": do_sample,
+        "top_k": top_k,
+        "top_p": top_p,
+        "temperature": temperature,
         "max_new_tokens": max_new_tokens,
     }
     if tokenizer is not None:
@@ -145,6 +145,7 @@ def batch_generate(
     prompts: Iterable[str],
     device: torch.device,
     max_new_tokens: int = 32,
+    generation_kwargs: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """Vectorized generation helper for multiple prompts."""
     tokenized = tokenizer(
@@ -155,7 +156,9 @@ def batch_generate(
     ).to(device)
     input_ids = tokenized["input_ids"]
     gen_kwargs = get_eval_generation_kwargs(
-        tokenizer=tokenizer, max_new_tokens=max_new_tokens
+        tokenizer=tokenizer,
+        max_new_tokens=max_new_tokens,
+        extra_kwargs=generation_kwargs,
     )
     output_ids = model.generate(**tokenized, **gen_kwargs)
     prompt_lengths = tokenized.get("attention_mask", torch.ones_like(input_ids)).sum(dim=1)
@@ -270,6 +273,8 @@ class EvalResult:
     tokens_per_sec: float
     examples: List[Dict[str, str]]
     correct: int
+    tokens_generated: int
+    elapsed: float
 
 
 def normalize_prediction(task: str, text: str) -> str:
@@ -340,7 +345,7 @@ def score_predictions(task: str, preds: List[str], targets: List[str]) -> Tuple[
     return correct, len(targets)
 
 
-def generate_outputs(
+def generate_batch(
     model,
     tokenizer,
     prompts: List[str],
@@ -405,7 +410,7 @@ def evaluate_condition(
         batch = dataset[start_idx : start_idx + batch_size]
         prompts = [ex["input"] for ex in batch]
         targets = [ex["target"] for ex in batch]
-        preds, tok_count, elapsed = generate_outputs(
+        preds, tok_count, elapsed = generate_batch(
             model,
             tokenizer,
             prompts,
@@ -448,6 +453,8 @@ def evaluate_condition(
         tokens_per_sec=tokens_per_sec,
         examples=collected_examples,
         correct=total_correct,
+        tokens_generated=total_tokens,
+        elapsed=total_time,
     )
 
 
@@ -457,6 +464,10 @@ def gather_metadata(
     device: torch.device,
     model_config: Optional[TransformerConfig],
     generation_kwargs: Dict[str, Any],
+    suite: Optional[str] = None,
+    seed: Optional[int] = None,
+    grid_version: Optional[str] = None,
+    model_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Collect run metadata for auditing and reproducibility."""
 
@@ -502,6 +513,10 @@ def gather_metadata(
         "tokenizer": tokenizer_name,
         "device": str(device),
         "model": model_summary,
+        "model_id": model_id,
+        "suite": suite,
+        "seed": seed,
+        "grid_version": grid_version,
         "decoding": generation_kwargs,
     }
 
