@@ -4,6 +4,7 @@ This module centralizes model/tokenizer loading, generation helpers,
 random seeding, and long-context data generation so that individual
 scripts remain lightweight.
 """
+import json
 import random
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -179,6 +180,36 @@ class NeedleInHaystackGenerator:
 def save_json(data: Dict, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w") as f:
-        import json
-
         json.dump(data, f, indent=2)
+
+
+def compute_perplexity(
+    model: BaselineTransformer,
+    tokenizer,
+    texts: Iterable[str],
+    device: torch.device,
+) -> float:
+    """Compute perplexity for a collection of texts."""
+
+    total_loss = 0.0
+    total_tokens = 0
+
+    model.eval()
+    with torch.no_grad():
+        for text in texts:
+            tokens = tokenizer.encode(
+                text,
+                max_length=model.config.max_seq_len,
+                truncation=True,
+                return_tensors="pt",
+            ).to(device)
+            if tokens.size(1) < 2:
+                continue
+            labels = tokens.clone()
+            _, loss, _ = model(tokens, labels=labels)
+            n_tokens = tokens.size(1) - 1
+            total_loss += loss.item() * n_tokens
+            total_tokens += n_tokens
+
+    avg_loss = total_loss / max(total_tokens, 1)
+    return float(torch.exp(torch.tensor(min(avg_loss, 20.0))).item())
