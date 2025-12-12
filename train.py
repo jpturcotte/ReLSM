@@ -97,50 +97,25 @@ class MetricsLogger:
 
 @torch.no_grad()
 def evaluate_algorithmic(model, tokenizer, device, n_examples: int = 100) -> Dict[str, float]:
-    """Evaluate exact-match accuracy on algorithmic tasks."""
-    from data import AlgorithmicGenerator
-    
-    model.eval()
-    task_correct = {}
-    task_total = {}
-    
-    examples = AlgorithmicGenerator.generate_batch(n_examples)
-    
-    for ex in examples:
-        task = ex["task"]
-        if task not in task_correct:
-            task_correct[task] = 0
-            task_total[task] = 0
-        
-        # Encode input
-        input_text = ex["input"]
-        input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
-        
-        # Generate
-        output_ids = model.generate(
-            input_ids,
-            max_new_tokens=20,
-            temperature=0.1,
-            top_k=1,
-        )
-        
-        generated = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        predicted = generated[len(input_text):].strip().split()[0] if generated[len(input_text):].strip() else ""
-        
-        # Check
-        expected = ex["target"].strip()
-        if predicted == expected:
-            task_correct[task] += 1
-        task_total[task] += 1
-    
-    model.train()
-    
-    results = {}
-    for task in task_correct:
-        results[task] = task_correct[task] / task_total[task] if task_total[task] > 0 else 0.0
-    results["overall"] = sum(task_correct.values()) / sum(task_total.values()) if sum(task_total.values()) > 0 else 0.0
-    
-    return results
+    """Thin wrapper that runs the canonical IID/OOD evaluator.
+
+    The ``n_examples`` argument is ignored but preserved for backward
+    compatibility with older training scripts.
+    """
+    from eval.run_algorithmic_eval import run_evaluation
+
+    device_str = str(device) if isinstance(device, torch.device) else device
+    results = run_evaluation(
+        device=device_str,
+        seed=42,
+        tasks=None,
+        out_path=None,
+        batch_size=8,
+        model=model,
+        tokenizer=tokenizer,
+    )
+    # run_evaluation returns EvalResult objects; we expose averages only
+    return results.get("summary", {})
 
 
 @torch.no_grad()

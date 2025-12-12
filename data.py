@@ -173,27 +173,39 @@ class AlgorithmicGenerator:
         }
 
     @staticmethod
-    def addition(max_digits: int = 4, rng: Optional[random.Random] = None, difficulty: float = 0.5) -> Dict[str, str]:
-        """Multi-digit addition"""
+    def addition(
+        max_digits: int = 4,
+        rng: Optional[random.Random] = None,
+        difficulty: float = 0.5,
+        digits: Optional[int] = None,
+        digit_bounds: Optional[Tuple[int, int]] = None,
+    ) -> Dict[str, str]:
+        """Multi-digit addition.
+
+        The ``digits`` and ``digit_bounds`` arguments are optional overrides used
+        by evaluation scripts to create deterministic OOD settings while keeping
+        the training defaults intact.
+        """
         # NOTE: For OOD addition eval we cap training digits at 4.
         rng = rng or random
         bucket = AlgorithmicGenerator._difficulty_bucket(difficulty)
         if bucket == "easy":
             digit_range = (1, 2)
-            digit_bounds = (0, 4)  # low carry pressure
+            default_digit_bounds = (0, 4)  # low carry pressure
         elif bucket == "medium":
             digit_range = (2, 3)
-            digit_bounds = (0, 9)  # neutral carry pressure
+            default_digit_bounds = (0, 9)  # neutral carry pressure
         else:
             digit_range = (4, 4)
-            digit_bounds = (5, 9)  # high carry pressure
+            default_digit_bounds = (5, 9)  # high carry pressure
 
-        digits = rng.randint(digit_range[0], min(digit_range[1], max_digits))
+        digits = digits if digits is not None else rng.randint(digit_range[0], min(digit_range[1], max_digits))
+        active_bounds = digit_bounds if digit_bounds is not None else default_digit_bounds
         a = AlgorithmicGenerator._sample_int_with_digit_bounds(
-            rng, digits, *digit_bounds
+            rng, digits, *active_bounds
         )
         b = AlgorithmicGenerator._sample_int_with_digit_bounds(
-            rng, digits, *digit_bounds
+            rng, digits, *active_bounds
         )
         result = a + b
 
@@ -329,6 +341,7 @@ class AlgorithmicGenerator:
         length: Optional[int] = None,
         rng: Optional[random.Random] = None,
         difficulty: float = 0.5,
+        force_valid: Optional[bool] = None,
     ) -> Dict[str, str]:
         """Dyck language (balanced parentheses) - tests stack operations"""
         rng = rng or random
@@ -382,7 +395,7 @@ class AlgorithmicGenerator:
             return depth == 0
 
         # Optionally corrupt to create invalid strings for decision task
-        is_valid = rng.random() < 0.5
+        is_valid = force_valid if force_valid is not None else (rng.random() < 0.5)
         if not is_valid:
             def _corruption_idx(length: int) -> int:
                 if length <= 1:
@@ -430,6 +443,8 @@ class AlgorithmicGenerator:
         n_ops: Optional[int] = None,
         rng: Optional[random.Random] = None,
         difficulty: float = 0.5,
+        operand_high: Optional[int] = None,
+        allow_negative: Optional[bool] = None,
     ) -> Dict[str, str]:
         """Chain of arithmetic operations"""
         rng = rng or random
@@ -441,17 +456,20 @@ class AlgorithmicGenerator:
         )
         bucket = AlgorithmicGenerator._difficulty_bucket(difficulty)
         if bucket == "easy":
-            operand_high = 9
+            default_operand_high = 9
             start_range = (5, 40)
-            allow_negative = False
+            default_allow_negative = False
         elif bucket == "medium":
-            operand_high = 20
+            default_operand_high = 20
             start_range = (10, 60)
-            allow_negative = rng.random() < 0.5
+            default_allow_negative = rng.random() < 0.5
         else:
-            operand_high = 50
+            default_operand_high = 50
             start_range = (20, 100)
-            allow_negative = True
+            default_allow_negative = True
+
+        operand_high = operand_high if operand_high is not None else default_operand_high
+        allow_negative = allow_negative if allow_negative is not None else default_allow_negative
 
         sampled_ops = rng.randint(op_counts[0], op_counts[1])
         ops = n_ops if n_ops is not None else sampled_ops
