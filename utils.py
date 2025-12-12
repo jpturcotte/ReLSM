@@ -119,7 +119,9 @@ def get_eval_generation_kwargs(
             if key in allowed_keys:
                 allowed_keys[key] = value
 
-    return allowed_keys
+    # Only forward parameters our custom generate implementation accepts and
+    # that have concrete values (drop optional None entries like eos_token_id).
+    return {k: v for k, v in allowed_keys.items() if v is not None}
 
 
 def generate_text(
