@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from eval import ood_grid
-from eval.utils import EvalResult, evaluate_condition, seed_all, select_device
+from utils import EvalResult, evaluate_condition, seed_all, select_device
 
 
 def _load_model(ckpt_path: str, device: torch.device):

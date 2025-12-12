@@ -6,7 +6,7 @@ import torch
 
 from data import AlgorithmicGenerator
 from eval import ood_grid
-from eval.utils import build_dataset, evaluate_condition, seed_all
+from utils import build_dataset, evaluate_condition, seed_all
 
 
 class AlwaysCorrectModel:
