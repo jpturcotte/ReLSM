@@ -52,9 +52,26 @@ python train.py --model_size nano --variant latent \
     --output_dir ./runs/nano_latent
 
 # Evaluate
-python evaluate.py --checkpoint ./runs/nano_baseline/best_model.pt
-python evaluate.py --checkpoint ./runs/nano_latent/best_model.pt
+python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --tasks algorithmic parity_ood addition_ood needle tinystories
+python eval_hub.py --checkpoint ./runs/nano_latent/best_model.pt --tasks algorithmic parity_ood addition_ood needle tinystories
 ```
+
+### Evaluation: one command, one JSON
+
+All evaluations now flow through `eval_hub.py` with a unified schema and deterministic decoding. Example:
+
+```
+python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --all \
+    --output_dir ./runs/nano_baseline/eval_results
+```
+
+`eval_hub.py` is the only supported entrypoint; the legacy `evaluate.py` wrapper has been removed.
+
+Artifacts written to `--output_dir`:
+
+- `results.json`: full metadata, algorithmic IID/OOD grid, needle sweep, and TinyStories perplexity
+- `results_ood.csv`: one row per OOD condition from `eval/ood_grid.py`
+- `summary.md`: human-readable summary for quick inspection
 
 ### Nano Baseline Control
 
@@ -140,8 +157,9 @@ python train.py --model_size nano --variant act \
 # === COMPARE ===
 for exp in exp0_baseline exp1_shared_loop exp2_latent exp3_act; do
     echo "=== $exp ==="
-    python evaluate.py --checkpoint ./runs/nano/$exp/best_model.pt \
-        --output ./runs/nano/$exp/eval_results.json
+    python eval_hub.py --checkpoint ./runs/nano/$exp/best_model.pt \
+        --tasks algorithmic parity_ood addition_ood needle tinystories \
+        --output_dir ./runs/nano/$exp/eval_results
 done
 ```
 
@@ -198,7 +216,7 @@ unified/
 ├── model.py      # All variants in one file
 ├── data.py       # Split curriculum + evaluation data
 ├── train.py      # Training with curriculum support
-├── evaluate.py   # Full evaluation suite
+├── eval_hub.py   # Full evaluation suite
 ├── README.md     # This file
 └── requirements.txt
 ```

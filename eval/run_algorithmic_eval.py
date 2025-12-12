@@ -11,7 +11,13 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from eval import ood_grid
-from eval.utils import EvalResult, evaluate_condition, seed_all, select_device
+from utils import (
+    EvalResult,
+    evaluate_condition,
+    get_eval_generation_kwargs,
+    seed_all,
+    select_device,
+)
 
 
 def _load_model(ckpt_path: str, device: torch.device):
@@ -64,12 +70,15 @@ def run_evaluation(
     tasks: Optional[List[str]] = None,
     out_path: Optional[str] = None,
     batch_size: int = 16,
+    n_override: Optional[int] = None,
     model=None,
     tokenizer=None,
+    verbose: bool = True,
+    iid_only: bool = False,
 ) -> Dict:
     seed_all(seed)
     device_obj = select_device(device)
-    tokenizer = tokenizer or ( _load_tokenizer(tokenizer_name) if tokenizer_name else None)
+    tokenizer = tokenizer or (_load_tokenizer(tokenizer_name) if tokenizer_name else None)
     if tokenizer is None:
         raise ValueError("Tokenizer must be provided or tokenizer_name must be set")
     model = model or (_load_model(ckpt_path, device_obj) if ckpt_path else None)
@@ -77,22 +86,28 @@ def run_evaluation(
         raise ValueError("Model must be provided or ckpt_path must be set")
 
     grid = ood_grid.build_grid(tasks)
+    if iid_only:
+        grid = [c for c in grid if c.name == "iid"]
+    gen_kwargs = get_eval_generation_kwargs(tokenizer=tokenizer)
+    gen_kwargs.pop("max_new_tokens", None)
     results: List[EvalResult] = []
 
     for cond in grid:
         h = hashlib.sha256(f"{cond.task}:{cond.name}:{seed}".encode()).digest()
         cond_seed = seed + int.from_bytes(h[:4], "little")
+        n = n_override if n_override is not None else cond.n
         res = evaluate_condition(
             model,
             tokenizer,
             task=cond.task,
             condition=cond.name,
             params=cond.params,
-            n=cond.n,
+            n=n,
             device=device_obj,
             max_new_tokens=cond.max_new_tokens,
             seed=cond_seed,
             batch_size=batch_size,
+            generation_kwargs=gen_kwargs,
         )
         results.append(res)
 
@@ -124,14 +139,15 @@ def run_evaluation(
             json.dump(output, f, indent=2)
 
     # Print table
-    header = f"{'task':<12}{'condition':<30}{'N':<6}{'acc':<8}{'avg_gen':<12}{'tok/s':<10}"
-    print(header)
-    print("-" * len(header))
-    for res in results:
-        print(
-            f"{res.task:<12}{res.condition:<30}{res.n:<6}{res.accuracy*100:>6.2f}  {res.avg_gen_len:>8.2f}    {res.tokens_per_sec:>8.1f}"
-        )
-    print("Overall accuracy:", summary["overall"])
+    if verbose:
+        header = f"{'task':<12}{'condition':<30}{'N':<6}{'acc':<8}{'avg_gen':<12}{'tok/s':<10}"
+        print(header)
+        print("-" * len(header))
+        for res in results:
+            print(
+                f"{res.task:<12}{res.condition:<30}{res.n:<6}{res.accuracy*100:>6.2f}  {res.avg_gen_len:>8.2f}    {res.tokens_per_sec:>8.1f}"
+            )
+        print("Overall accuracy:", summary["overall"])
 
     return {"summary": summary, "results": results}
 
