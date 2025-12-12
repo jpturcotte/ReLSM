@@ -26,6 +26,7 @@ import math
 import json
 import random
 import argparse
+from multiprocessing import Value
 from pathlib import Path
 from contextlib import nullcontext
 from typing import Optional, Dict, List
@@ -214,6 +215,21 @@ def build_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> t
     return torch.optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.95))
 
 
+def difficulty_schedule(tokens_seen: int, alg_tokens: int, schedule: str = "linear") -> float:
+    """Compute difficulty based on progress through algorithmic tokens."""
+
+    progress = min(tokens_seen / max(alg_tokens, 1), 1.0)
+
+    if schedule == "linear":
+        return 0.5 + 0.5 * progress
+    if schedule == "cosine":
+        return 0.5 + 0.5 * (1 - math.cos(math.pi * progress)) / 2
+    if schedule == "step":
+        return 0.5 if progress < 0.5 else 1.0
+
+    raise ValueError(f"Unknown difficulty schedule: {schedule}")
+
+
 def train(args):
     """Main training loop with split curriculum."""
 
@@ -301,6 +317,8 @@ def train(args):
     )
     
     print("\nLoading datasets...")
+
+    difficulty_value = Value("d", 0.0)
     
     # Phase 1: Algorithmic
     alg_dataset = AlgorithmicDataset(
@@ -308,6 +326,7 @@ def train(args):
         num_examples=args.alg_examples,
         max_seq_len=args.alg_seq_len,
         seed=args.seed,
+        difficulty_value=difficulty_value,
     )
     alg_loader = DataLoader(
         alg_dataset,
@@ -394,6 +413,12 @@ def train(args):
     running_ponder = 0.0
     
     while curriculum.tokens_seen < args.total_tokens:
+        if curriculum.tokens_seen < args.alg_tokens:
+            difficulty_value.value = difficulty_schedule(
+                curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
+            )
+        else:
+            difficulty_value.value = 1.0
         batch = curriculum.next_batch()
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
@@ -465,6 +490,7 @@ def train(args):
                 peak_vram_gb=peak_vram,
                 avg_inner_steps=avg_K,
                 ponder=avg_ponder,
+                difficulty=float(difficulty_value.value),
             )
 
             running_loss = 0.0
@@ -562,6 +588,13 @@ def main():
                        help="Tokens for Phase 1 (algorithmic)")
     parser.add_argument("--total_tokens", type=int, default=500_000_000,
                        help="Total token budget")
+    parser.add_argument(
+        "--difficulty_schedule",
+        type=str,
+        default="linear",
+        choices=["linear", "cosine", "step"],
+        help="Schedule for ramping algorithmic difficulty",
+    )
     parser.add_argument("--mix_band_tokens", type=int, default=None,
                        help="Transition band (tokens) between algorithmic and language phases")
     parser.add_argument("--persistent_alg_frac", type=float, default=0.15,
