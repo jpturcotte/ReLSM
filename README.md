@@ -65,6 +65,8 @@ python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --all \
     --output_dir ./runs/nano_baseline/eval_results
 ```
 
+`eval_hub.py` is the only supported entrypoint; the legacy `evaluate.py` wrapper has been removed.
+
 Artifacts written to `--output_dir`:
 
 - `results.json`: full metadata, algorithmic IID/OOD grid, needle sweep, and TinyStories perplexity
