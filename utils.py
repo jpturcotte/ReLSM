@@ -96,25 +96,32 @@ def get_eval_generation_kwargs(
     top_k: int = 0,
     extra_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Return deterministic generation settings for evaluation.
+    """Return generation kwargs compatible with ``BaselineTransformer.generate``.
 
-    All evaluation code paths should call this helper to guarantee greedy
-    decoding unless explicitly overridden. Defaults match the deterministic
-    decoding contract used by ``run_eval_suite``.
+    HF-style kwargs are intentionally filtered out so evaluation only forwards
+    arguments our custom ``model.generate`` understands.
     """
 
-    kwargs: Dict[str, Any] = {
-        "do_sample": do_sample,
+    allowed_keys = {
+        "max_new_tokens": max_new_tokens,
+        "temperature": temperature,
         "top_k": top_k,
         "top_p": top_p,
-        "temperature": temperature,
-        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
+        # Explicitly surface the EOS token ID our custom generator supports.
+        "eos_token_id": getattr(tokenizer, "eos_token_id", None) if tokenizer else None,
     }
-    if tokenizer is not None:
-        kwargs["pad_token_id"] = getattr(tokenizer, "pad_token_id", None)
+
     if extra_kwargs:
-        kwargs.update(extra_kwargs)
-    return kwargs
+        # Strip out any kwargs meant for HF generation APIs to avoid leaking
+        # unsupported parameters into custom models.
+        for key, value in extra_kwargs.items():
+            if key in allowed_keys:
+                allowed_keys[key] = value
+
+    # Only forward parameters our custom generate implementation accepts and
+    # that have concrete values (drop optional None entries like eos_token_id).
+    return {k: v for k, v in allowed_keys.items() if v is not None}
 
 
 def generate_text(
@@ -134,7 +141,7 @@ def generate_text(
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
     input_len = input_ids.shape[1]
 
-    output_ids = model.generate(input_ids, **generation_kwargs)
+    output_ids = model.generate(input_ids=input_ids, **generation_kwargs)
     generated_tokens = output_ids[0, input_len:]
     return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
@@ -160,7 +167,7 @@ def batch_generate(
         max_new_tokens=max_new_tokens,
         extra_kwargs=generation_kwargs,
     )
-    output_ids = model.generate(**tokenized, **gen_kwargs)
+    output_ids = model.generate(input_ids=input_ids, **gen_kwargs)
     prompt_lengths = tokenized.get("attention_mask", torch.ones_like(input_ids)).sum(dim=1)
     generations: List[str] = []
     for i, prompt_len in enumerate(prompt_lengths):
@@ -368,9 +375,9 @@ def generate_batch(
     with torch.no_grad():
         if use_autocast:
             with torch.cuda.amp.autocast():
-                outputs = model.generate(**tokenized, **gen_kwargs)
+                outputs = model.generate(input_ids=input_ids, **gen_kwargs)
         else:
-            outputs = model.generate(**tokenized, **gen_kwargs)
+            outputs = model.generate(input_ids=input_ids, **gen_kwargs)
     elapsed = max(1e-6, time.time() - start)
     attention_mask = tokenized.get("attention_mask")
     if attention_mask is None:

@@ -839,6 +839,7 @@ class BaselineTransformer(nn.Module):
         top_k: Optional[int] = 50,
         top_p: Optional[float] = 0.9,
         eos_token_id: Optional[int] = None,
+        do_sample: bool = True,
     ) -> torch.Tensor:
         """
         Autoregressive generation.
@@ -877,8 +878,12 @@ class BaselineTransformer(nn.Module):
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 logits[indices_to_remove] = float("-inf")
 
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            if do_sample:
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                # Greedy decoding path used for deterministic evaluation.
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
             generated = torch.cat([generated, next_token], dim=1)
 
             if eos_token_id is not None and (next_token == eos_token_id).all():
