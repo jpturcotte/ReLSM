@@ -36,6 +36,30 @@ class AlwaysCorrectModel:
         return torch.stack(padded)
 
 
+class AlwaysWrongModel:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def generate(self, input_ids=None, attention_mask=None, **kwargs):
+        decoded_prompts: List[str] = []
+        for ids, mask in zip(input_ids, attention_mask):
+            length = int(mask.sum().item())
+            decoded_prompts.append(self.tokenizer.decode(ids[:length], skip_special_tokens=True))
+        outputs = []
+        for prompt in decoded_prompts:
+            generated = prompt + " wrong"
+            outputs.append(self.tokenizer.encode(generated, return_tensors="pt")[0])
+        max_len = max(len(o) for o in outputs)
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        padded = []
+        for o in outputs:
+            if len(o) < max_len:
+                pad = torch.full((max_len - len(o),), pad_id, dtype=o.dtype)
+                o = torch.cat([o, pad])
+            padded.append(o)
+        return torch.stack(padded)
+
+
 def run_self_checks():
     from transformers import AutoTokenizer
 
@@ -53,6 +77,25 @@ def run_self_checks():
     yes_count = sum(1 for s in dyck_samples if s["target"].lower() == "yes")
     no_count = sum(1 for s in dyck_samples if s["target"].lower() == "no")
     assert yes_count == no_count == 10
+
+    # Dyck grid condition smoke test with always-correct stub
+    dyck_cond = ood_grid.dyck_grid()[0]
+    dyck_dataset = build_dataset("dyck", dyck_cond.n, dyck_cond.params, seed=2024)
+    dyck_answer_map = {ex["input"].strip(): ex["target"] for ex in dyck_dataset}
+    dyck_model = AlwaysCorrectModel(tok, dyck_answer_map)
+    dyck_res = evaluate_condition(
+        dyck_model,
+        tok,
+        task="dyck",
+        condition="dyck_iid",
+        params=dyck_cond.params,
+        n=dyck_cond.n,
+        device=torch.device("cpu"),
+        max_new_tokens=dyck_cond.max_new_tokens,
+        seed=2024,
+        batch_size=dyck_cond.n,
+    )
+    assert dyck_res.correct == dyck_cond.n and dyck_res.accuracy == 1.0
 
     # Always-correct stub
     cond = ood_grid.addition_grid()[0]
@@ -72,6 +115,23 @@ def run_self_checks():
         batch_size=4,
     )
     assert res.accuracy == 1.0, f"Expected perfect accuracy, got {res.accuracy}"
+
+    # Always-wrong stub to ensure failures are recorded
+    wrong_model = AlwaysWrongModel(tok)
+    wrong_res = evaluate_condition(
+        wrong_model,
+        tok,
+        task="addition",
+        condition="self_test_wrong",
+        params=cond.params,
+        n=8,
+        device=torch.device("cpu"),
+        max_new_tokens=32,
+        seed=111,
+        batch_size=4,
+    )
+    assert wrong_res.correct == 0, f"Expected zero correct, got {wrong_res.correct}"
+    assert wrong_res.examples, "Expected some failure examples to be collected"
     print(json.dumps({"status": "ok", "samples": len(dataset)}, indent=2))
 
 
