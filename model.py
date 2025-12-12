@@ -37,16 +37,26 @@ import torch.nn.functional as F
 
 # Optional accelerated selective scan (Mamba kernels)
 _selective_scan_fn = None
+HAS_MAMBA_SCAN = False
 
-_scan_iface = importlib.util.find_spec("mamba_ssm.ops.selective_scan_interface")
+try:
+    _scan_iface = importlib.util.find_spec("mamba_ssm.ops.selective_scan_interface")
+except ModuleNotFoundError:
+    _scan_iface = None
+
 if _scan_iface is not None:
     _module = importlib.import_module("mamba_ssm.ops.selective_scan_interface")
     _selective_scan_fn = getattr(_module, "selective_scan_fn", None)
+    HAS_MAMBA_SCAN = _selective_scan_fn is not None
 else:
-    _scan_triton = importlib.util.find_spec("mamba_ssm.ops.triton.selective_scan")
+    try:
+        _scan_triton = importlib.util.find_spec("mamba_ssm.ops.triton.selective_scan")
+    except ModuleNotFoundError:
+        _scan_triton = None
     if _scan_triton is not None:
         _module = importlib.import_module("mamba_ssm.ops.triton.selective_scan")
         _selective_scan_fn = getattr(_module, "selective_scan_fn", None)
+        HAS_MAMBA_SCAN = _selective_scan_fn is not None
 
 
 @torch.jit.script
