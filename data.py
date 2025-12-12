@@ -97,8 +97,10 @@ class AlgorithmicGenerator:
         sampled_mod = AlgorithmicGenerator._sample_int_with_digits(
             rng, min(modulus_digits, 5)
         )
-        base_mod = mod if mod is not None else 0
-        mod_val = max(3, max(base_mod, sampled_mod))
+        if mod is None:
+            mod_val = max(3, sampled_mod)
+        else:
+            mod_val = max(3, mod)
         a = rng.randint(0, mod_val - 1)
         b = rng.randint(0, mod_val - 1)
         result = (a + b) % mod_val
