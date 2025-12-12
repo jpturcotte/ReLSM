@@ -36,109 +36,296 @@ class AlgorithmicGenerator:
     Generates synthetic algorithmic tasks for grokking.
     Infinite, procedural - train for 1000s of epochs without overfitting.
     """
+
+    @staticmethod
+    def _difficulty_bucket(difficulty: float) -> str:
+        """Map difficulty scalar to a coarse bucket."""
+        d = min(max(difficulty, 0.0), 1.0)
+        if d < 0.3:
+            return "easy"
+        if d < 0.7:
+            return "medium"
+        return "hard"
+
+    @classmethod
+    def _digit_range(cls, difficulty: float, *, cap: int = 8) -> Tuple[int, int]:
+        bucket = cls._difficulty_bucket(difficulty)
+        if bucket == "easy":
+            low, high = 2, 3
+        elif bucket == "medium":
+            low, high = 4, 6
+        else:
+            low, high = 7, 8
+
+        high = min(high, cap)
+        low = min(low, high)
+        return low, high
+
+    @classmethod
+    def _length_range(cls, difficulty: float, *, easy: Tuple[int, int], medium: Tuple[int, int], hard: Tuple[int, int]) -> Tuple[int, int]:
+        bucket = cls._difficulty_bucket(difficulty)
+        if bucket == "easy":
+            return easy
+        if bucket == "medium":
+            return medium
+        return hard
+
+    @staticmethod
+    def _sample_int_with_digits(rng: random.Random, digits: int) -> int:
+        if digits <= 1:
+            return rng.randint(0, 9)
+        low = 10 ** (digits - 1)
+        high = 10**digits - 1
+        return rng.randint(low, high)
+
+    @staticmethod
+    def _choose_prompt(rng: random.Random, templates: List[str], **kwargs) -> str:
+        template = rng.choice(templates)
+        return template.format(**kwargs).strip()
     
     @staticmethod
-    def modular_arithmetic(mod: int = 97, rng: Optional[random.Random] = None) -> Dict[str, str]:
+    def modular_arithmetic(
+        mod: Optional[int] = 97,
+        rng: Optional[random.Random] = None,
+        difficulty: float = 0.5,
+    ) -> Dict[str, str]:
         """Modular addition: (a + b) mod p"""
         rng = rng or random
-        a = rng.randint(0, mod - 1)
-        b = rng.randint(0, mod - 1)
-        result = (a + b) % mod
-        
+        digits_low, digits_high = AlgorithmicGenerator._digit_range(difficulty)
+        operand_digits = rng.randint(digits_low, digits_high)
+        modulus_digits = max(operand_digits, digits_low)
+        sampled_mod = AlgorithmicGenerator._sample_int_with_digits(
+            rng, min(modulus_digits, 5)
+        )
+        if mod is None:
+            mod_val = max(3, sampled_mod)
+        else:
+            mod_val = max(3, mod)
+        a = rng.randint(0, mod_val - 1)
+        b = rng.randint(0, mod_val - 1)
+        result = (a + b) % mod_val
+
+        prompt = AlgorithmicGenerator._choose_prompt(
+            rng,
+            [
+                "Compute ({a} + {b}) mod {mod} =",
+                "What is ({a} + {b}) modulo {mod}?",
+                "Add {a} and {b}, then take mod {mod}. Result:",
+                "({a} plus {b}) % {mod} equals",
+            ],
+            a=a,
+            b=b,
+            mod=mod_val,
+        )
+
         return {
-            "text": f"({a} + {b}) mod {mod} = {result}",
-            "input": f"({a} + {b}) mod {mod} =",
+            "text": f"{prompt} {result}",
+            "input": prompt,
             "target": str(result),
             "task": "mod_add",
         }
-    
+
     @staticmethod
-    def parity(length: int = 8, rng: Optional[random.Random] = None) -> Dict[str, str]:
+    def parity(
+        length: Optional[int] = None,
+        rng: Optional[random.Random] = None,
+        difficulty: float = 0.5,
+    ) -> Dict[str, str]:
         """Parity of binary string"""
         rng = rng or random
-        bits = [rng.randint(0, 1) for _ in range(length)]
+        # NOTE: For OOD evaluation we keep training length fixed at 8 by default.
+        seq_len = length if length is not None else 8
+        bits = [rng.randint(0, 1) for _ in range(seq_len)]
         parity = sum(bits) % 2
         bit_str = "".join(map(str, bits))
-        
+
+        prompt = AlgorithmicGenerator._choose_prompt(
+            rng,
+            [
+                "parity({bits}) =",
+                "Is the number of ones in {bits} even (0) or odd (1)?",
+                "Compute the parity bit for {bits}:",
+                "Parity of {bits}?",
+            ],
+            bits=bit_str,
+        )
+
         return {
-            "text": f"parity({bit_str}) = {parity}",
-            "input": f"parity({bit_str}) =",
+            "text": f"{prompt} {parity}",
+            "input": prompt,
             "target": str(parity),
             "task": "parity",
         }
-    
+
     @staticmethod
-    def addition(max_digits: int = 4, rng: Optional[random.Random] = None) -> Dict[str, str]:
+    def addition(max_digits: int = 4, rng: Optional[random.Random] = None, difficulty: float = 0.5) -> Dict[str, str]:
         """Multi-digit addition"""
+        # NOTE: For OOD addition eval we cap training digits at 4.
         rng = rng or random
-        digits = rng.randint(1, max_digits)
-        a = rng.randint(10**(digits-1), 10**digits - 1) if digits > 1 else rng.randint(0, 9)
-        b = rng.randint(10**(digits-1), 10**digits - 1) if digits > 1 else rng.randint(0, 9)
+        digit_range = AlgorithmicGenerator._digit_range(difficulty, cap=max_digits)
+        digits = rng.randint(digit_range[0], digit_range[1])
+        a = AlgorithmicGenerator._sample_int_with_digits(rng, digits)
+        b = AlgorithmicGenerator._sample_int_with_digits(rng, digits)
         result = a + b
-        
+
+        prompt = AlgorithmicGenerator._choose_prompt(
+            rng,
+            [
+                "Compute: {a} + {b} =",
+                "What is {a} plus {b}?",
+                "Add {a} and {b}. Answer:",
+                "Sum {a} with {b} =",
+                "{a} + {b} equals",
+            ],
+            a=a,
+            b=b,
+        )
+
         return {
-            "text": f"{a} + {b} = {result}",
-            "input": f"{a} + {b} =",
+            "text": f"{prompt} {result}",
+            "input": prompt,
             "target": str(result),
             "task": "addition",
         }
-    
+
     @staticmethod
-    def multiplication(max_val: int = 99, rng: Optional[random.Random] = None) -> Dict[str, str]:
+    def multiplication(max_val: int = 99, rng: Optional[random.Random] = None, difficulty: float = 0.5) -> Dict[str, str]:
         """Two-digit multiplication"""
         rng = rng or random
-        a = rng.randint(2, max_val)
-        b = rng.randint(2, max_val)
+        digit_range = AlgorithmicGenerator._digit_range(difficulty, cap=4)
+        digits = rng.randint(digit_range[0], digit_range[1])
+        high = min(max_val, 10**digits - 1)
+        low = max(2, 10 ** (digits - 1))
+        if low > high:
+            low = 2
+        a = rng.randint(low, high)
+        b = rng.randint(low, high)
         result = a * b
-        
+
+        prompt = AlgorithmicGenerator._choose_prompt(
+            rng,
+            [
+                "Multiply: {a} * {b} =",
+                "What is {a} times {b}?",
+                "Product of {a} and {b}:",
+                "Compute {a} multiplied by {b} =",
+            ],
+            a=a,
+            b=b,
+        )
+
         return {
-            "text": f"{a} * {b} = {result}",
-            "input": f"{a} * {b} =",
+            "text": f"{prompt} {result}",
+            "input": prompt,
             "target": str(result),
             "task": "multiplication",
         }
-    
+
     @staticmethod
-    def copy_sequence(length: int = 8, rng: Optional[random.Random] = None) -> Dict[str, str]:
+    def copy_sequence(
+        length: Optional[int] = None,
+        rng: Optional[random.Random] = None,
+        difficulty: float = 0.5,
+    ) -> Dict[str, str]:
         """Copy task - tests basic sequence modeling"""
         rng = rng or random
-        seq = [rng.randint(0, 9) for _ in range(length)]
+        len_range = AlgorithmicGenerator._length_range(
+            difficulty,
+            easy=(4, 6),
+            medium=(7, 10),
+            hard=(11, 14),
+        )
+        seq_len = length if length is not None else rng.randint(len_range[0], len_range[1])
+        seq = [rng.randint(0, 9) for _ in range(seq_len)]
         seq_str = " ".join(map(str, seq))
-        
+
+        prompt = AlgorithmicGenerator._choose_prompt(
+            rng,
+            [
+                "copy: {seq} ->",
+                "Repeat the sequence {seq}:",
+                "Copy this list exactly: {seq} =>",
+                "Write the same numbers again: {seq} =",
+            ],
+            seq=seq_str,
+        )
+
         return {
-            "text": f"copy: {seq_str} -> {seq_str}",
-            "input": f"copy: {seq_str} ->",
+            "text": f"{prompt} {seq_str}",
+            "input": prompt,
             "target": seq_str,
             "task": "copy",
         }
-    
+
     @staticmethod
-    def reverse_sequence(length: int = 8, rng: Optional[random.Random] = None) -> Dict[str, str]:
+    def reverse_sequence(
+        length: Optional[int] = None,
+        rng: Optional[random.Random] = None,
+        difficulty: float = 0.5,
+    ) -> Dict[str, str]:
         """Reverse task - tests sequential reasoning"""
         rng = rng or random
-        seq = [rng.randint(0, 9) for _ in range(length)]
+        len_range = AlgorithmicGenerator._length_range(
+            difficulty,
+            easy=(4, 6),
+            medium=(7, 10),
+            hard=(11, 14),
+        )
+        seq_len = length if length is not None else rng.randint(len_range[0], len_range[1])
+        seq = [rng.randint(0, 9) for _ in range(seq_len)]
         seq_str = " ".join(map(str, seq))
         rev_str = " ".join(map(str, reversed(seq)))
-        
+
+        prompt = AlgorithmicGenerator._choose_prompt(
+            rng,
+            [
+                "reverse: {seq} ->",
+                "Write {seq} backwards:",
+                "Reverse the order of {seq}:",
+                "Flip the sequence {seq} =",
+            ],
+            seq=seq_str,
+        )
+
         return {
-            "text": f"reverse: {seq_str} -> {rev_str}",
-            "input": f"reverse: {seq_str} ->",
+            "text": f"{prompt} {rev_str}",
+            "input": prompt,
             "target": rev_str,
             "task": "reverse",
         }
-    
+
     @staticmethod
-    def dyck_language(max_depth: int = 4, length: int = 8, rng: Optional[random.Random] = None) -> Dict[str, str]:
+    def dyck_language(
+        max_depth: int = 4,
+        length: Optional[int] = None,
+        rng: Optional[random.Random] = None,
+        difficulty: float = 0.5,
+    ) -> Dict[str, str]:
         """Dyck language (balanced parentheses) - tests stack operations"""
         rng = rng or random
+        len_range = AlgorithmicGenerator._length_range(
+            difficulty,
+            easy=(6, 10),
+            medium=(10, 14),
+            hard=(14, 18),
+        )
+        seq_len = length if length is not None else rng.randint(len_range[0], len_range[1])
+        depth_bucket = AlgorithmicGenerator._difficulty_bucket(difficulty)
+        if depth_bucket == "easy":
+            depth_cap = min(2, max_depth)
+        elif depth_bucket == "medium":
+            depth_cap = min(3, max_depth)
+        else:
+            depth_cap = max_depth
+
         # Generate valid Dyck sequence
         seq = []
         depth = 0
-        for _ in range(length):
+        for _ in range(seq_len):
             if depth == 0:
                 seq.append("(")
                 depth += 1
-            elif depth >= max_depth:
+            elif depth >= depth_cap:
                 seq.append(")")
                 depth -= 1
             else:
@@ -155,57 +342,123 @@ class AlgorithmicGenerator:
             depth -= 1
         
         seq_str = "".join(seq)
-        
+
+        prompt = AlgorithmicGenerator._choose_prompt(
+            rng,
+            [
+                "dyck: {seq}",
+                "Is '{seq}' balanced?",
+                "Check Dyck validity for: {seq}",
+                "Does {seq} form a correct parentheses string?",
+            ],
+            seq=seq_str,
+        )
+
         return {
-            "text": f"dyck: {seq_str} valid",
-            "input": f"dyck: {seq_str}",
+            "text": f"{prompt} valid",
+            "input": prompt,
             "target": "valid",
             "task": "dyck",
         }
-    
+
     @staticmethod
-    def chain_arithmetic(n_ops: int = 3, rng: Optional[random.Random] = None) -> Dict[str, str]:
+    def chain_arithmetic(
+        n_ops: Optional[int] = None,
+        rng: Optional[random.Random] = None,
+        difficulty: float = 0.5,
+    ) -> Dict[str, str]:
         """Chain of arithmetic operations"""
         rng = rng or random
+        op_counts = AlgorithmicGenerator._length_range(
+            difficulty,
+            easy=(2, 3),
+            medium=(3, 4),
+            hard=(4, 6),
+        )
+        sampled_ops = rng.randint(op_counts[0], op_counts[1])
+        ops = n_ops if n_ops is not None else sampled_ops
         val = rng.randint(1, 50)
         expr = str(val)
 
-        for _ in range(n_ops):
+        for _ in range(ops):
             op = rng.choice(["+", "-"])
             operand = rng.randint(1, 20)
             expr += f" {op} {operand}"
             val = val + operand if op == "+" else val - operand
-        
+
+        prompt = AlgorithmicGenerator._choose_prompt(
+            rng,
+            [
+                "calc: {expr} =",
+                "Evaluate {expr}.",
+                "Compute the result of {expr}:",
+                "What does {expr} simplify to?",
+            ],
+            expr=expr,
+        )
+
         return {
-            "text": f"calc: {expr} = {val}",
-            "input": f"calc: {expr} =",
+            "text": f"{prompt} {val}",
+            "input": prompt,
             "target": str(val),
             "task": "chain",
         }
-    
+
     @staticmethod
-    def comparison(max_val: int = 1000, rng: Optional[random.Random] = None) -> Dict[str, str]:
+    def comparison(max_val: int = 1000, rng: Optional[random.Random] = None, difficulty: float = 0.5) -> Dict[str, str]:
         """Number comparison"""
         rng = rng or random
-        a = rng.randint(1, max_val)
-        b = rng.randint(1, max_val)
+        digit_range = AlgorithmicGenerator._digit_range(difficulty, cap=6)
+        digits = rng.randint(digit_range[0], digit_range[1])
+        high = min(max_val, 10**digits - 1)
+        low = max(1, 10 ** (digits - 1))
+        if low > high:
+            low = 1
+        a = rng.randint(low, high)
+        b = rng.randint(low, high)
         result = ">" if a > b else ("<" if a < b else "=")
-        
+
+        prompt = AlgorithmicGenerator._choose_prompt(
+            rng,
+            [
+                "compare: {a} ? {b} ->",
+                "Which is larger, {a} or {b}?",
+                "Compare {a} to {b} (>, <, or =):",
+                "Between {a} and {b}, choose the relation:",
+            ],
+            a=a,
+            b=b,
+        )
+
         return {
-            "text": f"compare: {a} ? {b} -> {result}",
-            "input": f"compare: {a} ? {b} ->",
+            "text": f"{prompt} {result}",
+            "input": prompt,
             "target": result,
             "task": "compare",
         }
-    
+
     @staticmethod
-    def successor(max_val: int = 1000, rng: Optional[random.Random] = None) -> Dict[str, str]:
+    def successor(max_val: int = 1000, rng: Optional[random.Random] = None, difficulty: float = 0.5) -> Dict[str, str]:
         """Successor function"""
         rng = rng or random
-        n = rng.randint(0, max_val)
+        digit_range = AlgorithmicGenerator._digit_range(difficulty, cap=6)
+        digits = rng.randint(digit_range[0], digit_range[1])
+        max_n = min(max_val, 10**digits - 1)
+        n = rng.randint(0, max_n)
+
+        prompt = AlgorithmicGenerator._choose_prompt(
+            rng,
+            [
+                "succ({n}) =",
+                "What is the successor of {n}:",
+                "Next integer after {n} is",
+                "Increment {n} by one =>",
+            ],
+            n=n,
+        )
         return {
-            "text": f"succ({n}) = {n + 1}",
-            "input": f"succ({n}) =",
+            "text": f"{prompt} {n + 1}",
+            "input": prompt,
             "target": str(n + 1),
             "task": "successor",
         }
@@ -216,15 +469,24 @@ class AlgorithmicGenerator:
         n: int,
         tasks: Optional[List[str]] = None,
         rng: Optional[random.Random] = None,
+        difficulty: Optional[float] = None,
     ) -> List[Dict]:
         """Generate mixed batch of algorithmic tasks."""
         rng = rng or random
         generators = cls._get_generators()
-        
+
+        if difficulty is None:
+            difficulty = 0.5
+
         if tasks is None:
             tasks = list(generators.keys())
-        
-        return [cls.generate_example(tasks=tasks, rng=rng, generators=generators) for _ in range(n)]
+
+        return [
+            cls.generate_example(
+                tasks=tasks, rng=rng, generators=generators, difficulty=difficulty
+            )
+            for _ in range(n)
+        ]
 
     @classmethod
     def generate_example(
@@ -232,8 +494,11 @@ class AlgorithmicGenerator:
         tasks: Optional[List[str]] = None,
         rng: Optional[random.Random] = None,
         generators: Optional[Dict[str, Callable]] = None,
+        difficulty: Optional[float] = None,
     ) -> Dict:
         rng = rng or random
+        if difficulty is None:
+            difficulty = 0.5
         if generators is None:
             generators = cls._get_generators()
 
@@ -241,7 +506,7 @@ class AlgorithmicGenerator:
             tasks = list(generators.keys())
 
         task = rng.choice(tasks)
-        return generators[task](rng=rng)
+        return generators[task](rng=rng, difficulty=difficulty)
 
     @classmethod
     def _get_generators(cls) -> Dict[str, Callable]:
@@ -278,6 +543,9 @@ class AlgorithmicDataset(IterableDataset):
         self.max_seq_len = max_seq_len
         self.tasks = tasks
         self.seed = seed
+        self.tokens_seen = 0
+        self._token_budget = max(1, self.num_examples * max(self.max_seq_len - 1, 1))
+        self._worker_token_budget = self._token_budget
 
         self._char_token_map = self._build_char_token_map()
 
@@ -286,7 +554,7 @@ class AlgorithmicDataset(IterableDataset):
         chars = "0123456789()+-*=? "
         chars += "abcdefghijklmnopqrstuvwxyz"
         chars += "ABCDEFGHIJKLMNOPQRSTUVWXYZ"  # For future-proofing
-        chars += ":,"  # punctuation used in prompts
+        chars += ":,%<>'"  # punctuation used in prompts
 
         token_map = {}
         for ch in set(chars):
@@ -308,6 +576,9 @@ class AlgorithmicDataset(IterableDataset):
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         worker_info = get_worker_info()
 
+        # Reset per-epoch token counter in case the dataset is reused across epochs.
+        self.tokens_seen = 0
+
         if self.seed is not None:
             seed = self.seed + (worker_info.id if worker_info is not None else 0)
         else:
@@ -321,9 +592,12 @@ class AlgorithmicDataset(IterableDataset):
         worker_id = worker_info.id if worker_info is not None else 0
         num_workers = worker_info.num_workers if worker_info is not None else 1
 
+        self._worker_token_budget = max(1, self._token_budget / num_workers)
+
         for _ in range(worker_id, self.num_examples, num_workers):
+            difficulty = self._sample_difficulty(rng)
             example = AlgorithmicGenerator.generate_example(
-                tasks=self.tasks, rng=rng, generators=generators
+                tasks=self.tasks, rng=rng, generators=generators, difficulty=difficulty
             )
             tokens = self._encode_text(example["text"])
 
@@ -339,11 +613,21 @@ class AlgorithmicDataset(IterableDataset):
                 input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
                 labels = torch.cat([labels, torch.full((pad_len,), -100)])
 
+            n_tokens = int((labels != -100).sum().item())
+            self.tokens_seen += n_tokens
+
             yield {
                 "input_ids": input_ids,
                 "labels": labels,
                 "task": example["task"],
             }
+
+    def _sample_difficulty(self, rng: random.Random) -> float:
+        budget = getattr(self, "_worker_token_budget", self._token_budget)
+        progress = min(self.tokens_seen / budget, 1.0)
+        upper = min(1.0, 0.5 + 0.5 * progress)
+        lower = 0.0
+        return rng.uniform(lower, upper)
 
 
 # =============================================================================
