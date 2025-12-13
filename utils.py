@@ -138,7 +138,7 @@ def generate_text(
         max_new_tokens=max_new_tokens,
         extra_kwargs=generation_kwargs,
     )
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    input_ids = tokenizer(prompt, truncation=True, return_tensors="pt")["input_ids"].to(device)
     input_len = input_ids.shape[1]
 
     output_ids = model.generate(input_ids=input_ids, **generation_kwargs)
@@ -397,7 +397,7 @@ def generate_batch(
     buckets: Dict[int, List[Tuple[int, torch.Tensor]]] = {}
     for item in encoded:
         _, input_ids = item
-        buckets.setdefault(input_ids.size(1), []).append(item)
+        buckets.setdefault(input_ids.size(0), []).append(item)
 
     preds: List[str] = [""] * len(prompts_list)
     generation_lengths: List[int] = [0] * len(prompts_list)
@@ -473,9 +473,8 @@ def evaluate_condition(
         total_time += elapsed
         total_gen_len += batch_generated
         for pred, tgt, ex in zip(preds, targets, batch):
-            norm_pred = normalize_prediction(task, pred)
             norm_tgt = normalize_target(task, tgt)
-            if norm_pred == norm_tgt:
+            if pred == norm_tgt:
                 total_correct += 1
             else:
                 if len(collected_examples) < 10:
