@@ -97,25 +97,31 @@ class MetricsLogger:
 
 @torch.no_grad()
 def evaluate_algorithmic(model, tokenizer, device, n_examples: int = 100) -> Dict[str, float]:
-    """Thin wrapper that runs the canonical IID/OOD evaluator.
+    """Run the canonical algorithmic OOD grid using ``eval_hub``.
 
-    The ``n_examples`` argument is ignored but preserved for backward
-    compatibility with older training scripts.
+    The ``n_examples`` argument caps the number of examples per condition
+    (kept for backward compatibility with older training scripts).
     """
-    from eval.run_algorithmic_eval import run_evaluation
 
-    device_str = str(device) if isinstance(device, torch.device) else device
-    results = run_evaluation(
-        device=device_str,
+    from eval_hub import run_algorithmic_suite
+    from utils import get_eval_generation_kwargs
+
+    device_obj = device if isinstance(device, torch.device) else torch.device(device)
+    generation_kwargs = get_eval_generation_kwargs(tokenizer=tokenizer, max_new_tokens=0)
+
+    results = run_algorithmic_suite(
+        model,
+        tokenizer,
+        device_obj,
         seed=42,
-        tasks=None,
-        out_path=None,
         batch_size=8,
-        model=model,
-        tokenizer=tokenizer,
+        generation_kwargs=generation_kwargs,
+        limit=n_examples,
     )
-    # run_evaluation returns EvalResult objects; we expose averages only
-    return results.get("summary", {})
+
+    summary = {"overall": results.get("overall_accuracy", 0.0)}
+    summary.update(results.get("per_task_accuracy", {}))
+    return summary
 
 
 @torch.no_grad()
