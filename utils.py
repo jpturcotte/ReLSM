@@ -155,24 +155,35 @@ def batch_generate(
     generation_kwargs: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """Vectorized generation helper for multiple prompts."""
-    tokenized = tokenizer(
-        list(prompts),
-        padding=True,
-        truncation=True,
-        return_tensors="pt",
-    ).to(device)
-    input_ids = tokenized["input_ids"]
+    prompts_list = list(prompts)
     gen_kwargs = get_eval_generation_kwargs(
         tokenizer=tokenizer,
         max_new_tokens=max_new_tokens,
         extra_kwargs=generation_kwargs,
     )
-    output_ids = model.generate(input_ids=input_ids, **gen_kwargs)
-    prompt_lengths = tokenized.get("attention_mask", torch.ones_like(input_ids)).sum(dim=1)
-    generations: List[str] = []
-    for i, prompt_len in enumerate(prompt_lengths):
-        tail = output_ids[i, prompt_len:]
-        generations.append(tokenizer.decode(tail, skip_special_tokens=True).strip())
+
+    # Tokenize each prompt individually to avoid introducing padding tokens that
+    # custom models may treat as real context.
+    encoded: List[Tuple[int, torch.Tensor]] = []
+    for idx, prompt in enumerate(prompts_list):
+        tokens = tokenizer(prompt, truncation=True, return_tensors="pt")
+        encoded.append((idx, tokens["input_ids"].squeeze(0)))
+
+    # Group prompts by exact tokenized length to preserve batching without
+    # padding. Each micro-batch shares the same sequence length and can be
+    # stacked without inserting pad tokens.
+    buckets: Dict[int, List[Tuple[int, torch.Tensor]]] = {}
+    for item in encoded:
+        _, input_ids = item
+        buckets.setdefault(input_ids.size(0), []).append(item)
+
+    generations: List[str] = [""] * len(prompts_list)
+    for prompt_len, bucket in buckets.items():
+        batch_ids = torch.stack([ids for _, ids in bucket], dim=0).to(device)
+        output_ids = model.generate(input_ids=batch_ids, **gen_kwargs)
+        for i, (orig_idx, _) in enumerate(bucket):
+            tail = output_ids[i, prompt_len:]
+            generations[orig_idx] = tokenizer.decode(tail, skip_special_tokens=True).strip()
     return generations
 
 
