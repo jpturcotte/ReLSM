@@ -182,7 +182,9 @@ def run_longctx_suite(
                 example = generator.generate(needle_depth=depth)
                 input_ids = example["input_ids"].to(device).unsqueeze(0)
                 outputs = model.generate(input_ids=input_ids, **gen_kwargs)
-                decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                prompt_len = input_ids.shape[1]
+                continuation = outputs[0, prompt_len:]
+                decoded = tokenizer.decode(continuation, skip_special_tokens=True)
                 if "Answer:" in decoded:
                     tail = decoded.split("Answer:")[-1].strip().split()
                 else:
