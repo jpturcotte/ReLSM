@@ -68,6 +68,28 @@ def _prepare_model(model, device: torch.device, dtype: Optional[str], compile_mo
     return model
 
 
+def _parse_answer_from_continuation(decoded: str) -> str:
+    """Extract the first token of the answer from a decoded continuation."""
+
+    if "Answer:" in decoded:
+        tail = decoded.split("Answer:")[-1].strip().split()
+    else:
+        tail = decoded.strip().split()
+    return tail[0] if tail else ""
+
+
+def _prediction_from_output_ids(
+    tokenizer, output_ids: torch.Tensor | Sequence[int], prompt_len: int
+) -> str:
+    """Decode and parse only the continuation portion of a generation."""
+
+    continuation_ids = output_ids[prompt_len:]
+    if isinstance(continuation_ids, torch.Tensor):
+        continuation_ids = continuation_ids.tolist()
+    continuation = tokenizer.decode(continuation_ids, skip_special_tokens=True)
+    return _parse_answer_from_continuation(continuation)
+
+
 def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
     conditions: List[Dict[str, Any]] = []
     per_task: Dict[str, Dict[str, Any]] = {}
@@ -183,13 +205,9 @@ def run_longctx_suite(
                 input_ids = example["input_ids"].to(device).unsqueeze(0)
                 outputs = model.generate(input_ids=input_ids, **gen_kwargs)
                 prompt_len = input_ids.shape[1]
-                continuation = outputs[0, prompt_len:]
-                decoded = tokenizer.decode(continuation, skip_special_tokens=True)
-                if "Answer:" in decoded:
-                    tail = decoded.split("Answer:")[-1].strip().split()
-                else:
-                    tail = decoded.split()
-                predicted = tail[0] if tail else ""
+                predicted = _prediction_from_output_ids(
+                    tokenizer, outputs[0], prompt_len
+                )
                 if predicted == example["answer"]:
                     depth_correct += 1
                     correct += 1
