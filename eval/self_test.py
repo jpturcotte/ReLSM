@@ -25,7 +25,7 @@ def run_self_test_suite(
 
     seed_all(seed)
     prompts = ["Hello, world!", "2 + 2 ="]
-    preds, tokens, elapsed = generate_batch(
+    preds, gen_lengths, elapsed = generate_batch(
         model,
         tokenizer,
         prompts,
@@ -35,6 +35,7 @@ def run_self_test_suite(
         task="self_test",
         generation_kwargs=generation_kwargs,
     )
+    tokens = sum(gen_lengths)
     return {
         "status": "ok",
         "samples": [

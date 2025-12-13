@@ -849,6 +849,8 @@ class BaselineTransformer(nn.Module):
         """
         self.eval()
         generated = input_ids
+        batch_size = generated.size(0)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=generated.device)
 
         use_kv_cache = self.config.variant in {"baseline", "shared_loop", "ssm", "ssm_mem"}
 
@@ -892,10 +894,18 @@ class BaselineTransformer(nn.Module):
             else:
                 # Greedy decoding path used for deterministic evaluation.
                 next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+            if eos_token_id is not None:
+                eos_fill = torch.full_like(next_token, eos_token_id)
+                next_token = torch.where(finished.unsqueeze(1), eos_fill, next_token)
+
             generated = torch.cat([generated, next_token], dim=1)
 
-            if eos_token_id is not None and (next_token == eos_token_id).all():
-                break
+            if eos_token_id is not None:
+                just_finished = (next_token.squeeze(1) == eos_token_id) & ~finished
+                finished = finished | just_finished
+                if finished.all():
+                    break
 
         return generated
 

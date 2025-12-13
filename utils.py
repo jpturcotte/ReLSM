@@ -400,7 +400,7 @@ def generate_batch(
     use_autocast: bool,
     task: str,
     generation_kwargs: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[str], int, float]:
+) -> Tuple[List[str], List[int], float]:
     """Generate model completions and return predictions and throughput stats."""
 
     tokenized = batch_tokenize(tokenizer, prompts, device)
@@ -422,8 +422,21 @@ def generate_batch(
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids)
     preds = decode_generated(tokenizer, input_ids, attention_mask, outputs, task=task)
-    total_tokens = int((outputs.shape[1] - input_ids.shape[1]) * outputs.shape[0])
-    return preds, total_tokens, elapsed
+
+    prompt_lengths = attention_mask.sum(dim=1)
+    eos_token_id = gen_kwargs.get("eos_token_id")
+    generation_lengths: List[int] = []
+    for i in range(outputs.size(0)):
+        prompt_len = int(prompt_lengths[i].item())
+        gen_tokens = outputs[i, prompt_len:]
+        gen_len = gen_tokens.size(0)
+        if eos_token_id is not None:
+            eos_positions = (gen_tokens == eos_token_id).nonzero(as_tuple=False)
+            if eos_positions.numel() > 0:
+                gen_len = int(eos_positions[0].item()) + 1
+        generation_lengths.append(int(gen_len))
+
+    return preds, generation_lengths, elapsed
 
 
 def evaluate_condition(
@@ -456,7 +469,7 @@ def evaluate_condition(
         batch = dataset[start_idx : start_idx + batch_size]
         prompts = [ex["input"] for ex in batch]
         targets = [ex["target"] for ex in batch]
-        preds, tok_count, elapsed = generate_batch(
+        preds, gen_lengths, elapsed = generate_batch(
             model,
             tokenizer,
             prompts,
@@ -466,10 +479,10 @@ def evaluate_condition(
             task=task,
             generation_kwargs=generation_kwargs,
         )
-        total_tokens += tok_count
+        batch_generated = sum(gen_lengths)
+        total_tokens += batch_generated
         total_time += elapsed
-        avg_batch_gen = tok_count / max(len(batch), 1)
-        total_gen_len += avg_batch_gen
+        total_gen_len += batch_generated
         for pred, tgt, ex in zip(preds, targets, batch):
             norm_pred = normalize_prediction(task, pred)
             norm_tgt = normalize_target(task, tgt)
@@ -487,7 +500,7 @@ def evaluate_condition(
             total_examples += 1
 
     accuracy = total_correct / total_examples if total_examples else 0.0
-    avg_gen_len = total_gen_len / math.ceil(n / batch_size) if n else 0.0
+    avg_gen_len = total_gen_len / total_examples if total_examples else 0.0
     tokens_per_sec = total_tokens / total_time if total_time > 0 else 0.0
 
     return EvalResult(
