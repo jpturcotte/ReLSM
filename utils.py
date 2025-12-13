@@ -357,30 +357,6 @@ def build_dataset(task: str, n: int, params: Dict[str, Any], seed: int) -> List[
     return examples
 
 
-def batch_tokenize(tokenizer, prompts: List[str], device: torch.device):
-    """Tokenize a list of prompts on the specified device."""
-
-    encoded = tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-    )
-    return {k: v.to(device) for k, v in encoded.items()}
-
-
-def decode_generated(tokenizer, input_ids, attention_mask, output_ids, task: str) -> List[str]:
-    """Decode generated continuations and normalize predictions."""
-
-    preds: List[str] = []
-    for inp, mask, out in zip(input_ids, attention_mask, output_ids):
-        prompt_len = int(mask.sum().item())
-        gen_tokens = out[prompt_len:]
-        text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
-        preds.append(normalize_prediction(task, text))
-    return preds
-
-
 def score_predictions(task: str, preds: List[str], targets: List[str]) -> Tuple[int, int]:
     """Compute correct counts for a batch of predictions."""
 
@@ -403,39 +379,52 @@ def generate_batch(
 ) -> Tuple[List[str], List[int], float]:
     """Generate model completions and return predictions and throughput stats."""
 
-    tokenized = batch_tokenize(tokenizer, prompts, device)
-    input_ids = tokenized["input_ids"]
+    prompts_list = list(prompts)
     gen_kwargs = get_eval_generation_kwargs(
         tokenizer=tokenizer,
         max_new_tokens=max_new_tokens,
         extra_kwargs=generation_kwargs,
     )
+
+    # Tokenize each prompt individually to avoid inserting padding tokens that
+    # custom models would treat as real context.
+    encoded: List[Tuple[int, torch.Tensor]] = []
+    for idx, prompt in enumerate(prompts_list):
+        tokens = tokenizer(prompt, truncation=True, return_tensors="pt")
+        encoded.append((idx, tokens["input_ids"].squeeze(0)))
+
+    # Bucket by exact sequence length so we can batch prompts without padding.
+    buckets: Dict[int, List[Tuple[int, torch.Tensor]]] = {}
+    for item in encoded:
+        _, input_ids = item
+        buckets.setdefault(input_ids.size(1), []).append(item)
+
+    preds: List[str] = [""] * len(prompts_list)
+    generation_lengths: List[int] = [0] * len(prompts_list)
+    eos_token_id = gen_kwargs.get("eos_token_id")
+
     start = time.time()
     with torch.no_grad():
-        if use_autocast:
-            with torch.cuda.amp.autocast():
-                outputs = model.generate(input_ids=input_ids, **gen_kwargs)
-        else:
-            outputs = model.generate(input_ids=input_ids, **gen_kwargs)
+        for prompt_len, bucket in buckets.items():
+            batch_ids = torch.stack([ids for _, ids in bucket], dim=0).to(device)
+            if use_autocast:
+                with torch.cuda.amp.autocast():
+                    outputs = model.generate(input_ids=batch_ids, **gen_kwargs)
+            else:
+                outputs = model.generate(input_ids=batch_ids, **gen_kwargs)
+
+            for i, (orig_idx, _) in enumerate(bucket):
+                gen_tokens = outputs[i, prompt_len:]
+                if eos_token_id is not None:
+                    eos_positions = (gen_tokens == eos_token_id).nonzero(as_tuple=False)
+                    if eos_positions.numel() > 0:
+                        gen_tokens = gen_tokens[: eos_positions[0].item() + 1]
+
+                generation_lengths[orig_idx] = int(gen_tokens.size(0))
+                decoded = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                preds[orig_idx] = normalize_prediction(task, decoded)
+
     elapsed = max(1e-6, time.time() - start)
-    attention_mask = tokenized.get("attention_mask")
-    if attention_mask is None:
-        attention_mask = torch.ones_like(input_ids)
-    preds = decode_generated(tokenizer, input_ids, attention_mask, outputs, task=task)
-
-    prompt_lengths = attention_mask.sum(dim=1)
-    eos_token_id = gen_kwargs.get("eos_token_id")
-    generation_lengths: List[int] = []
-    for i in range(outputs.size(0)):
-        prompt_len = int(prompt_lengths[i].item())
-        gen_tokens = outputs[i, prompt_len:]
-        gen_len = gen_tokens.size(0)
-        if eos_token_id is not None:
-            eos_positions = (gen_tokens == eos_token_id).nonzero(as_tuple=False)
-            if eos_positions.numel() > 0:
-                gen_len = int(eos_positions[0].item()) + 1
-        generation_lengths.append(int(gen_len))
-
     return preds, generation_lengths, elapsed
 
 
