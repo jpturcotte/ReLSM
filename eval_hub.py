@@ -234,6 +234,7 @@ def run_eval_suite(
     dtype: str = "bf16",
     compile_model: bool = False,
     limit: Optional[int] = None,
+    tasks: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Run the requested evaluation suite and persist standardized JSON."""
 
@@ -265,6 +266,7 @@ def run_eval_suite(
                 batch_size=batch_size,
                 generation_kwargs=base_generation_kwargs,
                 limit=limit,
+                tasks=tasks,
             )
         elif selected == "longctx":
             results["longctx"] = run_longctx_suite(
@@ -331,6 +333,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", type=str, default="bf16")
     parser.add_argument("--compile_model", action="store_true")
     parser.add_argument("--limit", type=int, default=None, help="Optional example cap")
+    parser.add_argument(
+        "--tasks",
+        nargs="*",
+        default=None,
+        help="Optional subset of algorithmic tasks (e.g., addition dyck copy)",
+    )
     return parser.parse_args()
 
 
@@ -354,6 +362,7 @@ def main() -> None:
         dtype=args.dtype,
         compile_model=args.compile_model,
         limit=args.limit,
+        tasks=args.tasks,
     )
     print(json.dumps(payload, indent=2))
 

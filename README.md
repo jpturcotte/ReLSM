@@ -53,17 +53,17 @@ python train.py --model_size nano --variant latent \
 
 # Evaluation
 
-All evaluations now flow through `eval_hub.py` with a unified schema and deterministic decoding. Recommended commands:
+All evaluations now flow through `eval_hub.py` with a unified schema and deterministic decoding (legacy `eval/run_algorithmic_eval.py` was removed in favor of this single entrypoint). Recommended commands:
 
 ```bash
-# Algorithmic IID/OOD grid only
-python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --suite algorithmic --out_dir ./runs/nano_baseline/eval
+# Algorithmic IID/OOD grid only (optionally restrict tasks with --tasks addition dyck copy)
+python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --suite algorithmic --out_dir ./runs/nano_baseline/eval_results
 
 # Needle-in-haystack long-context sweep
-python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --suite longctx --out_dir ./runs/nano_baseline/eval
+python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --suite longctx --out_dir ./runs/nano_baseline/eval_results
 
 # Full suite (algorithmic + longctx + self-test)
-python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --suite all --out_dir ./runs/nano_baseline/eval
+python eval_hub.py --checkpoint ./runs/nano_baseline/best_model.pt --suite all --out_dir ./runs/nano_baseline/eval_results
 ```
 
 Outputs are written to `--out_dir` with standardized filenames:
@@ -156,8 +156,8 @@ python train.py --model_size nano --variant act \
 for exp in exp0_baseline exp1_shared_loop exp2_latent exp3_act; do
     echo "=== $exp ==="
     python eval_hub.py --checkpoint ./runs/nano/$exp/best_model.pt \
-        --tasks algorithmic parity_ood addition_ood needle tinystories \
-        --output_dir ./runs/nano/$exp/eval_results
+        --suite algorithmic --tasks addition dyck chain parity \
+        --out_dir ./runs/nano/$exp/eval_results
 done
 ```
 
