@@ -92,8 +92,8 @@ def get_eval_generation_kwargs(
     max_new_tokens: int = 32,
     do_sample: bool = False,
     temperature: float = 0.0,
-    top_p: float = 1.0,
-    top_k: int = 0,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
     extra_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Return generation kwargs compatible with ``BaselineTransformer.generate``.
@@ -138,7 +138,10 @@ def generate_text(
         max_new_tokens=max_new_tokens,
         extra_kwargs=generation_kwargs,
     )
-    input_ids = tokenizer(prompt, truncation=True, return_tensors="pt")["input_ids"].to(device)
+    max_length = getattr(model.config, "max_seq_len", model.config.max_seq_len)
+    input_ids = tokenizer(
+        prompt, max_length=max_length, truncation=True, return_tensors="pt"
+    )["input_ids"].to(device)
     input_len = input_ids.shape[1]
 
     output_ids = model.generate(input_ids=input_ids, **generation_kwargs)
@@ -162,11 +165,15 @@ def batch_generate(
         extra_kwargs=generation_kwargs,
     )
 
+    max_length = getattr(model.config, "max_seq_len", model.config.max_seq_len)
+
     # Tokenize each prompt individually to avoid introducing padding tokens that
     # custom models may treat as real context.
     encoded: List[Tuple[int, torch.Tensor]] = []
     for idx, prompt in enumerate(prompts_list):
-        tokens = tokenizer(prompt, truncation=True, return_tensors="pt")
+        tokens = tokenizer(
+            prompt, max_length=max_length, truncation=True, return_tensors="pt"
+        )
         encoded.append((idx, tokens["input_ids"].squeeze(0)))
 
     # Group prompts by exact tokenized length to preserve batching without
@@ -386,11 +393,15 @@ def generate_batch(
         extra_kwargs=generation_kwargs,
     )
 
+    max_length = getattr(model.config, "max_seq_len", model.config.max_seq_len)
+
     # Tokenize each prompt individually to avoid inserting padding tokens that
     # custom models would treat as real context.
     encoded: List[Tuple[int, torch.Tensor]] = []
     for idx, prompt in enumerate(prompts_list):
-        tokens = tokenizer(prompt, truncation=True, return_tensors="pt")
+        tokens = tokenizer(
+            prompt, max_length=max_length, truncation=True, return_tensors="pt"
+        )
         encoded.append((idx, tokens["input_ids"].squeeze(0)))
 
     # Bucket by exact sequence length so we can batch prompts without padding.
@@ -406,23 +417,25 @@ def generate_batch(
     start = time.time()
     with torch.no_grad():
         for prompt_len, bucket in buckets.items():
-            batch_ids = torch.stack([ids for _, ids in bucket], dim=0).to(device)
-            if use_autocast:
-                with torch.cuda.amp.autocast():
+            for start_idx in range(0, len(bucket), batch_size):
+                microbatch = bucket[start_idx : start_idx + batch_size]
+                batch_ids = torch.stack([ids for _, ids in microbatch], dim=0).to(device)
+                if use_autocast:
+                    with torch.cuda.amp.autocast():
+                        outputs = model.generate(input_ids=batch_ids, **gen_kwargs)
+                else:
                     outputs = model.generate(input_ids=batch_ids, **gen_kwargs)
-            else:
-                outputs = model.generate(input_ids=batch_ids, **gen_kwargs)
 
-            for i, (orig_idx, _) in enumerate(bucket):
-                gen_tokens = outputs[i, prompt_len:]
-                if eos_token_id is not None:
-                    eos_positions = (gen_tokens == eos_token_id).nonzero(as_tuple=False)
-                    if eos_positions.numel() > 0:
-                        gen_tokens = gen_tokens[: eos_positions[0].item() + 1]
+                for i, (orig_idx, _) in enumerate(microbatch):
+                    gen_tokens = outputs[i, prompt_len:]
+                    if eos_token_id is not None:
+                        eos_positions = (gen_tokens == eos_token_id).nonzero(as_tuple=False)
+                        if eos_positions.numel() > 0:
+                            gen_tokens = gen_tokens[: eos_positions[0].item() + 1]
 
-                generation_lengths[orig_idx] = int(gen_tokens.size(0))
-                decoded = tokenizer.decode(gen_tokens, skip_special_tokens=True)
-                preds[orig_idx] = normalize_prediction(task, decoded)
+                    generation_lengths[orig_idx] = int(gen_tokens.size(0))
+                    decoded = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                    preds[orig_idx] = normalize_prediction(task, decoded)
 
     elapsed = max(1e-6, time.time() - start)
     return preds, generation_lengths, elapsed
