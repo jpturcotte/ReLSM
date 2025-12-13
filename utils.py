@@ -314,8 +314,22 @@ def normalize_prediction(task: str, text: str) -> str:
 
     text = text.split("\n")[0]
     text = SPACE_PATTERN.sub(" ", text).strip()
+    text = text.strip(" \t\n\r\"'`.,;:!?")
+
     if task == "dyck":
-        return text.lower()
+        lowered = text.lower()
+        if lowered.startswith("yes"):
+            return "yes"
+        if lowered.startswith("no"):
+            return "no"
+        return lowered
+
+    numeric_tasks = {"mod_add", "parity", "addition", "multiplication", "chain", "successor"}
+    if task in numeric_tasks:
+        match = re.search(r"[+-]?\d+(?:\.\d+)?", text)
+        if match:
+            return match.group(0)
+
     return text
 
 
