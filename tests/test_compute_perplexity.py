@@ -1,5 +1,8 @@
 import math
-import torch
+import math
+import pytest
+
+torch = pytest.importorskip("torch")
 
 from utils import compute_perplexity
 

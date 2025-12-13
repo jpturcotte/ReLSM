@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
-from transformers import AutoTokenizer
 
 from data import AlgorithmicGenerator
 from model import BaselineTransformer, TransformerConfig
@@ -53,10 +52,62 @@ SPACE_PATTERN = re.compile(r"\s+")
 
 def prepare_tokenizer(tokenizer_name: str):
     """Load a tokenizer and ensure padding is defined."""
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:  # pragma: no cover - defensive import guard
+        raise ImportError(
+            "transformers is required for loading tokenizers; install it to proceed."
+        ) from exc
+
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
+
+
+def _resolve_max_length(model: Any, tokenizer: Any) -> Optional[int]:
+    """Best-effort maximum length derived from model config or tokenizer."""
+
+    config = getattr(model, "config", None)
+    if config is not None:
+        max_len = getattr(config, "max_seq_len", None)
+        if max_len is not None:
+            return max_len
+
+    model_max_len = getattr(tokenizer, "model_max_length", None)
+    if isinstance(model_max_len, int) and model_max_len < 1e12:
+        return model_max_len
+    return None
+
+
+def _tokenize_prompt(tokenizer: Any, text: str, max_length: Optional[int] = None) -> Dict[str, Any]:
+    """Call a tokenizer while gracefully handling unsupported kwargs."""
+
+    base_kwargs: Dict[str, Any] = {"truncation": True, "return_tensors": "pt"}
+    if max_length is not None:
+        base_kwargs["max_length"] = max_length
+
+    try:
+        return tokenizer(text, **base_kwargs)
+    except TypeError:
+        reduced_kwargs = {k: v for k, v in base_kwargs.items() if k != "max_length"}
+        try:
+            return tokenizer(text, **reduced_kwargs)
+        except TypeError:
+            minimal_kwargs = {"return_tensors": base_kwargs.get("return_tensors")}
+            try:
+                return tokenizer(text, **minimal_kwargs)
+            except TypeError:
+                return tokenizer(text)
+
+
+def _ensure_2d_tensor(value: Any) -> torch.Tensor:
+    """Convert arbitrary tensor-like ``input_ids`` to a 2D torch.Tensor."""
+
+    tensor = value if isinstance(value, torch.Tensor) else torch.tensor(value)
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    return tensor
 
 
 @torch.no_grad()
@@ -138,10 +189,9 @@ def generate_text(
         max_new_tokens=max_new_tokens,
         extra_kwargs=generation_kwargs,
     )
-    max_length = getattr(model.config, "max_seq_len", model.config.max_seq_len)
-    input_ids = tokenizer(
-        prompt, max_length=max_length, truncation=True, return_tensors="pt"
-    )["input_ids"].to(device)
+    max_length = _resolve_max_length(model, tokenizer)
+    encoded = _tokenize_prompt(tokenizer, prompt, max_length=max_length)
+    input_ids = _ensure_2d_tensor(encoded["input_ids"]).to(device)
     input_len = input_ids.shape[1]
 
     output_ids = model.generate(input_ids=input_ids, **generation_kwargs)
@@ -165,16 +215,13 @@ def batch_generate(
         extra_kwargs=generation_kwargs,
     )
 
-    max_length = getattr(model.config, "max_seq_len", model.config.max_seq_len)
-
     # Tokenize each prompt individually to avoid introducing padding tokens that
     # custom models may treat as real context.
     encoded: List[Tuple[int, torch.Tensor]] = []
+    max_length = _resolve_max_length(model, tokenizer)
     for idx, prompt in enumerate(prompts_list):
-        tokens = tokenizer(
-            prompt, max_length=max_length, truncation=True, return_tensors="pt"
-        )
-        encoded.append((idx, tokens["input_ids"].squeeze(0)))
+        tokens = _tokenize_prompt(tokenizer, prompt, max_length=max_length)
+        encoded.append((idx, _ensure_2d_tensor(tokens["input_ids"]).squeeze(0)))
 
     # Group prompts by exact tokenized length to preserve batching without
     # padding. Each micro-batch shares the same sequence length and can be
@@ -268,16 +315,14 @@ def compute_perplexity(
     model.eval()
     with torch.no_grad():
         for text in texts:
-            encoded = tokenizer(
-                text,
-                max_length=model.config.max_seq_len,
-                truncation=True,
-                return_tensors="pt",
-            )
-            input_ids = encoded["input_ids"].to(device)
+            max_length = _resolve_max_length(model, tokenizer)
+            encoded = _tokenize_prompt(tokenizer, text, max_length=max_length)
+            input_ids = _ensure_2d_tensor(encoded["input_ids"]).to(device)
             attention_mask = encoded.get("attention_mask")
             if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
+                attention_mask = _ensure_2d_tensor(attention_mask).to(device)
+            else:
+                attention_mask = torch.ones_like(input_ids)
 
             if input_ids.size(1) < 2:
                 continue
@@ -382,6 +427,7 @@ def generate_batch(
     device: torch.device,
     use_autocast: bool,
     task: str,
+    batch_size: int = 16,
     generation_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[str], List[int], float]:
     """Generate model completions and return predictions and throughput stats."""
@@ -393,16 +439,13 @@ def generate_batch(
         extra_kwargs=generation_kwargs,
     )
 
-    max_length = getattr(model.config, "max_seq_len", model.config.max_seq_len)
-
     # Tokenize each prompt individually to avoid inserting padding tokens that
     # custom models would treat as real context.
     encoded: List[Tuple[int, torch.Tensor]] = []
+    max_length = _resolve_max_length(model, tokenizer)
     for idx, prompt in enumerate(prompts_list):
-        tokens = tokenizer(
-            prompt, max_length=max_length, truncation=True, return_tensors="pt"
-        )
-        encoded.append((idx, tokens["input_ids"].squeeze(0)))
+        tokens = _tokenize_prompt(tokenizer, prompt, max_length=max_length)
+        encoded.append((idx, _ensure_2d_tensor(tokens["input_ids"]).squeeze(0)))
 
     # Bucket by exact sequence length so we can batch prompts without padding.
     buckets: Dict[int, List[Tuple[int, torch.Tensor]]] = {}
@@ -479,6 +522,7 @@ def evaluate_condition(
             device=device,
             use_autocast=use_autocast,
             task=task,
+            batch_size=batch_size,
             generation_kwargs=generation_kwargs,
         )
         batch_generated = sum(gen_lengths)
