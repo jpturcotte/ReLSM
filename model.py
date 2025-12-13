@@ -855,6 +855,12 @@ class BaselineTransformer(nn.Module):
         if use_kv_cache:
             kv_cache: List[Any] = [None] * self._cache_slots
 
+        sampling = do_sample and temperature > 0
+
+        # Treat disabling values as None for easier downstream logic.
+        top_k = None if top_k is None or top_k <= 0 else top_k
+        top_p = None if top_p is None or top_p >= 1 or top_p <= 0 else top_p
+
         for _ in range(max_new_tokens):
             if use_kv_cache:
                 curr_input = generated[:, -1:] if kv_cache[0] is not None else generated
@@ -863,22 +869,24 @@ class BaselineTransformer(nn.Module):
                 # no-cache: recompute full context each step
                 logits, _, _ = self(generated, kv_cache=None, use_cache=False)
 
-            logits = logits[:, -1, :] / max(1e-8, temperature)
+            logits = logits[:, -1, :]
 
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float("-inf")
+            if sampling:
+                logits = logits / max(1e-8, temperature)
 
-            if top_p is not None:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                logits[indices_to_remove] = float("-inf")
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = float("-inf")
 
-            if do_sample:
+                if top_p is not None:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    logits[indices_to_remove] = float("-inf")
+
                 probs = F.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
             else:
