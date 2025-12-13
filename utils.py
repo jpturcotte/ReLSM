@@ -261,17 +261,31 @@ def compute_perplexity(
     model.eval()
     with torch.no_grad():
         for text in texts:
-            tokens = tokenizer.encode(
+            encoded = tokenizer(
                 text,
                 max_length=model.config.max_seq_len,
                 truncation=True,
                 return_tensors="pt",
-            ).to(device)
-            if tokens.size(1) < 2:
+            )
+            input_ids = encoded["input_ids"].to(device)
+            attention_mask = encoded.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+
+            if input_ids.size(1) < 2:
                 continue
-            labels = tokens.clone()
-            _, loss, _ = model(tokens, labels=labels)
-            n_tokens = tokens.size(1) - 1
+
+            labels = input_ids.clone()
+            if attention_mask is not None:
+                labels = labels.masked_fill(attention_mask == 0, -100)
+
+            _, loss, _ = model(input_ids, labels=labels)
+
+            if attention_mask is not None:
+                n_tokens = int(attention_mask[..., 1:].sum().item())
+            else:
+                n_tokens = input_ids.size(1) - 1
+
             total_loss += loss.item() * n_tokens
             total_tokens += n_tokens
 
