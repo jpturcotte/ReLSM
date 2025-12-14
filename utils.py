@@ -7,7 +7,6 @@ behavior and output schemas.
 """
 
 import json
-import math
 import os
 import platform
 import random
@@ -190,7 +189,16 @@ def generate_text(
         extra_kwargs=generation_kwargs,
     )
     max_length = _resolve_max_length(model, tokenizer)
-    encoded = _tokenize_prompt(tokenizer, prompt, max_length=max_length)
+    tokenize_kwargs: Dict[str, Any] = {"return_tensors": "pt", "truncation": True}
+    if max_length is not None:
+        tokenize_kwargs["max_length"] = max_length
+
+    try:
+        encoded = tokenizer(prompt, **tokenize_kwargs)
+    except TypeError:
+        tokenize_kwargs.pop("max_length", None)
+        encoded = tokenizer(prompt, **tokenize_kwargs)
+
     input_ids = _ensure_2d_tensor(encoded["input_ids"]).to(device)
     input_len = input_ids.shape[1]
 
@@ -451,7 +459,8 @@ def generate_batch(
     buckets: Dict[int, List[Tuple[int, torch.Tensor]]] = {}
     for item in encoded:
         _, input_ids = item
-        buckets.setdefault(input_ids.size(0), []).append(item)
+        seq_len = input_ids.size(0)
+        buckets.setdefault(seq_len, []).append(item)
 
     preds: List[str] = [""] * len(prompts_list)
     generation_lengths: List[int] = [0] * len(prompts_list)
