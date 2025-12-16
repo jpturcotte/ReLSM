@@ -35,7 +35,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 
 
@@ -355,7 +355,7 @@ def train(args):
     
     # Mixed precision
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    ctx = autocast(device_type="cuda", dtype=dtype) if device.type == "cuda" else nullcontext()
+    ctx = torch.amp.autocast(device_type="cuda", dtype=dtype) if device.type == "cuda" else nullcontext()
     scaler = GradScaler(enabled=(dtype == torch.float16))
     
     # =========================================================================
