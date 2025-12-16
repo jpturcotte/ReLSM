@@ -41,6 +41,10 @@ Both `train.py` and the `create_model` factory accept the same size strings abov
 # Install (includes optional Mamba-2 kernels)
 pip install -r requirements.txt
 
+# Optional: enable PyTorch compilation on Linux for extra speed
+# (disabled by default to avoid Windows Triton issues)
+# python train.py --compile ...
+
 # Train nano baseline (quick test, ~10 min)
 python train.py --model_size nano --variant baseline \
     --alg_tokens 10000000 --total_tokens 20000000 \
