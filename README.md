@@ -75,6 +75,13 @@ Outputs are written to `--out_dir` with standardized filenames:
 - `results_algorithmic.json`, `results_longctx.json`, or `results_all.json` depending on the selected suite
 - Each JSON includes metadata (commit hash, seed, decoding parameters, grid version) and the relevant results payload
 
+### Training-time evaluation safety
+
+The training loop periodically runs the algorithmic suite. To keep those evaluations bounded and avoid hanging when EOS is missed, use the CLI controls in `train.py`:
+
+- `--eval_samples` controls how many examples are drawn per interval (default: 100)
+- `--eval_max_new_tokens` caps generated tokens per example during evaluation (default: 32)
+
 ### Nano Baseline Control
 
 Note that `nano_baseline.py` is a standalone script that implements a control model with learned **absolute positional embeddings**. This is distinct from running `train.py --variant baseline`, which uses the main model codebase with RoPE. Use `nano_baseline.py` specifically to test the hypothesis that absolute embeddings fail out-of-distribution length generalization.
