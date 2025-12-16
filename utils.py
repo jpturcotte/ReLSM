@@ -82,7 +82,7 @@ def _resolve_max_length(model: Any, tokenizer: Any) -> Optional[int]:
 def _tokenize_prompt(tokenizer: Any, text: str, max_length: Optional[int] = None) -> Dict[str, Any]:
     """Call a tokenizer while gracefully handling unsupported kwargs."""
 
-    base_kwargs: Dict[str, Any] = {"truncation": True, "return_tensors": "pt"}
+    base_kwargs: Dict[str, Any] = {"truncation": True, "padding": False, "return_tensors": "pt"}
     if max_length is not None:
         base_kwargs["max_length"] = max_length
 
@@ -93,7 +93,10 @@ def _tokenize_prompt(tokenizer: Any, text: str, max_length: Optional[int] = None
         try:
             return tokenizer(text, **reduced_kwargs)
         except TypeError:
-            minimal_kwargs = {"return_tensors": base_kwargs.get("return_tensors")}
+            minimal_kwargs = {
+                "padding": base_kwargs.get("padding"),
+                "return_tensors": base_kwargs.get("return_tensors"),
+            }
             try:
                 return tokenizer(text, **minimal_kwargs)
             except TypeError:
@@ -240,7 +243,8 @@ def batch_generate(
         buckets.setdefault(input_ids.size(0), []).append(item)
 
     generations: List[str] = [""] * len(prompts_list)
-    for prompt_len, bucket in buckets.items():
+    for prompt_len in sorted(buckets):
+        bucket = buckets[prompt_len]
         batch_ids = torch.stack([ids for _, ids in bucket], dim=0).to(device)
         output_ids = model.generate(input_ids=batch_ids, **gen_kwargs)
         for i, (orig_idx, _) in enumerate(bucket):
@@ -468,7 +472,8 @@ def generate_batch(
 
     start = time.time()
     with torch.no_grad():
-        for prompt_len, bucket in buckets.items():
+        for prompt_len in sorted(buckets):
+            bucket = buckets[prompt_len]
             for start_idx in range(0, len(bucket), batch_size):
                 microbatch = bucket[start_idx : start_idx + batch_size]
                 batch_ids = torch.stack([ids for _, ids in microbatch], dim=0).to(device)
