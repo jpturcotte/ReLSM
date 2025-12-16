@@ -75,6 +75,13 @@ Outputs are written to `--out_dir` with standardized filenames:
 - `results_algorithmic.json`, `results_longctx.json`, or `results_all.json` depending on the selected suite
 - Each JSON includes metadata (commit hash, seed, decoding parameters, grid version) and the relevant results payload
 
+### Training artifacts
+
+`train.py` writes human-readable summaries alongside machine-parseable logs in the chosen `--output_dir`:
+
+- `metrics.json` and `summary.json` capture scalar logs and evaluation outputs.
+- `loss.png` and `accuracy.png` are refreshed after every evaluation run, showing log-scale loss curves and per-task accuracy traces over time.
+
 ### Training-time evaluation safety
 
 The training loop periodically runs the algorithmic suite. To keep those evaluations bounded and avoid hanging when EOS is missed, use the CLI controls in `train.py`:

@@ -33,11 +33,14 @@ from typing import Optional, Dict, List
 
 import numpy as np
 
+import matplotlib.pyplot as plt
+
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 
+plt.switch_backend("Agg")
 
 def get_lr(step: int, warmup_steps: int, max_steps: int, max_lr: float, min_lr: float) -> float:
     """Cosine schedule with warmup."""
@@ -63,6 +66,7 @@ class MetricsLogger:
             "phase": [],
             "step": [],
         }
+        self.metric_steps = {}
         self.task_accuracies = {}
     
     def log(self, step: int, phase: str, **kwargs):
@@ -72,7 +76,10 @@ class MetricsLogger:
         for k, v in kwargs.items():
             if k not in self.metrics:
                 self.metrics[k] = []
+            if k not in self.metric_steps:
+                self.metric_steps[k] = []
             self.metrics[k].append(v)
+            self.metric_steps[k].append(step)
     
     def log_task_accuracy(self, task: str, accuracy: float, step: int):
         if task not in self.task_accuracies:
@@ -94,6 +101,50 @@ class MetricsLogger:
             "avg_tokens_per_sec": sum(self.metrics["tokens_per_sec"]) / len(self.metrics["tokens_per_sec"]) if self.metrics["tokens_per_sec"] else None,
             "total_tokens": self.metrics["tokens_seen"][-1] if self.metrics["tokens_seen"] else 0,
         }
+
+    def plot(self):
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Loss plot
+        plt.figure()
+        train_steps = self.metric_steps.get("train_loss", [])
+        train_losses = self.metrics.get("train_loss", [])
+        if train_steps and train_losses:
+            plt.plot(train_steps, train_losses, label="train")
+
+        val_steps = self.metric_steps.get("val_loss", [])
+        val_losses = self.metrics.get("val_loss", [])
+        if val_steps and val_losses:
+            plt.plot(val_steps, val_losses, label="val")
+
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.yscale("log")
+        plt.title("Training and Validation Loss")
+        if train_steps or val_steps:
+            plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(self.output_dir / "loss.png")
+        plt.close()
+
+        # Accuracy plot
+        plt.figure()
+        for task, records in self.task_accuracies.items():
+            steps = [entry["step"] for entry in records]
+            accuracies = [entry["accuracy"] for entry in records]
+            if steps and accuracies:
+                plt.plot(steps, accuracies, label=task)
+
+        plt.xlabel("Step")
+        plt.ylabel("Accuracy")
+        plt.title("Task Accuracy")
+        if self.task_accuracies:
+            plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(self.output_dir / "accuracy.png")
+        plt.close()
 
 
 @torch.no_grad()
@@ -502,7 +553,7 @@ def train(args):
                 if task != "overall":
                     logger.log_task_accuracy(task, acc, global_step)
                     print(f"    {task}: {acc*100:.1f}%")
-            
+
             # Track best
             if alg_results["overall"] > best_alg_acc:
                 best_alg_acc = alg_results["overall"]
@@ -519,7 +570,9 @@ def train(args):
                 ppl = evaluate_perplexity(model, lang_loader, device, ctx)
                 print(f"  Language PPL: {ppl:.2f}")
                 logger.log(step=global_step, phase="eval", val_loss=math.log(ppl))
-            
+
+            logger.plot()
+
             print()
             model.train()
     
