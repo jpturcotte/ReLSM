@@ -225,6 +225,9 @@ def batch_generate(
         max_new_tokens=max_new_tokens,
         extra_kwargs=generation_kwargs,
     )
+    # Be explicit about the decoding limit in case downstream code mutates
+    # ``generation_kwargs`` before calling ``model.generate``.
+    gen_kwargs.setdefault("max_new_tokens", max_new_tokens)
 
     # Tokenize each prompt individually to avoid introducing padding tokens that
     # custom models may treat as real context.
@@ -251,6 +254,32 @@ def batch_generate(
             tail = output_ids[i, prompt_len:]
             generations[orig_idx] = tokenizer.decode(tail, skip_special_tokens=True).strip()
     return generations
+
+
+@torch.no_grad()
+def evaluate_model(
+    model: BaselineTransformer,
+    tokenizer,
+    prompts: Iterable[str],
+    device: torch.device,
+    max_new_tokens: int = 32,
+    generation_kwargs: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Generate model completions for a collection of prompts.
+
+    The ``max_new_tokens`` argument bounds generation length to avoid runaway
+    decoding when EOS markers are missing. Additional generation kwargs are
+    forwarded to the model's ``generate`` implementation when provided.
+    """
+
+    return batch_generate(
+        model=model,
+        tokenizer=tokenizer,
+        prompts=prompts,
+        device=device,
+        max_new_tokens=max_new_tokens,
+        generation_kwargs=generation_kwargs,
+    )
 
 
 class NeedleInHaystackGenerator:
