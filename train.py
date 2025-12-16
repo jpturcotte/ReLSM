@@ -97,18 +97,24 @@ class MetricsLogger:
 
 
 @torch.no_grad()
-def evaluate_algorithmic(model, tokenizer, device, n_examples: int = 100) -> Dict[str, float]:
+def evaluate_algorithmic(
+    model, tokenizer, device, n_examples: int = 100, max_new_tokens: int = 32
+) -> Dict[str, float]:
     """Run the canonical algorithmic OOD grid using ``eval_hub``.
 
     The ``n_examples`` argument caps the number of examples per condition
-    (kept for backward compatibility with older training scripts).
+    (kept for backward compatibility with older training scripts), while
+    ``max_new_tokens`` constrains generation length to avoid runaway decoding
+    when EOS is missed.
     """
 
     from eval_hub import run_algorithmic_suite
     from utils import get_eval_generation_kwargs
 
     device_obj = device if isinstance(device, torch.device) else torch.device(device)
-    generation_kwargs = get_eval_generation_kwargs(tokenizer=tokenizer, max_new_tokens=0)
+    generation_kwargs = get_eval_generation_kwargs(
+        tokenizer=tokenizer, max_new_tokens=max_new_tokens
+    )
 
     results = run_algorithmic_suite(
         model,
@@ -484,7 +490,13 @@ def train(args):
             print("\nRunning evaluation...")
             
             # Algorithmic accuracy
-            alg_results = evaluate_algorithmic(model, tokenizer, device, n_examples=200)
+            alg_results = evaluate_algorithmic(
+                model,
+                tokenizer,
+                device,
+                n_examples=args.eval_samples,
+                max_new_tokens=args.eval_max_new_tokens,
+            )
             print(f"  Algorithmic accuracy: {alg_results['overall']*100:.1f}%")
             for task, acc in alg_results.items():
                 if task != "overall":
@@ -603,6 +615,18 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--eval_interval", type=int, default=500)
+    parser.add_argument(
+        "--eval_max_new_tokens",
+        type=int,
+        default=32,
+        help="Limit generated tokens per example to prevent infinite loops",
+    )
+    parser.add_argument(
+        "--eval_samples",
+        type=int,
+        default=100,
+        help="Number of examples to evaluate per interval",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (recommended for Linux only)")
 
