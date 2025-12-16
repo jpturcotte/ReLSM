@@ -511,6 +511,10 @@ class SSMBlock(nn.Module):
         self.C_proj = nn.Linear(self.E, self.groups * self.N, bias=False)
         self.dt_proj = nn.Linear(self.E, self.groups, bias=True)
         self.A_log = nn.Parameter(torch.zeros(self.groups, self.N))     # decay (log-space)
+        nn.init.normal_(self.dt_proj.weight, mean=0.0, std=1e-3)
+        with torch.no_grad():
+            u = torch.empty_like(self.dt_proj.bias).uniform_(0.001, 0.1)
+            self.dt_proj.bias.copy_(torch.log(torch.expm1(u)))
 
         self.out_proj = nn.Linear(self.E, self.D, bias=config.bias)
         self.drop = nn.Dropout(config.dropout)
