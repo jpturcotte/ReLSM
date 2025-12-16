@@ -433,12 +433,17 @@ def train(args):
     start_time = time.time()
     best_alg_acc = 0.0
     
-    # Estimate steps
-    tokens_per_step = args.alg_batch_size * args.alg_seq_len * args.grad_accum_steps
-    max_steps = args.total_tokens // tokens_per_step
-    warmup_steps = int(0.1 * max_steps)
-    
-    print(f"  Estimated steps: {max_steps}")
+    # Estimate steps with hybrid calculation for sparse algorithmic and dense language data
+    algo_steps = args.alg_tokens // (args.alg_batch_size * 40)
+    lang_tokens = max(0, args.total_tokens - args.alg_tokens)
+    lang_steps = lang_tokens // (args.alg_batch_size * args.lang_seq_len)
+    estimated_steps = algo_steps + lang_steps
+    max_steps = estimated_steps
+    warmup_steps = int(0.1 * estimated_steps)
+
+    print(
+        f"  Estimated steps (Hybrid calc: Algo ~{algo_steps} + Lang ~{lang_steps}): {estimated_steps}"
+    )
     print(f"  Warmup steps: {warmup_steps}")
     print("\n" + "="*60)
     print("Starting training...")
