@@ -278,7 +278,7 @@ def train(args):
     model = model.to(device)
 
     # Optimize model execution
-    if hasattr(torch, "compile"):
+    if args.compile and hasattr(torch, "compile"):
         print("Compiling model with torch.compile...")
         # 'reduce-overhead' is excellent for smaller models or CPU training
         # If this errors on your setup, try mode="default"
@@ -604,6 +604,7 @@ def main():
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--eval_interval", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile (recommended for Linux only)")
 
     args = parser.parse_args()
 
