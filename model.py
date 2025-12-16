@@ -314,13 +314,17 @@ class Attention(nn.Module):
         k = self._repeat_kv(k)
         v = self._repeat_kv(v)
 
-        attn_weights = (q @ k.transpose(-2, -1)) * self.scale
-        if mask is not None:
-            attn_weights = attn_weights + mask
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(q)
-        attn_weights = self.attn_dropout(attn_weights)
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+        if mask is None:
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True
+            )
+        else:
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, dropout_p=dropout_p, is_causal=False
+            )
 
-        out = (attn_weights @ v).transpose(1, 2).contiguous().view(B, T, -1)
+        out = attn_output.transpose(1, 2).contiguous().view(B, T, -1)
         out = self.o_proj(out)
         return out, new_cache
 
@@ -778,7 +782,7 @@ class BaselineTransformer(nn.Module):
                 mask = torch.zeros((T, past_len + T), device=device)
                 mask[:, past_len:] = self._make_causal_mask(T, device)
             else:
-                mask = self._make_causal_mask(T, device)
+                mask = None
 
         new_cache = [] if use_cache else None
 
