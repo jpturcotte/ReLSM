@@ -351,29 +351,48 @@ def train(args):
     # =========================================================================
     
     from data import (
-        AlgorithmicDataset, LanguageDataset, CurriculumSampler,
-        create_curriculum_loaders
+        AlgorithmicDataset,
+        CurriculumSampler,
+        FixedAlgorithmicDataset,
+        LanguageDataset,
+        create_curriculum_loaders,
     )
     
     print("\nLoading datasets...")
 
-    difficulty_value = Value("d", 0.0)
-    
+    difficulty_value = Value("d", 0.0) if not args.fixed_data else None
+
     # Phase 1: Algorithmic
-    alg_dataset = AlgorithmicDataset(
-        tokenizer=tokenizer,
-        num_examples=args.alg_examples,
-        max_seq_len=args.alg_seq_len,
-        seed=args.seed,
-        difficulty_value=difficulty_value,
-    )
-    alg_loader = DataLoader(
-        alg_dataset,
-        batch_size=args.alg_batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
+    if args.fixed_data:
+        alg_dataset = FixedAlgorithmicDataset(
+            tokenizer=tokenizer,
+            num_examples=args.fixed_data_size,
+            max_seq_len=args.alg_seq_len,
+            seed=args.seed,
+            difficulty=0.5,
+        )
+        alg_loader = DataLoader(
+            alg_dataset,
+            batch_size=args.alg_batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+    else:
+        alg_dataset = AlgorithmicDataset(
+            tokenizer=tokenizer,
+            num_examples=args.alg_examples,
+            max_seq_len=args.alg_seq_len,
+            seed=args.seed,
+            difficulty_value=difficulty_value,
+        )
+        alg_loader = DataLoader(
+            alg_dataset,
+            batch_size=args.alg_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
     
     # Phase 2: Language (only load if we'll use it)
     if args.total_tokens > args.alg_tokens:
@@ -409,11 +428,17 @@ def train(args):
     # =========================================================================
 
     optimizer = build_optimizer(model, lr=args.max_lr, weight_decay=args.weight_decay)
-    
+
     # Mixed precision
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     ctx = torch.amp.autocast(device_type="cuda", dtype=dtype) if device.type == "cuda" else nullcontext()
     scaler = GradScaler(enabled=(dtype == torch.float16))
+
+    grokfast_ema: Dict[str, torch.Tensor] = {}
+    if args.grokfast:
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                grokfast_ema[name] = torch.zeros_like(param.data)
     
     # =========================================================================
     # TRAINING LOOP
@@ -427,6 +452,15 @@ def train(args):
     print(f"  Persistent alg frac: {args.persistent_alg_frac:.2f}")
     print(f"  Lexical frac (phase1): {args.lexical_frac_phase1:.2f}")
     print(f"  Variant: {args.variant}")
+    print(
+        f"  Fixed data: {args.fixed_data}" +
+        (f" ({args.fixed_data_size} examples)" if args.fixed_data else "")
+    )
+    print(
+        f"  Grokfast: {args.grokfast}" +
+        (f" (α={args.grokfast_alpha}, λ={args.grokfast_lambda})" if args.grokfast else "")
+    )
+    print(f"  Weight decay: {args.weight_decay}")
     
     global_step = 0
     tokens_seen = 0
@@ -457,12 +491,13 @@ def train(args):
     running_ponder = 0.0
     
     while curriculum.tokens_seen < args.total_tokens:
-        if curriculum.tokens_seen < args.alg_tokens:
-            difficulty_value.value = difficulty_schedule(
-                curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
-            )
-        else:
-            difficulty_value.value = 1.0
+        if difficulty_value is not None:
+            if curriculum.tokens_seen < args.alg_tokens:
+                difficulty_value.value = difficulty_schedule(
+                    curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
+                )
+            else:
+                difficulty_value.value = 1.0
         batch = curriculum.next_batch()
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
@@ -491,7 +526,17 @@ def train(args):
         # Backward
         scaler.scale(loss).backward()
         running_loss += loss.item() * args.grad_accum_steps
-        
+
+        if args.grokfast:
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        ema = grokfast_ema[name]
+                        ema.mul_(args.grokfast_alpha).add_(
+                            param.grad, alpha=1 - args.grokfast_alpha
+                        )
+                        param.grad.add_(ema, alpha=args.grokfast_lambda)
+
         # Step
         if (global_step + 1) % args.grad_accum_steps == 0:
             scaler.unscale_(optimizer)
@@ -525,6 +570,10 @@ def train(args):
                   (f" | K: {avg_K:.1f}" if avg_K > 0 else "") +
                   (f" | ponder: {avg_ponder:.3f}" if avg_ponder > 0 else ""))
 
+            difficulty_logged = (
+                float(difficulty_value.value) if difficulty_value is not None else 0.5
+            )
+
             logger.log(
                 step=global_step,
                 phase=phase,
@@ -534,7 +583,7 @@ def train(args):
                 peak_vram_gb=peak_vram,
                 avg_inner_steps=avg_K,
                 ponder=avg_ponder,
-                difficulty=float(difficulty_value.value),
+                difficulty=difficulty_logged,
             )
 
             running_loss = 0.0
@@ -661,11 +710,41 @@ def main():
     parser.add_argument("--lang_seq_len", type=int, default=1024)
     parser.add_argument("--lang_batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
-    
+
+    # Grokking
+    parser.add_argument(
+        "--fixed_data",
+        action="store_true",
+        help="Use fixed dataset for grokking (vs infinite procedural)",
+    )
+    parser.add_argument(
+        "--fixed_data_size",
+        type=int,
+        default=5000,
+        help="Number of examples in fixed dataset",
+    )
+    parser.add_argument(
+        "--grokfast",
+        action="store_true",
+        help="Enable Grokfast gradient filtering for faster grokking",
+    )
+    parser.add_argument(
+        "--grokfast_alpha",
+        type=float,
+        default=0.98,
+        help="EMA decay for Grokfast",
+    )
+    parser.add_argument(
+        "--grokfast_lambda",
+        type=float,
+        default=5.0,
+        help="Amplification factor for Grokfast",
+    )
+
     # Optimizer
     parser.add_argument("--max_lr", type=float, default=6e-4)
     parser.add_argument("--min_lr", type=float, default=6e-5)
-    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--weight_decay", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--grad_accum_steps", type=int, default=4)
 

@@ -21,7 +21,7 @@ Also includes:
 
 import random
 import math
-from typing import List, Dict, Optional, Tuple, Iterator, Callable, Iterable
+from typing import List, Dict, Optional, Tuple, Iterator, Callable, Iterable, Union
 from dataclasses import dataclass
 import torch
 from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
@@ -735,6 +735,113 @@ class AlgorithmicDataset(IterableDataset):
         upper = min(1.0, 0.5 + 0.5 * progress)
         lower = 0.0
         return rng.uniform(lower, upper)
+
+
+class FixedAlgorithmicDataset(Dataset):
+    """Fixed dataset for grokking experiments. Same examples every epoch."""
+
+    def __init__(
+        self,
+        tokenizer,
+        num_examples: int = 5000,
+        max_seq_len: int = 128,
+        tasks: Optional[List[str]] = None,
+        seed: int = 42,
+        difficulty: float = 0.5,
+    ):
+        self.tokenizer = tokenizer
+        self.num_examples = num_examples
+        self.max_seq_len = max_seq_len
+        self.tasks = tasks
+        self.seed = seed
+        self.difficulty = difficulty
+
+        self._char_token_map = self._build_char_token_map()
+        self.examples: List[Dict[str, torch.Tensor]] = []
+
+        rng = random.Random(seed)
+        generators = AlgorithmicGenerator._get_generators()
+
+        for _ in range(self.num_examples):
+            example = AlgorithmicGenerator.generate_example(
+                tasks=self.tasks, rng=rng, generators=generators, difficulty=self.difficulty
+            )
+            tokens = self._encode_text(example["text"])
+
+            if len(tokens) > self.max_seq_len:
+                tokens = tokens[: self.max_seq_len]
+
+            input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
+            labels = torch.tensor(tokens[1:], dtype=torch.long)
+
+            pad_len = self.max_seq_len - 1 - len(input_ids)
+            if pad_len > 0:
+                pad_id = self.tokenizer.pad_token_id or 0
+                input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
+                labels = torch.cat([labels, torch.full((pad_len,), -100)])
+
+            self.examples.append(
+                {
+                    "input_ids": input_ids,
+                    "labels": labels,
+                    "task": example["task"],
+                }
+            )
+
+    def _build_char_token_map(self) -> Dict[str, int]:
+        chars = "0123456789()+-*=? "
+        chars += "abcdefghijklmnopqrstuvwxyz"
+        chars += "ABCDEFGHIJKLMNOPQRSTUVWXYZ"  # For future-proofing
+        chars += ":,%<>'"  # punctuation used in prompts
+
+        token_map = {}
+        for ch in set(chars):
+            encoded = self.tokenizer.encode(ch, add_special_tokens=False)
+            if len(encoded) == 1:
+                token_map[ch] = encoded[0]
+        return token_map
+
+    def _encode_text(self, text: str) -> List[int]:
+        if self._char_token_map and all(ch in self._char_token_map for ch in text):
+            core_tokens = [self._char_token_map[ch] for ch in text]
+            return self.tokenizer.build_inputs_with_special_tokens(core_tokens)
+        return self.tokenizer.encode(text, add_special_tokens=True)
+
+    def __len__(self) -> int:
+        return self.num_examples
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        return self.examples[idx % len(self.examples)]
+
+
+def create_algorithmic_dataset(
+    tokenizer,
+    fixed: bool = False,
+    num_examples: int = 100000,
+    max_seq_len: int = 128,
+    tasks: Optional[List[str]] = None,
+    seed: int = 42,
+    difficulty_value=None,
+) -> Union[AlgorithmicDataset, FixedAlgorithmicDataset]:
+    """Factory that returns fixed or infinite dataset based on flag."""
+
+    if fixed:
+        return FixedAlgorithmicDataset(
+            tokenizer=tokenizer,
+            num_examples=num_examples,
+            max_seq_len=max_seq_len,
+            tasks=tasks,
+            seed=seed,
+        )
+
+    return AlgorithmicDataset(
+        tokenizer=tokenizer,
+        num_examples=num_examples,
+        max_seq_len=max_seq_len,
+        tasks=tasks,
+        seed=seed,
+        difficulty_value=difficulty_value,
+    )
 
 
 # =============================================================================
