@@ -374,7 +374,7 @@ def train(args):
         alg_loader = DataLoader(
             alg_dataset,
             batch_size=args.alg_batch_size,
-            shuffle=True,
+            shuffle=True,  # reshuffle fixed set each epoch to avoid ordering artifacts
             num_workers=args.num_workers,
             pin_memory=True,
         )
