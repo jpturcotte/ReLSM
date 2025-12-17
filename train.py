@@ -352,6 +352,7 @@ def train(args):
     
     from data import (
         AlgorithmicDataset,
+        AlgorithmicGenerator,
         CurriculumSampler,
         FixedAlgorithmicDataset,
         LanguageDataset,
@@ -362,12 +363,23 @@ def train(args):
 
     difficulty_value = Value("d", 0.0) if not args.fixed_data else None
 
+    available_tasks = set(AlgorithmicGenerator._get_generators().keys())
+    alg_tasks = list(args.alg_tasks) if args.alg_tasks is not None else None
+    if alg_tasks:
+        invalid = [task for task in alg_tasks if task not in available_tasks]
+        if invalid:
+            raise ValueError(
+                f"Invalid alg_tasks {invalid}; choose from {sorted(available_tasks)}"
+            )
+        print(f"Restricting algorithmic tasks to: {', '.join(alg_tasks)}")
+
     # Phase 1: Algorithmic
     if args.fixed_data:
         alg_dataset = FixedAlgorithmicDataset(
             tokenizer=tokenizer,
             num_examples=args.fixed_data_size,
             max_seq_len=args.alg_seq_len,
+            tasks=alg_tasks,
             seed=args.seed,
             difficulty=0.5,
         )
@@ -383,6 +395,7 @@ def train(args):
             tokenizer=tokenizer,
             num_examples=args.alg_examples,
             max_seq_len=args.alg_seq_len,
+            tasks=alg_tasks,
             seed=args.seed,
             difficulty_value=difficulty_value,
         )
@@ -706,6 +719,15 @@ def main():
     # Data
     parser.add_argument("--alg_examples", type=int, default=100_000)
     parser.add_argument("--alg_seq_len", type=int, default=128)
+    parser.add_argument(
+        "--alg_tasks",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional subset of algorithmic tasks for training (e.g., parity addition). "
+            "If provided, examples are drawn only from this set."
+        ),
+    )
     parser.add_argument("--alg_batch_size", type=int, default=64)
     parser.add_argument("--lang_seq_len", type=int, default=1024)
     parser.add_argument("--lang_batch_size", type=int, default=32)

@@ -50,6 +50,14 @@ python train.py --model_size nano --variant baseline \
     --alg_tokens 10000000 --total_tokens 20000000 \
     --output_dir ./runs/nano_baseline
 
+# Focus on a single algorithmic task (e.g., parity only)
+python train.py --model_size nano --variant baseline \
+    --alg_tokens 10000000 --total_tokens 20000000 \
+    --alg_tasks parity \
+    --output_dir ./runs/nano_parity_only
+
+All algorithmic task names are drawn from the training generator set (e.g., `mod_add`, `parity`, `addition`, `multiplication`, `copy`, `reverse`, `dyck`, `chain`, `compare`, `successor`).
+
 # Train nano with latent thought stream
 python train.py --model_size nano --variant latent \
     --alg_tokens 10000000 --total_tokens 20000000 \
