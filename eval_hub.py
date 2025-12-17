@@ -256,7 +256,12 @@ def run_eval_suite(
     limit: Optional[int] = None,
     tasks: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """Run the requested evaluation suite and persist standardized JSON."""
+    """Run the requested evaluation suite and persist standardized JSON.
+
+    Results are saved after each suite finishes and again if evaluation is
+    interrupted via ``KeyboardInterrupt`` so partial progress is always
+    captured.
+    """
 
     device_obj = _normalize_device(device)
     model = _prepare_model(model, device_obj, dtype, compile_model)
@@ -275,54 +280,66 @@ def run_eval_suite(
     if suite == "all":
         suites_to_run = ["algorithmic", "longctx", "self_test"]
 
-    results: Dict[str, Any] = {}
-    for selected in suites_to_run:
-        if selected == "algorithmic":
-            results["algorithmic"] = run_algorithmic_suite(
-                model,
-                tokenizer,
-                device_obj,
-                seed=seed,
-                batch_size=batch_size,
-                generation_kwargs=base_generation_kwargs,
-                limit=limit,
-                tasks=tasks,
-            )
-        elif selected == "longctx":
-            results["longctx"] = run_longctx_suite(
-                model,
-                tokenizer,
-                device_obj,
-                seed=seed,
-                generation_kwargs=base_generation_kwargs,
-                max_new_tokens=min(10, max_new_tokens),
-            )
-        elif selected == "self_test":
-            results["self_test"] = run_self_test_suite(
-                model,
-                tokenizer,
-                device_obj,
-                seed=seed,
-                generation_kwargs=base_generation_kwargs,
-            )
-
-    meta = gather_metadata(
-        checkpoint=getattr(model, "checkpoint_path", None),
-        tokenizer_name=getattr(tokenizer, "name_or_path", None),
-        device=device_obj,
-        model_config=getattr(model, "config", None),
-        generation_kwargs=base_generation_kwargs,
-        suite=suite,
-        seed=seed,
-        grid_version=ood_grid.OOD_GRID_VERSION if "algorithmic" in results else None,
-        model_id=getattr(getattr(model, "config", None), "variant", None),
-    )
-
-    payload = {"meta": meta, **results}
     output_path = Path(out_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     filename = f"results_{suite}.json" if suite != "all" else "results_all.json"
-    save_json(payload, output_path / filename)
+
+    results: Dict[str, Any] = {}
+
+    def _build_payload(interrupted: bool = False) -> Dict[str, Any]:
+        meta = gather_metadata(
+            checkpoint=getattr(model, "checkpoint_path", None),
+            tokenizer_name=getattr(tokenizer, "name_or_path", None),
+            device=device_obj,
+            model_config=getattr(model, "config", None),
+            generation_kwargs=base_generation_kwargs,
+            suite=suite,
+            seed=seed,
+            grid_version=ood_grid.OOD_GRID_VERSION if "algorithmic" in results else None,
+            model_id=getattr(getattr(model, "config", None), "variant", None),
+        )
+        if interrupted:
+            meta["status"] = "interrupted"
+        return {"meta": meta, **results}
+
+    for selected in suites_to_run:
+        try:
+            if selected == "algorithmic":
+                results["algorithmic"] = run_algorithmic_suite(
+                    model,
+                    tokenizer,
+                    device_obj,
+                    seed=seed,
+                    batch_size=batch_size,
+                    generation_kwargs=base_generation_kwargs,
+                    limit=limit,
+                    tasks=tasks,
+                )
+            elif selected == "longctx":
+                results["longctx"] = run_longctx_suite(
+                    model,
+                    tokenizer,
+                    device_obj,
+                    seed=seed,
+                    generation_kwargs=base_generation_kwargs,
+                    max_new_tokens=min(10, max_new_tokens),
+                )
+            elif selected == "self_test":
+                results["self_test"] = run_self_test_suite(
+                    model,
+                    tokenizer,
+                    device_obj,
+                    seed=seed,
+                    generation_kwargs=base_generation_kwargs,
+                )
+        except KeyboardInterrupt:
+            payload = _build_payload(interrupted=True)
+            save_json(payload, output_path / filename)
+            raise
+
+        payload = _build_payload()
+        save_json(payload, output_path / filename)
+
     return payload
 
 
