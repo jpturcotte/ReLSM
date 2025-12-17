@@ -664,10 +664,7 @@ class AlgorithmicDataset(IterableDataset):
         return token_map
 
     def _encode_text(self, text: str) -> List[int]:
-        """Encode text quickly using the char map when possible."""
-        if self._char_token_map and all(ch in self._char_token_map for ch in text):
-            core_tokens = [self._char_token_map[ch] for ch in text]
-            return self.tokenizer.build_inputs_with_special_tokens(core_tokens)
+        """Encode text with the tokenizer to align training and evaluation."""
         return self.tokenizer.encode(text, add_special_tokens=True)
 
     def __len__(self):
@@ -802,9 +799,6 @@ class FixedAlgorithmicDataset(Dataset):
         return token_map
 
     def _encode_text(self, text: str) -> List[int]:
-        if self._char_token_map and all(ch in self._char_token_map for ch in text):
-            core_tokens = [self._char_token_map[ch] for ch in text]
-            return self.tokenizer.build_inputs_with_special_tokens(core_tokens)
         return self.tokenizer.encode(text, add_special_tokens=True)
 
     def __len__(self) -> int:
