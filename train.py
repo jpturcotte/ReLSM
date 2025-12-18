@@ -494,28 +494,29 @@ def train(args):
     lang_steps = lang_tokens // (args.alg_batch_size * args.lang_seq_len)
     estimated_steps = algo_steps + lang_steps
     warmup_steps = args.warmup_steps
+    warmup_tokens_arg = args.warmup_tokens
     estimated_tokens_per_step = args.total_tokens / max(estimated_steps, 1)
 
-    if warmup_steps is None:
-        warmup_tokens = int(args.warmup_frac * args.total_tokens)
-    else:
+    if warmup_tokens_arg is not None:
+        warmup_tokens = warmup_tokens_arg
+        warmup_source = "manual warmup_tokens override"
+    elif warmup_steps is not None:
         # Preserve the CLI contract for --warmup_steps by translating the requested
         # step count into the equivalent token budget using the hybrid step
         # estimate above.
         warmup_tokens = int(warmup_steps * estimated_tokens_per_step)
+        warmup_source = f"derived from {warmup_steps} manual warmup steps"
+    else:
+        warmup_tokens = int(args.warmup_frac * args.total_tokens)
+        warmup_source = f"{args.warmup_frac:.2f} of total tokens"
+
     warmup_tokens = min(max(warmup_tokens, 1), args.total_tokens)
+    warmup_display = f"{warmup_tokens} tokens ({warmup_source})"
 
     print(
         f"  Estimated steps (Hybrid calc: Algo ~{algo_steps} + Lang ~{lang_steps}): {estimated_steps}"
     )
-    print(
-        "  Warmup: "
-        + (
-            f"{warmup_tokens} tokens (derived from {warmup_steps} manual warmup steps)"
-            if args.warmup_steps is not None
-            else f"{warmup_tokens} tokens ({args.warmup_frac:.2f} of total tokens)"
-        )
-    )
+    print(f"  Warmup: {warmup_display}")
     print("\n" + "="*60)
     print("Starting training...")
     print("="*60 + "\n")
@@ -805,7 +806,16 @@ def main():
         default=None,
         help=(
             "Manual override for warmup expressed in steps (converted to tokens); "
-            "otherwise derived from warmup_frac"
+            "ignored when warmup_tokens is set"
+        ),
+    )
+    parser.add_argument(
+        "--warmup_tokens",
+        type=int,
+        default=None,
+        help=(
+            "Manual override for warmup expressed directly in tokens. Overrides "
+            "warmup_steps and warmup_frac when set."
         ),
     )
     parser.add_argument(
@@ -813,7 +823,8 @@ def main():
         type=float,
         default=0.1,
         help=(
-            "Fraction of total tokens to use for warmup when warmup_steps is not set"
+            "Fraction of total tokens to use for warmup when warmup_tokens and "
+            "warmup_steps are not set"
         ),
     )
     parser.add_argument("--weight_decay", type=float, default=1.0)
