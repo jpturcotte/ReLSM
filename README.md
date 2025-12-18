@@ -41,6 +41,10 @@ Both `train.py` and the `create_model` factory accept the same size strings abov
 # Install (includes optional Mamba-2 kernels)
 pip install -r requirements.txt
 
+# Tokenization
+# All training/eval paths default to the EleutherAI/llemma_7b tokenizer.
+# Override with --tokenizer if you need a different vocabulary.
+
 # Optional: enable PyTorch compilation on Linux for extra speed
 # (disabled by default to avoid Windows Triton issues)
 # python train.py --compile ...

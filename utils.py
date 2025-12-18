@@ -24,6 +24,8 @@ import torch
 from data import AlgorithmicGenerator
 from model import BaselineTransformer, TransformerConfig
 
+DEFAULT_TOKENIZER_NAME = "EleutherAI/llemma_7b"
+
 
 def seed_all(seed: int) -> None:
     """Seed Python, NumPy (if available), and torch RNGs."""
