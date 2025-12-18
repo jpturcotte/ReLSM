@@ -19,6 +19,7 @@ import torch
 from eval import ood_grid
 from eval.self_test import run_self_test_suite
 from utils import (
+    DEFAULT_TOKENIZER_NAME,
     EvalResult,
     NeedleInHaystackGenerator,
     area_under_depth_curve,
@@ -352,7 +353,9 @@ def _load_for_cli(checkpoint: str, tokenizer_name: str, device: torch.device):
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified evaluation hub")
     parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint")
-    parser.add_argument("--tokenizer", default="gpt2", help="Tokenizer name or path")
+    parser.add_argument(
+        "--tokenizer", default=DEFAULT_TOKENIZER_NAME, help="Tokenizer name or path"
+    )
     parser.add_argument(
         "--suite",
         default="algorithmic",

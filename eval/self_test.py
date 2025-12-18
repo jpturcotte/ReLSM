@@ -10,7 +10,7 @@ from typing import Any, Dict
 import torch
 
 from model import BaselineTransformer, TransformerConfig
-from utils import generate_batch, seed_all
+from utils import DEFAULT_TOKENIZER_NAME, generate_batch, seed_all
 
 
 def run_self_test_suite(
@@ -71,7 +71,7 @@ def run_self_checks() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         ckpt = _make_tiny_checkpoint(tmp_path)
-        tokenizer = prepare_tokenizer("gpt2")
+        tokenizer = prepare_tokenizer(DEFAULT_TOKENIZER_NAME)
         checkpoint = torch.load(ckpt, map_location="cpu")
         model = BaselineTransformer(checkpoint["config"])
         model.load_state_dict(checkpoint["model_state_dict"])

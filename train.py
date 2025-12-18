@@ -40,6 +40,8 @@ import torch.nn as nn
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 
+from utils import DEFAULT_TOKENIZER_NAME
+
 plt.switch_backend("Agg")
 
 def get_lr(step: int, warmup_steps: int, max_steps: int, max_lr: float, min_lr: float) -> float:
@@ -688,7 +690,7 @@ def main():
                        choices=["nano", "50M", "125M", "300M", "350M", "760M", "1B", "1B-16k"])
     parser.add_argument("--variant", type=str, default="baseline",
                        choices=["baseline", "shared_loop", "latent", "act", "ssm", "ssm_mem"])
-    parser.add_argument("--tokenizer", type=str, default="gpt2")
+    parser.add_argument("--tokenizer", type=str, default=DEFAULT_TOKENIZER_NAME)
     parser.add_argument("--K", type=int, default=4, help="Fixed inner steps for latent/ssm")
     parser.add_argument("--min_K", type=int, default=2, help="Minimum ACT steps")
     parser.add_argument("--max_K", type=int, default=8, help="Maximum ACT steps")
