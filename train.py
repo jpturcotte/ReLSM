@@ -488,12 +488,21 @@ def train(args):
     lang_steps = lang_tokens // (args.alg_batch_size * args.lang_seq_len)
     estimated_steps = algo_steps + lang_steps
     max_steps = estimated_steps
-    warmup_steps = int(0.1 * estimated_steps)
+    warmup_steps = args.warmup_steps
+    if warmup_steps is None:
+        warmup_steps = int(args.warmup_frac * estimated_steps)
 
     print(
         f"  Estimated steps (Hybrid calc: Algo ~{algo_steps} + Lang ~{lang_steps}): {estimated_steps}"
     )
-    print(f"  Warmup steps: {warmup_steps}")
+    print(
+        "  Warmup steps: "
+        + (
+            f"{warmup_steps} (manual override)"
+            if args.warmup_steps is not None
+            else f"{warmup_steps} ({args.warmup_frac:.2f} of estimated steps)"
+        )
+    )
     print("\n" + "="*60)
     print("Starting training...")
     print("="*60 + "\n")
@@ -768,6 +777,18 @@ def main():
     # Optimizer
     parser.add_argument("--max_lr", type=float, default=6e-4)
     parser.add_argument("--min_lr", type=float, default=6e-5)
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=None,
+        help="Manual override for warmup steps; otherwise derived from warmup_frac",
+    )
+    parser.add_argument(
+        "--warmup_frac",
+        type=float,
+        default=0.1,
+        help="Fraction of total steps to use for warmup when warmup_steps is not set",
+    )
     parser.add_argument("--weight_decay", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--grad_accum_steps", type=int, default=4)
