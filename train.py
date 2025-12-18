@@ -44,13 +44,13 @@ from utils import DEFAULT_TOKENIZER_NAME
 
 plt.switch_backend("Agg")
 
-def get_lr(step: int, warmup_steps: int, max_steps: int, max_lr: float, min_lr: float) -> float:
-    """Cosine schedule with warmup."""
-    current_step = min(step, max_steps)
-    if step < warmup_steps:
-        return max_lr * (step + 1) / warmup_steps
-    progress = (current_step - warmup_steps) / max(1, max_steps - warmup_steps)
-    return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
+def get_lr(progress: int, warmup_progress: int, max_progress: int, max_lr: float, min_lr: float) -> float:
+    """Cosine schedule with warmup based on generic progress units (e.g., tokens)."""
+    current_progress = min(progress, max_progress)
+    if progress < warmup_progress:
+        return max_lr * (progress + 1) / max(1, warmup_progress)
+    progress_frac = (current_progress - warmup_progress) / max(1, max_progress - warmup_progress)
+    return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress_frac))
 
 
 class MetricsLogger:
@@ -493,20 +493,24 @@ def train(args):
     lang_tokens = max(0, args.total_tokens - args.alg_tokens)
     lang_steps = lang_tokens // (args.alg_batch_size * args.lang_seq_len)
     estimated_steps = algo_steps + lang_steps
-    max_steps = estimated_steps
     warmup_steps = args.warmup_steps
     if warmup_steps is None:
-        warmup_steps = int(args.warmup_frac * estimated_steps)
+        warmup_tokens = int(args.warmup_frac * args.total_tokens)
+    else:
+        warmup_tokens = int(
+            args.total_tokens * warmup_steps / max(estimated_steps, 1)
+        )
+    warmup_tokens = min(max(warmup_tokens, 1), args.total_tokens)
 
     print(
         f"  Estimated steps (Hybrid calc: Algo ~{algo_steps} + Lang ~{lang_steps}): {estimated_steps}"
     )
     print(
-        "  Warmup steps: "
+        "  Warmup: "
         + (
-            f"{warmup_steps} (manual override)"
+            f"{warmup_tokens} tokens (derived from {warmup_steps} manual warmup steps)"
             if args.warmup_steps is not None
-            else f"{warmup_steps} ({args.warmup_frac:.2f} of estimated steps)"
+            else f"{warmup_tokens} tokens ({args.warmup_frac:.2f} of total tokens)"
         )
     )
     print("\n" + "="*60)
@@ -531,9 +535,10 @@ def train(args):
         batch = curriculum.next_batch()
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
+        tokens_seen = curriculum.tokens_seen
         
-        # Learning rate
-        lr = get_lr(global_step, warmup_steps, max_steps, args.max_lr, args.min_lr)
+        # Learning rate (token-based decay to align with actual budget consumption)
+        lr = get_lr(tokens_seen, warmup_tokens, args.total_tokens, args.max_lr, args.min_lr)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
         
@@ -576,7 +581,6 @@ def train(args):
             optimizer.zero_grad()
         
         global_step += 1
-        tokens_seen = curriculum.tokens_seen
         
         # Logging
         if global_step % args.log_interval == 0:
