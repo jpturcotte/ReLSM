@@ -494,12 +494,15 @@ def train(args):
     lang_steps = lang_tokens // (args.alg_batch_size * args.lang_seq_len)
     estimated_steps = algo_steps + lang_steps
     warmup_steps = args.warmup_steps
+    estimated_tokens_per_step = args.total_tokens / max(estimated_steps, 1)
+
     if warmup_steps is None:
         warmup_tokens = int(args.warmup_frac * args.total_tokens)
     else:
-        warmup_tokens = int(
-            args.total_tokens * warmup_steps / max(estimated_steps, 1)
-        )
+        # Preserve the CLI contract for --warmup_steps by translating the requested
+        # step count into the equivalent token budget using the hybrid step
+        # estimate above.
+        warmup_tokens = int(warmup_steps * estimated_tokens_per_step)
     warmup_tokens = min(max(warmup_tokens, 1), args.total_tokens)
 
     print(
@@ -800,13 +803,18 @@ def main():
         "--warmup_steps",
         type=int,
         default=None,
-        help="Manual override for warmup steps; otherwise derived from warmup_frac",
+        help=(
+            "Manual override for warmup expressed in steps (converted to tokens); "
+            "otherwise derived from warmup_frac"
+        ),
     )
     parser.add_argument(
         "--warmup_frac",
         type=float,
         default=0.1,
-        help="Fraction of total steps to use for warmup when warmup_steps is not set",
+        help=(
+            "Fraction of total tokens to use for warmup when warmup_steps is not set"
+        ),
     )
     parser.add_argument("--weight_decay", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
