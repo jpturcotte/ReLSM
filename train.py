@@ -83,10 +83,13 @@ class MetricsLogger:
             self.metrics[k].append(v)
             self.metric_steps[k].append(step)
     
-    def log_task_accuracy(self, task: str, accuracy: float, step: int):
+    def log_task_accuracy(self, task: str, accuracy: float, step: int, mae: Optional[float] = None):
         if task not in self.task_accuracies:
             self.task_accuracies[task] = []
-        self.task_accuracies[task].append({"step": step, "accuracy": accuracy})
+        entry = {"step": step, "accuracy": accuracy}
+        if mae is not None:
+            entry["mae"] = mae
+        self.task_accuracies[task].append(entry)
     
     def save(self):
         with open(self.output_dir / "metrics.json", "w") as f:
@@ -152,7 +155,7 @@ class MetricsLogger:
 @torch.no_grad()
 def evaluate_algorithmic(
     model, tokenizer, device, n_examples: int = 100, max_new_tokens: int = 32
-) -> Dict[str, float]:
+) -> Dict[str, Dict[str, float] | float | None]:
     """Run the canonical algorithmic OOD grid using ``eval_hub``.
 
     The ``n_examples`` argument caps the number of examples per condition
@@ -179,9 +182,12 @@ def evaluate_algorithmic(
         limit=n_examples,
     )
 
-    summary = {"overall": results.get("overall_accuracy", 0.0)}
-    summary.update(results.get("per_task_accuracy", {}))
-    return summary
+    return {
+        "overall_accuracy": results.get("overall_accuracy", 0.0),
+        "per_task_accuracy": results.get("per_task_accuracy", {}),
+        "overall_mae": results.get("overall_mae"),
+        "per_task_mae": results.get("per_task_mae", {}),
+    }
 
 
 @torch.no_grad()
@@ -626,15 +632,24 @@ def train(args):
                 n_examples=args.eval_samples,
                 max_new_tokens=args.eval_max_new_tokens,
             )
-            print(f"  Algorithmic accuracy: {alg_results['overall']*100:.1f}%")
-            for task, acc in alg_results.items():
-                if task != "overall":
-                    logger.log_task_accuracy(task, acc, global_step)
-                    print(f"    {task}: {acc*100:.1f}%")
+            overall_acc = alg_results.get("overall_accuracy", 0.0)
+            overall_mae = alg_results.get("overall_mae")
+            print(f"  Algorithmic accuracy: {overall_acc*100:.1f}%")
+            if overall_mae is not None:
+                print(f"  Algorithmic MAE (numeric tasks): {overall_mae:.3f}")
+
+            per_task_mae = alg_results.get("per_task_mae", {}) or {}
+            for task, acc in alg_results.get("per_task_accuracy", {}).items():
+                task_mae = per_task_mae.get(task)
+                logger.log_task_accuracy(task, acc, global_step, mae=task_mae)
+                line = f"    {task}: {acc*100:.1f}%"
+                if task_mae is not None:
+                    line += f" | MAE: {task_mae:.3f}"
+                print(line)
 
             # Track best
-            if alg_results["overall"] > best_alg_acc:
-                best_alg_acc = alg_results["overall"]
+            if overall_acc > best_alg_acc:
+                best_alg_acc = overall_acc
                 torch.save({
                     "model_state_dict": model.state_dict(),
                     "config": config,
