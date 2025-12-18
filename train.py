@@ -44,13 +44,13 @@ from utils import DEFAULT_TOKENIZER_NAME
 
 plt.switch_backend("Agg")
 
-def get_lr(step: int, warmup_steps: int, max_steps: int, max_lr: float, min_lr: float) -> float:
-    """Cosine schedule with warmup."""
-    current_step = min(step, max_steps)
-    if step < warmup_steps:
-        return max_lr * (step + 1) / warmup_steps
-    progress = (current_step - warmup_steps) / max(1, max_steps - warmup_steps)
-    return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
+def get_lr(progress: int, warmup_progress: int, max_progress: int, max_lr: float, min_lr: float) -> float:
+    """Cosine schedule with warmup based on generic progress units (e.g., tokens)."""
+    current_progress = min(progress, max_progress)
+    if progress < warmup_progress:
+        return max_lr * (progress + 1) / max(1, warmup_progress)
+    progress_frac = (current_progress - warmup_progress) / max(1, max_progress - warmup_progress)
+    return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress_frac))
 
 
 class MetricsLogger:
@@ -493,22 +493,30 @@ def train(args):
     lang_tokens = max(0, args.total_tokens - args.alg_tokens)
     lang_steps = lang_tokens // (args.alg_batch_size * args.lang_seq_len)
     estimated_steps = algo_steps + lang_steps
-    max_steps = estimated_steps
     warmup_steps = args.warmup_steps
-    if warmup_steps is None:
-        warmup_steps = int(args.warmup_frac * estimated_steps)
+    warmup_tokens_arg = args.warmup_tokens
+    estimated_tokens_per_step = args.total_tokens / max(estimated_steps, 1)
+
+    if warmup_tokens_arg is not None:
+        warmup_tokens = warmup_tokens_arg
+        warmup_source = "manual warmup_tokens override"
+    elif warmup_steps is not None:
+        # Preserve the CLI contract for --warmup_steps by translating the requested
+        # step count into the equivalent token budget using the hybrid step
+        # estimate above.
+        warmup_tokens = int(warmup_steps * estimated_tokens_per_step)
+        warmup_source = f"derived from {warmup_steps} manual warmup steps"
+    else:
+        warmup_tokens = int(args.warmup_frac * args.total_tokens)
+        warmup_source = f"{args.warmup_frac:.2f} of total tokens"
+
+    warmup_tokens = min(max(warmup_tokens, 1), args.total_tokens)
+    warmup_display = f"{warmup_tokens} tokens ({warmup_source})"
 
     print(
         f"  Estimated steps (Hybrid calc: Algo ~{algo_steps} + Lang ~{lang_steps}): {estimated_steps}"
     )
-    print(
-        "  Warmup steps: "
-        + (
-            f"{warmup_steps} (manual override)"
-            if args.warmup_steps is not None
-            else f"{warmup_steps} ({args.warmup_frac:.2f} of estimated steps)"
-        )
-    )
+    print(f"  Warmup: {warmup_display}")
     print("\n" + "="*60)
     print("Starting training...")
     print("="*60 + "\n")
@@ -531,9 +539,10 @@ def train(args):
         batch = curriculum.next_batch()
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
+        tokens_seen = curriculum.tokens_seen
         
-        # Learning rate
-        lr = get_lr(global_step, warmup_steps, max_steps, args.max_lr, args.min_lr)
+        # Learning rate (token-based decay to align with actual budget consumption)
+        lr = get_lr(tokens_seen, warmup_tokens, args.total_tokens, args.max_lr, args.min_lr)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
         
@@ -576,7 +585,6 @@ def train(args):
             optimizer.zero_grad()
         
         global_step += 1
-        tokens_seen = curriculum.tokens_seen
         
         # Logging
         if global_step % args.log_interval == 0:
@@ -796,13 +804,28 @@ def main():
         "--warmup_steps",
         type=int,
         default=None,
-        help="Manual override for warmup steps; otherwise derived from warmup_frac",
+        help=(
+            "Manual override for warmup expressed in steps (converted to tokens); "
+            "ignored when warmup_tokens is set"
+        ),
+    )
+    parser.add_argument(
+        "--warmup_tokens",
+        type=int,
+        default=None,
+        help=(
+            "Manual override for warmup expressed directly in tokens. Overrides "
+            "warmup_steps and warmup_frac when set."
+        ),
     )
     parser.add_argument(
         "--warmup_frac",
         type=float,
         default=0.1,
-        help="Fraction of total steps to use for warmup when warmup_steps is not set",
+        help=(
+            "Fraction of total tokens to use for warmup when warmup_tokens and "
+            "warmup_steps are not set"
+        ),
     )
     parser.add_argument("--weight_decay", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
