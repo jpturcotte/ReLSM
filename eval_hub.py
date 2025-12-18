@@ -96,6 +96,8 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
     per_task: Dict[str, Dict[str, Any]] = {}
     total_correct = 0
     total_seen = 0
+    total_abs_error = 0.0
+    total_numeric = 0
 
     for res in results:
         conditions.append(
@@ -103,6 +105,8 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
                 "task": res.task,
                 "condition": res.condition,
                 "accuracy": res.accuracy,
+                "mae": res.mae,
+                "numeric_count": res.numeric_count,
                 "n": res.n,
                 "avg_gen_len": res.avg_gen_len,
                 "tokens_per_sec": res.tokens_per_sec,
@@ -113,21 +117,37 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
         )
         total_correct += res.correct
         total_seen += res.n
-        per_task.setdefault(res.task, {"conditions": [], "correct": 0, "total": 0})
+        per_task.setdefault(
+            res.task,
+            {"conditions": [], "correct": 0, "total": 0, "mae_error": 0.0, "mae_count": 0},
+        )
         per_task[res.task]["conditions"].append(res.condition)
         per_task[res.task]["correct"] += res.correct
         per_task[res.task]["total"] += res.n
+        if res.mae is not None and res.numeric_count > 0:
+            error_sum = res.mae * res.numeric_count
+            per_task[res.task]["mae_error"] += error_sum
+            per_task[res.task]["mae_count"] += res.numeric_count
+            total_abs_error += error_sum
+            total_numeric += res.numeric_count
 
     per_task_acc = {
         task: (payload["correct"] / payload["total"] if payload["total"] else 0.0)
         for task, payload in per_task.items()
     }
+    per_task_mae: Dict[str, Optional[float]] = {
+        task: (payload["mae_error"] / payload["mae_count"] if payload["mae_count"] else None)
+        for task, payload in per_task.items()
+    }
     overall = total_correct / total_seen if total_seen else 0.0
+    overall_mae = total_abs_error / total_numeric if total_numeric else None
     return {
         "grid_version": ood_grid.OOD_GRID_VERSION,
         "conditions": conditions,
         "per_task_accuracy": per_task_acc,
+        "per_task_mae": per_task_mae,
         "overall_accuracy": overall,
+        "overall_mae": overall_mae,
     }
 
 

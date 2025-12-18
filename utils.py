@@ -395,6 +395,8 @@ class EvalResult:
     condition: str
     task: str
     accuracy: float
+    mae: Optional[float]
+    numeric_count: int
     n: int
     avg_gen_len: float
     tokens_per_sec: float
@@ -549,6 +551,8 @@ def evaluate_condition(
     use_autocast = device.type == "cuda"
 
     total_correct = 0
+    total_absolute_error = 0.0
+    total_numeric_samples = 0
     total_examples = 0
     total_tokens = 0
     total_time = 0.0
@@ -587,9 +591,18 @@ def evaluate_condition(
                             "prediction": pred,
                         }
                     )
+
+            try:
+                val_pred = float(pred)
+                val_tgt = float(norm_tgt)
+                total_absolute_error += abs(val_pred - val_tgt)
+                total_numeric_samples += 1
+            except ValueError:
+                pass
             total_examples += 1
 
     accuracy = total_correct / total_examples if total_examples else 0.0
+    mae = total_absolute_error / total_numeric_samples if total_numeric_samples > 0 else None
     avg_gen_len = total_gen_len / total_examples if total_examples else 0.0
     tokens_per_sec = total_tokens / total_time if total_time > 0 else 0.0
 
@@ -597,6 +610,8 @@ def evaluate_condition(
         condition=condition,
         task=task,
         accuracy=accuracy,
+        mae=mae,
+        numeric_count=total_numeric_samples,
         n=total_examples,
         avg_gen_len=avg_gen_len,
         tokens_per_sec=tokens_per_sec,
