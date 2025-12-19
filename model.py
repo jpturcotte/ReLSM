@@ -527,8 +527,10 @@ class SSMBlock(nn.Module):
         B, T, E = v.shape
         pad = self.groups * self.group_size - E
         if pad:
-            v = F.pad(v, (0, pad))
-        v_group = v.view(B, T, self.groups, self.group_size)
+            v_padded = F.pad(v, (0, pad))
+        else:
+            v_padded = v
+        v_group = v_padded.view(B, T, self.groups, self.group_size)
 
         # Project inputs to SSM parameters
         B_t = self.B_proj(v).view(B, T, self.groups, self.N)
@@ -865,7 +867,9 @@ class BaselineTransformer(nn.Module):
         if use_kv_cache:
             kv_cache: List[Any] = [None] * self._cache_slots
 
-        sampling = do_sample and temperature > 0
+        sampling = do_sample
+        if sampling and temperature <= 0:
+            sampling = False
 
         # Treat disabling values as None for easier downstream logic.
         top_k = None if top_k is None or top_k <= 0 else top_k

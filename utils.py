@@ -511,7 +511,7 @@ def generate_batch(
                 microbatch = bucket[start_idx : start_idx + batch_size]
                 batch_ids = torch.stack([ids for _, ids in microbatch], dim=0).to(device)
                 if use_autocast:
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast(device_type="cuda"):
                         outputs = model.generate(input_ids=batch_ids, **gen_kwargs)
                 else:
                     outputs = model.generate(input_ids=batch_ids, **gen_kwargs)
