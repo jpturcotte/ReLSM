@@ -786,6 +786,27 @@ def train(args):
     start_time = time.time()
     best_alg_acc = 0.0
     last_grad_norm = 0.0
+    checkpoint_paths: List[Path] = []
+
+    def save_rotating_checkpoint(step: int, tokens_seen: int, tag: Optional[str] = None) -> Optional[Path]:
+        if args.eval_checkpoints <= 0:
+            return None
+        suffix = f"_{tag}" if tag else ""
+        checkpoint_path = output_dir / f"checkpoint_step_{step}{suffix}.pt"
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "config": config,
+            "step": step,
+            "tokens_seen": tokens_seen,
+        }, checkpoint_path)
+        checkpoint_paths.append(checkpoint_path)
+        while len(checkpoint_paths) > args.eval_checkpoints:
+            old_checkpoint = checkpoint_paths.pop(0)
+            try:
+                old_checkpoint.unlink()
+            except FileNotFoundError:
+                pass
+        return checkpoint_path
     
     # Estimate steps with hybrid calculation for sparse algorithmic and dense language data
     algo_steps = args.alg_tokens // (args.alg_batch_size * 40)
@@ -827,211 +848,227 @@ def train(args):
     running_inner_steps = 0.0
     running_ponder = 0.0
     
-    while curriculum.tokens_seen < args.total_tokens:
-        if difficulty_value is not None:
-            if curriculum.tokens_seen < args.alg_tokens:
-                difficulty_value.value = difficulty_schedule(
-                    curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
+    try:
+        while curriculum.tokens_seen < args.total_tokens:
+            if difficulty_value is not None:
+                if curriculum.tokens_seen < args.alg_tokens:
+                    difficulty_value.value = difficulty_schedule(
+                        curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
+                    )
+                else:
+                    difficulty_value.value = 1.0
+            batch = curriculum.next_batch()
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            tokens_seen = curriculum.tokens_seen
+            
+            # Learning rate (token-based decay to align with actual budget consumption)
+            lr = get_lr(tokens_seen, warmup_tokens, args.total_tokens, args.max_lr, args.min_lr)
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
+            
+            # Forward
+            with ctx:
+                logits, loss, _ = model(input_ids, labels=labels)
+                inner_steps = model.aux.get("inner_steps", 0)
+                ponder = model.aux.get("ponder", 0.0)
+
+                if isinstance(inner_steps, torch.Tensor):
+                    avg_inner = inner_steps.float().mean().item()
+                else:
+                    avg_inner = float(inner_steps) if inner_steps else 0.0
+
+                running_inner_steps += avg_inner
+                running_ponder += float(ponder)
+
+                loss = loss / args.grad_accum_steps
+            
+            # Backward
+            scaler.scale(loss).backward()
+            running_loss += loss.item() * args.grad_accum_steps
+
+            if args.grokfast:
+                with torch.no_grad():
+                    for name, param in model.named_parameters():
+                        if param.grad is not None:
+                            ema = grokfast_ema[name]
+                            ema.mul_(args.grokfast_alpha).add_(
+                                param.grad, alpha=1 - args.grokfast_alpha
+                            )
+                            param.grad.add_(ema, alpha=args.grokfast_lambda)
+
+            # Step
+            if (global_step + 1) % args.grad_accum_steps == 0:
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+                last_grad_norm = float(grad_norm)
+            
+            global_step += 1
+            
+            # Logging
+            if global_step % args.log_interval == 0:
+                elapsed = time.time() - start_time
+                toks_per_sec = tokens_seen / max(elapsed, 1e-6)
+                peak_vram = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0.0
+                avg_loss = running_loss / args.log_interval
+                avg_K = running_inner_steps / args.log_interval if running_inner_steps > 0 else 0.0
+                avg_ponder = running_ponder / args.log_interval if running_ponder > 0 else 0.0
+
+                phase = curriculum.phase
+                progress = curriculum.progress * 100
+
+                with torch.no_grad():
+                    weight_norm = math.sqrt(
+                        sum((param.detach().float() ** 2).sum().item() for param in model.parameters())
+                    )
+
+                print(f"Step {global_step:>6} | "
+                      f"Phase: {phase[:4]:>4} | "
+                      f"Progress: {progress:>5.1f}% | "
+                      f"Loss: {avg_loss:.4f} | "
+                      f"LR: {lr:.2e} | "
+                      f"Tok/s: {toks_per_sec:.0f} | "
+                      f"VRAM: {peak_vram:.1f}GB" +
+                      (f" | K: {avg_K:.1f}" if avg_K > 0 else "") +
+                      (f" | ponder: {avg_ponder:.3f}" if avg_ponder > 0 else ""))
+
+                difficulty_logged = (
+                    float(difficulty_value.value) if difficulty_value is not None else 0.5
                 )
-            else:
-                difficulty_value.value = 1.0
-        batch = curriculum.next_batch()
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
-        tokens_seen = curriculum.tokens_seen
-        
-        # Learning rate (token-based decay to align with actual budget consumption)
-        lr = get_lr(tokens_seen, warmup_tokens, args.total_tokens, args.max_lr, args.min_lr)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
-        
-        # Forward
-        with ctx:
-            logits, loss, _ = model(input_ids, labels=labels)
-            inner_steps = model.aux.get("inner_steps", 0)
-            ponder = model.aux.get("ponder", 0.0)
 
-            if isinstance(inner_steps, torch.Tensor):
-                avg_inner = inner_steps.float().mean().item()
-            else:
-                avg_inner = float(inner_steps) if inner_steps else 0.0
-
-            running_inner_steps += avg_inner
-            running_ponder += float(ponder)
-
-            loss = loss / args.grad_accum_steps
-        
-        # Backward
-        scaler.scale(loss).backward()
-        running_loss += loss.item() * args.grad_accum_steps
-
-        if args.grokfast:
-            with torch.no_grad():
-                for name, param in model.named_parameters():
-                    if param.grad is not None:
-                        ema = grokfast_ema[name]
-                        ema.mul_(args.grokfast_alpha).add_(
-                            param.grad, alpha=1 - args.grokfast_alpha
-                        )
-                        param.grad.add_(ema, alpha=args.grokfast_lambda)
-
-        # Step
-        if (global_step + 1) % args.grad_accum_steps == 0:
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-
-            last_grad_norm = float(grad_norm)
-        
-        global_step += 1
-        
-        # Logging
-        if global_step % args.log_interval == 0:
-            elapsed = time.time() - start_time
-            toks_per_sec = tokens_seen / max(elapsed, 1e-6)
-            peak_vram = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0.0
-            avg_loss = running_loss / args.log_interval
-            avg_K = running_inner_steps / args.log_interval if running_inner_steps > 0 else 0.0
-            avg_ponder = running_ponder / args.log_interval if running_ponder > 0 else 0.0
-
-            phase = curriculum.phase
-            progress = curriculum.progress * 100
-
-            with torch.no_grad():
-                weight_norm = math.sqrt(
-                    sum((param.detach().float() ** 2).sum().item() for param in model.parameters())
-                )
-
-            print(f"Step {global_step:>6} | "
-                  f"Phase: {phase[:4]:>4} | "
-                  f"Progress: {progress:>5.1f}% | "
-                  f"Loss: {avg_loss:.4f} | "
-                  f"LR: {lr:.2e} | "
-                  f"Tok/s: {toks_per_sec:.0f} | "
-                  f"VRAM: {peak_vram:.1f}GB" +
-                  (f" | K: {avg_K:.1f}" if avg_K > 0 else "") +
-                  (f" | ponder: {avg_ponder:.3f}" if avg_ponder > 0 else ""))
-
-            difficulty_logged = (
-                float(difficulty_value.value) if difficulty_value is not None else 0.5
-            )
-
-            logger.log(
-                step=global_step,
-                phase=phase,
-                train_loss=avg_loss,
-                tokens_seen=tokens_seen,
-                tokens_per_sec=toks_per_sec,
-                peak_vram_gb=peak_vram,
-                avg_inner_steps=avg_K,
-                ponder=avg_ponder,
-                difficulty=difficulty_logged,
-                grad_norm=last_grad_norm,
-                weight_norm=weight_norm,
-            )
-
-            running_loss = 0.0
-            running_inner_steps = 0.0
-            running_ponder = 0.0
-        
-        # Evaluation
-        if global_step % args.eval_interval == 0:
-            print("\nRunning evaluation...")
-            with torch.no_grad():
-                weight_norm = math.sqrt(
-                    sum((param.detach().float() ** 2).sum().item() for param in model.parameters())
-                )
-            effective_wd_pressure = args.weight_decay * weight_norm
-            print(f"  Grad norm: {last_grad_norm:.1f}")
-            print(f"  Weight norm: {weight_norm:.1f}")
-            print(f"  WD pressure: {effective_wd_pressure:.1f}")
-
-            # Algorithmic accuracy (OOD grid)
-            if args.eval_algorithmic:
-                alg_results = evaluate_algorithmic(
-                    model,
-                    tokenizer,
-                    device,
-                    n_examples=args.eval_samples,
-                    max_new_tokens=args.eval_max_new_tokens,
-                    tasks=alg_tasks,
-                )
-                overall_acc = alg_results.get("overall_accuracy", 0.0)
-                overall_mae = alg_results.get("overall_mae")
-                print(f"  Algorithmic accuracy: {overall_acc*100:.1f}%")
-                if overall_mae is not None:
-                    print(f"  Algorithmic MAE (numeric tasks): {overall_mae:.3f}")
-
-                per_task_mae = alg_results.get("per_task_mae", {}) or {}
-                for task, acc in alg_results.get("per_task_accuracy", {}).items():
-                    task_mae = per_task_mae.get(task)
-                    logger.log_task_accuracy(task, acc, global_step, mae=task_mae)
-                    line = f"    {task}: {acc*100:.1f}%"
-                    if task_mae is not None:
-                        line += f" | MAE: {task_mae:.3f}"
-                    print(line)
-
-                # Track best
-                if overall_acc > best_alg_acc:
-                    best_alg_acc = overall_acc
-                    torch.save({
-                        "model_state_dict": model.state_dict(),
-                        "config": config,
-                        "step": global_step,
-                        "alg_accuracy": best_alg_acc,
-                    }, output_dir / "best_model.pt")
-                    print(f"  New best! Saved checkpoint.")
-
-            # Training data accuracy (memorization tracking)
-            if train_eval_loader is not None:
-                train_eval_metrics = evaluate_training_split(
-                    model,
-                    train_eval_loader,
-                    device,
-                    ctx,
-                    max_batches=args.train_eval_max_batches,
-                )
-                train_acc = train_eval_metrics["accuracy"]
-                train_loss_eval = train_eval_metrics["loss"]
-                print(
-                    f"  Training accuracy ({train_eval_label}): {train_acc*100:.2f}% | "
-                    f"Loss: {train_loss_eval:.4f}"
-                )
                 logger.log(
                     step=global_step,
-                    phase="eval",
-                    train_accuracy=train_acc,
-                    train_eval_loss=train_loss_eval,
+                    phase=phase,
+                    train_loss=avg_loss,
+                    tokens_seen=tokens_seen,
+                    tokens_per_sec=toks_per_sec,
+                    peak_vram_gb=peak_vram,
+                    avg_inner_steps=avg_K,
+                    ponder=avg_ponder,
+                    difficulty=difficulty_logged,
+                    grad_norm=last_grad_norm,
+                    weight_norm=weight_norm,
                 )
 
-                task_eval = evaluate_task_accuracy(
-                    model,
-                    tokenizer,
-                    train_eval_loader,
-                    device,
-                    ctx,
-                    max_samples=args.train_eval_samples,
-                    max_new_tokens=args.eval_max_new_tokens,
-                )
-                overall_task_acc = task_eval.get("overall_accuracy", 0.0)
-                print(f"  Training task accuracy: {overall_task_acc*100:.1f}%")
-                for task, acc in task_eval.get("per_task_accuracy", {}).items():
-                    logger.log_train_task_accuracy(task, acc, global_step)
-                    print(f"    {task}: {acc*100:.1f}%")
+                running_loss = 0.0
+                running_inner_steps = 0.0
+                running_ponder = 0.0
+            
+            # Evaluation
+            if global_step % args.eval_interval == 0:
+                print("\nRunning evaluation...")
+                with torch.no_grad():
+                    weight_norm = math.sqrt(
+                        sum((param.detach().float() ** 2).sum().item() for param in model.parameters())
+                    )
+                effective_wd_pressure = args.weight_decay * weight_norm
+                print(f"  Grad norm: {last_grad_norm:.1f}")
+                print(f"  Weight norm: {weight_norm:.1f}")
+                print(f"  WD pressure: {effective_wd_pressure:.1f}")
 
-            # Perplexity (only in Phase 2)
-            if curriculum.phase == "language":
-                ppl = evaluate_perplexity(model, lang_loader, device, ctx)
-                print(f"  Language PPL: {ppl:.2f}")
-                logger.log(step=global_step, phase="eval", val_loss=math.log(ppl))
+                # Algorithmic accuracy (OOD grid)
+                if args.eval_algorithmic:
+                    alg_results = evaluate_algorithmic(
+                        model,
+                        tokenizer,
+                        device,
+                        n_examples=args.eval_samples,
+                        max_new_tokens=args.eval_max_new_tokens,
+                        tasks=alg_tasks,
+                    )
+                    overall_acc = alg_results.get("overall_accuracy", 0.0)
+                    overall_mae = alg_results.get("overall_mae")
+                    print(f"  Algorithmic accuracy: {overall_acc*100:.1f}%")
+                    if overall_mae is not None:
+                        print(f"  Algorithmic MAE (numeric tasks): {overall_mae:.3f}")
 
-            logger.plot()
-            logger.save()
+                    per_task_mae = alg_results.get("per_task_mae", {}) or {}
+                    for task, acc in alg_results.get("per_task_accuracy", {}).items():
+                        task_mae = per_task_mae.get(task)
+                        logger.log_task_accuracy(task, acc, global_step, mae=task_mae)
+                        line = f"    {task}: {acc*100:.1f}%"
+                        if task_mae is not None:
+                            line += f" | MAE: {task_mae:.3f}"
+                        print(line)
 
-            print()
-            model.train()
+                    # Track best
+                    if overall_acc > best_alg_acc:
+                        best_alg_acc = overall_acc
+                        torch.save({
+                            "model_state_dict": model.state_dict(),
+                            "config": config,
+                            "step": global_step,
+                            "alg_accuracy": best_alg_acc,
+                        }, output_dir / "best_model.pt")
+                        print(f"  New best! Saved checkpoint.")
+
+                # Training data accuracy (memorization tracking)
+                if train_eval_loader is not None:
+                    train_eval_metrics = evaluate_training_split(
+                        model,
+                        train_eval_loader,
+                        device,
+                        ctx,
+                        max_batches=args.train_eval_max_batches,
+                    )
+                    train_acc = train_eval_metrics["accuracy"]
+                    train_loss_eval = train_eval_metrics["loss"]
+                    print(
+                        f"  Training accuracy ({train_eval_label}): {train_acc*100:.2f}% | "
+                        f"Loss: {train_loss_eval:.4f}"
+                    )
+                    logger.log(
+                        step=global_step,
+                        phase="eval",
+                        train_accuracy=train_acc,
+                        train_eval_loss=train_loss_eval,
+                    )
+
+                    task_eval = evaluate_task_accuracy(
+                        model,
+                        tokenizer,
+                        train_eval_loader,
+                        device,
+                        ctx,
+                        max_samples=args.train_eval_samples,
+                        max_new_tokens=args.eval_max_new_tokens,
+                    )
+                    overall_task_acc = task_eval.get("overall_accuracy", 0.0)
+                    print(f"  Training task accuracy: {overall_task_acc*100:.1f}%")
+                    for task, acc in task_eval.get("per_task_accuracy", {}).items():
+                        logger.log_train_task_accuracy(task, acc, global_step)
+                        print(f"    {task}: {acc*100:.1f}%")
+
+                # Perplexity (only in Phase 2)
+                if curriculum.phase == "language":
+                    ppl = evaluate_perplexity(model, lang_loader, device, ctx)
+                    print(f"  Language PPL: {ppl:.2f}")
+                    logger.log(step=global_step, phase="eval", val_loss=math.log(ppl))
+
+                logger.plot()
+                logger.save()
+
+                checkpoint_path = save_rotating_checkpoint(global_step, tokens_seen)
+                if checkpoint_path is not None:
+                    print(
+                        f"  Saved checkpoint: {checkpoint_path.name} "
+                        f"(keeping last {args.eval_checkpoints})"
+                    )
+
+                print()
+                model.train()
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt detected. Saving checkpoint before exit.")
+        interrupt_checkpoint = save_rotating_checkpoint(global_step, tokens_seen, tag="interrupt")
+        if interrupt_checkpoint is not None:
+            print(
+                f"  Saved checkpoint: {interrupt_checkpoint.name} "
+                f"(keeping last {args.eval_checkpoints})"
+            )
     
     # =========================================================================
     # FINISH
@@ -1219,6 +1256,12 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--eval_interval", type=int, default=500)
+    parser.add_argument(
+        "--eval_checkpoints",
+        type=int,
+        default=2,
+        help="Number of most recent evaluation checkpoints to keep",
+    )
     parser.add_argument(
         "--eval_algorithmic",
         action=argparse.BooleanOptionalAction,
