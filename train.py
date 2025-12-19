@@ -73,6 +73,8 @@ class MetricsLogger:
         self.metric_steps = {}
         self.task_accuracies = {}
         self.train_task_accuracies = {}
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.save()
     
     def log(self, step: int, phase: str, **kwargs):
         self.metrics["step"].append(step)
@@ -100,6 +102,7 @@ class MetricsLogger:
         self.train_task_accuracies[task].append({"step": step, "accuracy": accuracy})
     
     def save(self):
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         with open(self.output_dir / "metrics.json", "w") as f:
             json.dump({
                 "training": self.metrics,
@@ -1011,6 +1014,7 @@ def train(args):
                 logger.log(step=global_step, phase="eval", val_loss=math.log(ppl))
 
             logger.plot()
+            logger.save()
 
             print()
             model.train()
