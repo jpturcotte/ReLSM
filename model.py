@@ -875,6 +875,7 @@ class BaselineTransformer(nn.Module):
         top_k = None if top_k is None or top_k <= 0 else top_k
         top_p = None if top_p is None or top_p >= 1 or top_p <= 0 else top_p
 
+        # If eos_token_id is None, decoding will run for the full max_new_tokens.
         for _ in range(max_new_tokens):
             if use_kv_cache:
                 curr_input = generated[:, -1:] if kv_cache[0] is not None else generated
