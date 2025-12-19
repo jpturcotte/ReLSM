@@ -26,6 +26,8 @@ import math
 import json
 import random
 import argparse
+import re
+from collections import defaultdict
 from multiprocessing import Value
 from pathlib import Path
 from contextlib import nullcontext
@@ -70,6 +72,7 @@ class MetricsLogger:
         }
         self.metric_steps = {}
         self.task_accuracies = {}
+        self.train_task_accuracies = {}
     
     def log(self, step: int, phase: str, **kwargs):
         self.metrics["step"].append(step)
@@ -90,12 +93,18 @@ class MetricsLogger:
         if mae is not None:
             entry["mae"] = mae
         self.task_accuracies[task].append(entry)
+
+    def log_train_task_accuracy(self, task: str, accuracy: float, step: int):
+        if task not in self.train_task_accuracies:
+            self.train_task_accuracies[task] = []
+        self.train_task_accuracies[task].append({"step": step, "accuracy": accuracy})
     
     def save(self):
         with open(self.output_dir / "metrics.json", "w") as f:
             json.dump({
                 "training": self.metrics,
                 "task_accuracies": self.task_accuracies,
+                "train_task_accuracies": self.train_task_accuracies,
             }, f, indent=2)
     
     def summary(self) -> Dict:
@@ -150,6 +159,24 @@ class MetricsLogger:
         plt.tight_layout()
         plt.savefig(self.output_dir / "accuracy.png")
         plt.close()
+
+        # Training task accuracy plot
+        if self.train_task_accuracies:
+            plt.figure()
+            for task, records in self.train_task_accuracies.items():
+                steps = [entry["step"] for entry in records]
+                accuracies = [entry["accuracy"] for entry in records]
+                if steps and accuracies:
+                    plt.plot(steps, accuracies, label=task)
+
+            plt.xlabel("Step")
+            plt.ylabel("Accuracy")
+            plt.title("Training Task Accuracy")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(self.output_dir / "train_task_accuracy.png")
+            plt.close()
 
 
 @torch.no_grad()
@@ -256,6 +283,174 @@ def evaluate_training_split(
     avg_loss = total_loss / denom
     accuracy = total_correct / denom
     return {"loss": avg_loss, "accuracy": accuracy}
+
+
+NUMERIC_TASKS = {"mod_add", "addition", "multiplication", "chain", "successor", "parity"}
+SEQUENCE_TASKS = {"copy", "reverse"}
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _decode_example_text(example: Dict[str, torch.Tensor], tokenizer) -> Optional[str]:
+    input_ids = example["input_ids"]
+    labels = example["labels"]
+    valid = (labels != -100).nonzero(as_tuple=False).view(-1)
+    if valid.numel() == 0:
+        return None
+    last_pos = int(valid[-1].item())
+    full_tokens = torch.cat([input_ids[: last_pos + 1], labels[last_pos : last_pos + 1]])
+    return tokenizer.decode(full_tokens, skip_special_tokens=True)
+
+
+def _extract_prompt_target(full_text: str, task: str) -> Optional[Dict[str, str]]:
+    if task in SEQUENCE_TASKS:
+        separators = ["->", "=>", "=", ":"]
+        sep_index = -1
+        chosen_sep = None
+        for sep in separators:
+            idx = full_text.rfind(sep)
+            if idx > sep_index:
+                sep_index = idx
+                chosen_sep = sep
+        if sep_index == -1 or chosen_sep is None:
+            return None
+        prompt = full_text[: sep_index + len(chosen_sep)].rstrip() + " "
+        target = full_text[sep_index + len(chosen_sep) :].strip()
+        return {"prompt": prompt, "target": target}
+
+    if " " not in full_text:
+        return None
+    prompt, target = full_text.rsplit(" ", 1)
+    return {"prompt": prompt.rstrip() + " ", "target": target.strip()}
+
+
+def _iter_eval_examples(loader, max_samples: Optional[int]):
+    count = 0
+    for batch in loader:
+        batch_size = batch["input_ids"].shape[0]
+        for idx in range(batch_size):
+            if max_samples is not None and count >= max_samples:
+                return
+            example = {}
+            for key, value in batch.items():
+                if torch.is_tensor(value):
+                    example[key] = value[idx]
+                else:
+                    example[key] = value[idx]
+            count += 1
+            yield example
+
+
+def _evaluate_numeric_answer(
+    model,
+    tokenizer,
+    prompt: str,
+    target: str,
+    device,
+    ctx,
+) -> Optional[bool]:
+    prompt_ids = tokenizer(prompt, return_tensors="pt", truncation=True)["input_ids"].to(device)
+    target_ids = tokenizer(target, add_special_tokens=False)["input_ids"]
+    if not target_ids:
+        return None
+
+    if len(target_ids) == 1:
+        input_ids = prompt_ids
+    else:
+        target_prefix = torch.tensor(target_ids[:-1], dtype=torch.long, device=device).unsqueeze(0)
+        input_ids = torch.cat([prompt_ids, target_prefix], dim=1)
+
+    with ctx:
+        logits, _, _ = model(input_ids)
+
+    prompt_len = prompt_ids.shape[1]
+    for offset, token_id in enumerate(target_ids):
+        pos = prompt_len + offset - 1
+        if pos < 0 or pos >= logits.shape[1]:
+            return None
+        pred_token = logits[0, pos].argmax().item()
+        if pred_token != token_id:
+            return False
+
+    return True
+
+
+def _evaluate_generation_answer(
+    model,
+    tokenizer,
+    prompt: str,
+    target: str,
+    device,
+    max_new_tokens: int,
+) -> Optional[bool]:
+    input_ids = tokenizer(prompt, return_tensors="pt", truncation=True)["input_ids"].to(device)
+    output = model.generate(
+        input_ids,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        temperature=0.0,
+        eos_token_id=getattr(tokenizer, "eos_token_id", None),
+    )
+    pred = tokenizer.decode(output[0, input_ids.shape[1] :], skip_special_tokens=True)
+    pred_norm = _normalize_text(pred)
+    target_norm = _normalize_text(target)
+    if not target_norm:
+        return None
+    return pred_norm.startswith(target_norm)
+
+
+@torch.no_grad()
+def evaluate_task_accuracy(
+    model,
+    tokenizer,
+    loader,
+    device,
+    ctx,
+    max_samples: Optional[int] = 200,
+    max_new_tokens: int = 32,
+    numeric_tasks: Optional[set] = None,
+) -> Dict[str, Dict[str, float] | float]:
+    """Evaluate task completion accuracy on a training split."""
+    model.eval()
+    numeric_tasks = numeric_tasks or NUMERIC_TASKS
+    correct = defaultdict(int)
+    total = defaultdict(int)
+
+    for example in _iter_eval_examples(loader, max_samples):
+        task = example.get("task")
+        if task is None:
+            continue
+        full_text = _decode_example_text(example, tokenizer)
+        if not full_text:
+            continue
+        parsed = _extract_prompt_target(full_text, task)
+        if not parsed:
+            continue
+        prompt = parsed["prompt"]
+        target = parsed["target"]
+        if not prompt or not target:
+            continue
+
+        if task in numeric_tasks:
+            result = _evaluate_numeric_answer(model, tokenizer, prompt, target, device, ctx)
+        else:
+            result = _evaluate_generation_answer(
+                model, tokenizer, prompt, target, device, max_new_tokens
+            )
+        if result is None:
+            continue
+
+        total[task] += 1
+        if result:
+            correct[task] += 1
+
+    model.train()
+
+    per_task = {task: correct[task] / total[task] for task in total}
+    overall = sum(correct.values()) / max(sum(total.values()), 1)
+    return {"overall_accuracy": overall, "per_task_accuracy": per_task}
 
 
 def build_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> torch.optim.Optimizer:
@@ -786,6 +981,21 @@ def train(args):
                     train_accuracy=train_acc,
                     train_eval_loss=train_loss_eval,
                 )
+
+                task_eval = evaluate_task_accuracy(
+                    model,
+                    tokenizer,
+                    train_eval_loader,
+                    device,
+                    ctx,
+                    max_samples=args.train_eval_samples,
+                    max_new_tokens=args.eval_max_new_tokens,
+                )
+                overall_task_acc = task_eval.get("overall_accuracy", 0.0)
+                print(f"  Training task accuracy: {overall_task_acc*100:.1f}%")
+                for task, acc in task_eval.get("per_task_accuracy", {}).items():
+                    logger.log_train_task_accuracy(task, acc, global_step)
+                    print(f"    {task}: {acc*100:.1f}%")
 
             # Perplexity (only in Phase 2)
             if curriculum.phase == "language":
