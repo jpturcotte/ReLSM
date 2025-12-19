@@ -113,8 +113,11 @@ class MetricsLogger:
             "task_accuracies": self.task_accuracies,
             "train_task_accuracies": self.train_task_accuracies,
         }
-        with open(self._metrics_path, "a") as f:
-            f.write(json.dumps(snapshot) + "\n")
+        tmp_path = self._metrics_path.with_suffix(".json.tmp")
+        with open(tmp_path, "w") as f:
+            json.dump(snapshot, f)
+            f.write("\n")
+        os.replace(tmp_path, self._metrics_path)
     
     def summary(self) -> Dict:
         return {
@@ -196,6 +199,7 @@ def evaluate_algorithmic(
     n_examples: int = 100,
     max_new_tokens: int = 32,
     tasks: Optional[Sequence[str]] = None,
+    seed: int = 42,
 ) -> Dict[str, Dict[str, float] | float | None]:
     """Run the canonical algorithmic OOD grid using ``eval_hub``.
 
@@ -217,7 +221,7 @@ def evaluate_algorithmic(
         model,
         tokenizer,
         device_obj,
-        seed=42,
+        seed=seed,
         batch_size=8,
         generation_kwargs=generation_kwargs,
         limit=n_examples,
@@ -979,6 +983,7 @@ def train(args):
                         n_examples=args.eval_samples,
                         max_new_tokens=args.eval_max_new_tokens,
                         tasks=alg_tasks,
+                        seed=args.seed,
                     )
                     overall_acc = alg_results.get("overall_accuracy", 0.0)
                     overall_mae = alg_results.get("overall_mae")

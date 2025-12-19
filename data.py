@@ -647,22 +647,6 @@ class AlgorithmicDataset(IterableDataset):
         self._token_budget = max(1, self.num_examples * max(self.max_seq_len - 1, 1))
         self._worker_token_budget = self._token_budget
 
-        self._char_token_map = self._build_char_token_map()
-
-    def _build_char_token_map(self) -> Dict[str, int]:
-        """Precompute a fast char->id map for synthetic strings."""
-        chars = "0123456789()+-*=? "
-        chars += "abcdefghijklmnopqrstuvwxyz"
-        chars += "ABCDEFGHIJKLMNOPQRSTUVWXYZ"  # For future-proofing
-        chars += ":,%<>'"  # punctuation used in prompts
-
-        token_map = {}
-        for ch in set(chars):
-            encoded = self.tokenizer.encode(ch, add_special_tokens=False)
-            if len(encoded) == 1:
-                token_map[ch] = encoded[0]
-        return token_map
-
     def _encode_text(self, text: str) -> List[int]:
         """Encode text with the tokenizer to align training and evaluation."""
         return self.tokenizer.encode(text, add_special_tokens=True)
@@ -754,7 +738,6 @@ class FixedAlgorithmicDataset(Dataset):
         self.seed = seed
         self.difficulty = difficulty
 
-        self._char_token_map = self._build_char_token_map()
         self.examples: List[Dict[str, torch.Tensor]] = []
 
         rng = random.Random(seed)
@@ -786,19 +769,6 @@ class FixedAlgorithmicDataset(Dataset):
                 }
             )
 
-    def _build_char_token_map(self) -> Dict[str, int]:
-        chars = "0123456789()+-*=? "
-        chars += "abcdefghijklmnopqrstuvwxyz"
-        chars += "ABCDEFGHIJKLMNOPQRSTUVWXYZ"  # For future-proofing
-        chars += ":,%<>'"  # punctuation used in prompts
-
-        token_map = {}
-        for ch in set(chars):
-            encoded = self.tokenizer.encode(ch, add_special_tokens=False)
-            if len(encoded) == 1:
-                token_map[ch] = encoded[0]
-        return token_map
-
     def _encode_text(self, text: str) -> List[int]:
         return self.tokenizer.encode(text, add_special_tokens=True)
 
@@ -821,12 +791,20 @@ def create_algorithmic_dataset(
     """Factory that returns fixed or infinite dataset based on flag."""
 
     if fixed:
+        if difficulty_value is None:
+            difficulty = 0.5
+        else:
+            try:
+                difficulty = float(difficulty_value.value)
+            except Exception:
+                difficulty = float(difficulty_value)
         return FixedAlgorithmicDataset(
             tokenizer=tokenizer,
             num_examples=num_examples,
             max_seq_len=max_seq_len,
             tasks=tasks,
             seed=seed,
+            difficulty=difficulty,
         )
 
     return AlgorithmicDataset(
@@ -1037,6 +1015,9 @@ class LanguageDataset(IterableDataset):
             except StopIteration:
                 active_streams.pop(chosen_index)
                 continue
+            except Exception:
+                active_streams.pop(chosen_index)
+                continue
 
             tokens = self.tokenizer.encode(example["text"], add_special_tokens=True)
             if len(tokens) > self.max_seq_len:
@@ -1052,8 +1033,6 @@ class LanguageDataset(IterableDataset):
                 labels = torch.cat([labels, torch.full((pad_len,), -100)])
 
             yield {"input_ids": input_ids, "labels": labels}
-
-            active_streams[chosen_index] = (config, stream)
 
 
 # =============================================================================
