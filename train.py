@@ -42,7 +42,7 @@ import torch.nn as nn
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 
-from utils import DEFAULT_TOKENIZER_NAME
+from utils import DEFAULT_TOKENIZER_NAME, normalize_prediction, normalize_target
 
 plt.switch_backend("Agg")
 
@@ -98,10 +98,15 @@ class MetricsLogger:
             entry["mae"] = mae
         self.task_accuracies[task].append(entry)
 
-    def log_train_task_accuracy(self, task: str, accuracy: float, step: int):
+    def log_train_task_accuracy(
+        self, task: str, accuracy: float, step: int, mae: Optional[float] = None
+    ):
         if task not in self.train_task_accuracies:
             self.train_task_accuracies[task] = []
-        self.train_task_accuracies[task].append({"step": step, "accuracy": accuracy})
+        entry = {"step": step, "accuracy": accuracy}
+        if mae is not None:
+            entry["mae"] = mae
+        self.train_task_accuracies[task].append(entry)
     
     def save(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -420,6 +425,27 @@ def _evaluate_generation_answer(
     return pred_norm.startswith(target_norm)
 
 
+def _predict_numeric_answer(
+    model,
+    tokenizer,
+    prompt: str,
+    task: str,
+    device,
+    max_new_tokens: int,
+) -> Optional[str]:
+    input_ids = tokenizer(prompt, return_tensors="pt", truncation=True)["input_ids"].to(device)
+    output = model.generate(
+        input_ids,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        temperature=0.0,
+        eos_token_id=getattr(tokenizer, "eos_token_id", None),
+    )
+    pred = tokenizer.decode(output[0, input_ids.shape[1] :], skip_special_tokens=True)
+    pred_norm = normalize_prediction(task, pred)
+    return pred_norm if pred_norm else None
+
+
 @torch.no_grad()
 def evaluate_task_accuracy(
     model,
@@ -430,12 +456,16 @@ def evaluate_task_accuracy(
     max_samples: Optional[int] = 200,
     max_new_tokens: int = 32,
     numeric_tasks: Optional[set] = None,
-) -> Dict[str, Dict[str, float] | float]:
+) -> Dict[str, Dict[str, float | None] | float | None]:
     """Evaluate task completion accuracy on a training split."""
     model.eval()
     numeric_tasks = numeric_tasks or NUMERIC_TASKS
     correct = defaultdict(int)
     total = defaultdict(int)
+    total_abs_error = 0.0
+    total_numeric = 0
+    per_task_abs_error = defaultdict(float)
+    per_task_numeric = defaultdict(int)
 
     for example in _iter_eval_examples(loader, max_samples):
         task = example.get("task")
@@ -454,6 +484,22 @@ def evaluate_task_accuracy(
 
         if task in numeric_tasks:
             result = _evaluate_numeric_answer(model, tokenizer, prompt, target, device, ctx)
+            pred_norm = _predict_numeric_answer(
+                model, tokenizer, prompt, task, device, max_new_tokens
+            )
+            if pred_norm:
+                target_norm = normalize_target(task, target)
+                try:
+                    pred_val = float(pred_norm)
+                    target_val = float(target_norm)
+                except ValueError:
+                    pass
+                else:
+                    abs_error = abs(pred_val - target_val)
+                    total_abs_error += abs_error
+                    total_numeric += 1
+                    per_task_abs_error[task] += abs_error
+                    per_task_numeric[task] += 1
         else:
             result = _evaluate_generation_answer(
                 model, tokenizer, prompt, target, device, max_new_tokens
@@ -468,8 +514,22 @@ def evaluate_task_accuracy(
     model.train()
 
     per_task = {task: correct[task] / total[task] for task in total}
+    per_task_mae = {
+        task: (
+            per_task_abs_error[task] / per_task_numeric[task]
+            if per_task_numeric[task]
+            else None
+        )
+        for task in per_task_abs_error
+    }
     overall = sum(correct.values()) / max(sum(total.values()), 1)
-    return {"overall_accuracy": overall, "per_task_accuracy": per_task}
+    overall_mae = total_abs_error / total_numeric if total_numeric else None
+    return {
+        "overall_accuracy": overall,
+        "per_task_accuracy": per_task,
+        "overall_mae": overall_mae,
+        "per_task_mae": per_task_mae,
+    }
 
 
 def build_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> torch.optim.Optimizer:
@@ -1022,16 +1082,6 @@ def train(args):
                     )
                     train_acc = train_eval_metrics["accuracy"]
                     train_loss_eval = train_eval_metrics["loss"]
-                    print(
-                        f"  Training accuracy ({train_eval_label}): {train_acc*100:.2f}% | "
-                        f"Loss: {train_loss_eval:.4f}"
-                    )
-                    logger.log(
-                        step=global_step,
-                        phase="eval",
-                        train_accuracy=train_acc,
-                        train_eval_loss=train_loss_eval,
-                    )
 
                     task_eval = evaluate_task_accuracy(
                         model,
@@ -1043,10 +1093,33 @@ def train(args):
                         max_new_tokens=args.eval_max_new_tokens,
                     )
                     overall_task_acc = task_eval.get("overall_accuracy", 0.0)
+                    overall_task_mae = task_eval.get("overall_mae")
+                    print(
+                        f"  Training accuracy ({train_eval_label}): {train_acc*100:.2f}% | "
+                        f"Loss: {train_loss_eval:.4f}"
+                    )
                     print(f"  Training task accuracy: {overall_task_acc*100:.1f}%")
+                    if overall_task_mae is not None:
+                        print(f"  Training task MAE (numeric tasks): {overall_task_mae:.3f}")
+
+                    logger.log(
+                        step=global_step,
+                        phase="eval",
+                        train_accuracy=train_acc,
+                        train_eval_loss=train_loss_eval,
+                        train_eval_mae=overall_task_mae,
+                    )
+
+                    per_task_mae = task_eval.get("per_task_mae", {}) or {}
                     for task, acc in task_eval.get("per_task_accuracy", {}).items():
-                        logger.log_train_task_accuracy(task, acc, global_step)
-                        print(f"    {task}: {acc*100:.1f}%")
+                        task_mae = per_task_mae.get(task)
+                        logger.log_train_task_accuracy(
+                            task, acc, global_step, mae=task_mae
+                        )
+                        line = f"    {task}: {acc*100:.1f}%"
+                        if task_mae is not None:
+                            line += f" | MAE: {task_mae:.3f}"
+                        print(line)
 
                 # Perplexity (only in Phase 2)
                 if curriculum.phase == "language":
