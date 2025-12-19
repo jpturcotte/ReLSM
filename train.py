@@ -257,7 +257,13 @@ def evaluate_algorithmic(
 
     return {
         "overall_accuracy": results.get("overall_accuracy", 0.0),
+        "overall_token_accuracy": results.get("overall_token_accuracy", 0.0),
+        "overall_distance": results.get("overall_distance", 1.0),
+        "overall_prefix_accuracy": results.get("overall_prefix_accuracy", 0.0),
         "per_task_accuracy": results.get("per_task_accuracy", {}),
+        "per_task_token_accuracy": results.get("per_task_token_accuracy", {}),
+        "per_task_distance": results.get("per_task_distance", {}),
+        "per_task_prefix_accuracy": results.get("per_task_prefix_accuracy", {}),
         "overall_mae": results.get("overall_mae"),
         "per_task_mae": results.get("per_task_mae", {}),
     }
@@ -1085,9 +1091,28 @@ def train(args):
                     )
                     overall_acc = alg_results.get("overall_accuracy", 0.0)
                     overall_mae = alg_results.get("overall_mae")
-                    print(f"  Algorithmic accuracy: {overall_acc*100:.1f}%")
+                    overall_token_accuracy = alg_results.get("overall_token_accuracy", 0.0)
+                    overall_distance = alg_results.get("overall_distance", 1.0)
+                    overall_prefix_accuracy = alg_results.get("overall_prefix_accuracy", 0.0)
+                    print(
+                        "  Algorithmic metrics: "
+                        f"acc={overall_acc*100:.1f}% | "
+                        f"token={overall_token_accuracy:.3f} | "
+                        f"dist={overall_distance:.3f} | "
+                        f"prefix={overall_prefix_accuracy:.3f}"
+                    )
                     if overall_mae is not None:
                         print(f"  Algorithmic MAE (numeric tasks): {overall_mae:.3f}")
+
+                    logger.log(
+                        step=global_step,
+                        phase="eval",
+                        algorithmic_accuracy=overall_acc,
+                        algorithmic_token_accuracy=overall_token_accuracy,
+                        algorithmic_distance=overall_distance,
+                        algorithmic_prefix_accuracy=overall_prefix_accuracy,
+                        algorithmic_mae=overall_mae,
+                    )
 
                     per_task_mae = alg_results.get("per_task_mae", {}) or {}
                     per_task_token_accuracy = alg_results.get("per_task_token_accuracy", {}) or {}
@@ -1107,7 +1132,15 @@ def train(args):
                             mean_distance=per_task_distance.get(task),
                             mean_prefix_accuracy=per_task_prefix_accuracy.get(task),
                         )
-                        line = f"    {task}: {acc*100:.1f}%"
+                        token_acc = per_task_token_accuracy.get(task, 0.0)
+                        distance = per_task_distance.get(task, 1.0)
+                        prefix_acc = per_task_prefix_accuracy.get(task, 0.0)
+                        line = (
+                            f"    {task}: {acc*100:.1f}%"
+                            f" | token={token_acc:.3f}"
+                            f" | dist={distance:.3f}"
+                            f" | prefix={prefix_acc:.3f}"
+                        )
                         if task_mae is not None:
                             line += f" | MAE: {task_mae:.3f}"
                         print(line)
