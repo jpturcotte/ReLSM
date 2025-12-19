@@ -106,13 +106,18 @@ class MetricsLogger:
         task: str,
         accuracy: float,
         step: int,
+        target: str = "eval",
         mae: Optional[float] = None,
         mean_token_accuracy: Optional[float] = None,
         mean_distance: Optional[float] = None,
         mean_prefix_accuracy: Optional[float] = None,
     ):
-        if task not in self.task_accuracies:
-            self.task_accuracies[task] = []
+        if target == "train":
+            store = self.train_task_accuracies
+        else:
+            store = self.task_accuracies
+        if task not in store:
+            store[task] = []
         entry = {"step": step, "accuracy": accuracy}
         if mae is not None:
             entry["mae"] = mae
@@ -122,30 +127,7 @@ class MetricsLogger:
             entry["mean_distance"] = mean_distance
         if mean_prefix_accuracy is not None:
             entry["mean_prefix_accuracy"] = mean_prefix_accuracy
-        self.task_accuracies[task].append(entry)
-
-    def log_train_task_accuracy(
-        self,
-        task: str,
-        accuracy: float,
-        step: int,
-        mae: Optional[float] = None,
-        mean_token_accuracy: Optional[float] = None,
-        mean_distance: Optional[float] = None,
-        mean_prefix_accuracy: Optional[float] = None,
-    ):
-        if task not in self.train_task_accuracies:
-            self.train_task_accuracies[task] = []
-        entry = {"step": step, "accuracy": accuracy}
-        if mae is not None:
-            entry["mae"] = mae
-        if mean_token_accuracy is not None:
-            entry["mean_token_accuracy"] = mean_token_accuracy
-        if mean_distance is not None:
-            entry["mean_distance"] = mean_distance
-        if mean_prefix_accuracy is not None:
-            entry["mean_prefix_accuracy"] = mean_prefix_accuracy
-        self.train_task_accuracies[task].append(entry)
+        store[task].append(entry)
     
     def save(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1119,6 +1101,7 @@ def train(args):
                             task,
                             acc,
                             global_step,
+                            target="eval",
                             mae=task_mae,
                             mean_token_accuracy=per_task_token_accuracy.get(task),
                             mean_distance=per_task_distance.get(task),
@@ -1190,10 +1173,11 @@ def train(args):
                     )
                     for task, acc in task_eval.get("per_task_accuracy", {}).items():
                         task_mae = per_task_mae.get(task)
-                        logger.log_train_task_accuracy(
+                        logger.log_task_accuracy(
                             task,
                             acc,
                             global_step,
+                            target="train",
                             mae=task_mae,
                             mean_token_accuracy=per_task_token_accuracy.get(task),
                             mean_distance=per_task_distance.get(task),
