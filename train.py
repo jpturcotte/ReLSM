@@ -76,6 +76,7 @@ class MetricsLogger:
             "phase": [],
             "step": [],
         }
+        self.evaluations = []
         self.metric_steps = {}
         self.task_accuracies = {}
         self.train_task_accuracies = {}
@@ -85,6 +86,10 @@ class MetricsLogger:
             self._append_snapshot()
     
     def log(self, step: int, phase: str, **kwargs):
+        entry = {"step": step, "phase": phase}
+        entry.update(kwargs)
+        self.evaluations.append(entry)
+
         self.metrics["step"].append(step)
         self.metrics["phase"].append(phase)
         
@@ -149,6 +154,7 @@ class MetricsLogger:
     def _append_snapshot(self):
         snapshot = {
             "training": self.metrics,
+            "evaluations": self.evaluations,
             "task_accuracies": self.task_accuracies,
             "train_task_accuracies": self.train_task_accuracies,
         }
