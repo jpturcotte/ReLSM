@@ -7,6 +7,7 @@ behavior and output schemas.
 """
 
 import json
+import math
 import os
 import platform
 import random
@@ -403,6 +404,9 @@ class EvalResult:
     condition: str
     task: str
     accuracy: float
+    mean_token_accuracy: float
+    mean_distance: float
+    mean_prefix_accuracy: float
     mae: Optional[float]
     numeric_count: int
     n: int
@@ -444,6 +448,180 @@ def normalize_target(task: str, text: str) -> str:
     if task == "dyck":
         return text.lower().strip()
     return SPACE_PATTERN.sub(" ", text).strip()
+
+
+def compute_metrics(task: str, pred: str, target: str) -> Dict[str, float]:
+    """Compute universal metrics for algorithmic and fixed training tasks."""
+    pred = _metrics_normalize(task, pred)
+    target = _metrics_normalize(task, target)
+
+    exact_match = float(pred == target)
+
+    if _is_numeric_task(task):
+        return _numeric_metrics(pred, target, exact_match)
+    if _is_classification_task(task):
+        return _classification_metrics(pred, target, exact_match)
+    return _sequence_metrics(pred, target, exact_match)
+
+
+def _metrics_normalize(task: str, text: str) -> str:
+    text = text.split("\n")[0].strip().lower()
+    text = SPACE_PATTERN.sub(" ", text)
+
+    if task in {"dyck", "parity", "compare"}:
+        text = text.split()[0] if text else ""
+        text = text.strip(".,!?\"'-")
+
+    return text
+
+
+def _is_numeric_task(task: str) -> bool:
+    return task in {"addition", "multiplication", "chain", "successor", "mod_add"}
+
+
+def _is_classification_task(task: str) -> bool:
+    return task in {"parity", "dyck", "compare"}
+
+
+def _numeric_metrics(pred: str, target: str, exact_match: float) -> Dict[str, float]:
+    try:
+        pred_num = float(pred)
+        target_num = float(target)
+        parseable = True
+    except ValueError:
+        parseable = False
+        pred_num = 0.0
+        target_num = 0.0
+
+    pred_digits = re.sub(r"[^0-9\-]", "", pred).lstrip("-") or "0"
+    target_digits = re.sub(r"[^0-9\-]", "", target).lstrip("-") or "0"
+    max_len = max(len(pred_digits), len(target_digits))
+    pred_padded = pred_digits.zfill(max_len)
+    target_padded = target_digits.zfill(max_len)
+    token_accuracy = sum(p == t for p, t in zip(pred_padded, target_padded)) / max_len
+
+    if parseable:
+        abs_error = abs(pred_num - target_num)
+        normalized_distance = min(
+            1.0,
+            math.log1p(abs_error)
+            / math.log1p(abs(target_num) + 1000),
+        )
+    else:
+        normalized_distance = 1.0
+
+    prefix_len = 0
+    for p, t in zip(pred_padded, target_padded):
+        if p == t:
+            prefix_len += 1
+        else:
+            break
+    prefix_accuracy = prefix_len / max_len
+
+    return {
+        "exact_match": exact_match,
+        "token_accuracy": token_accuracy,
+        "normalized_distance": normalized_distance,
+        "prefix_accuracy": prefix_accuracy,
+    }
+
+
+def _sequence_metrics(pred: str, target: str, exact_match: float) -> Dict[str, float]:
+    pred_tokens = pred.split()
+    target_tokens = target.split()
+
+    if not target_tokens:
+        return {
+            "exact_match": exact_match,
+            "token_accuracy": 1.0 if not pred_tokens else 0.0,
+            "normalized_distance": 0.0 if not pred_tokens else 1.0,
+            "prefix_accuracy": 1.0 if not pred_tokens else 0.0,
+        }
+
+    max_len = max(len(pred_tokens), len(target_tokens))
+    matches = sum(p == t for p, t in zip(pred_tokens, target_tokens))
+    token_accuracy = matches / max_len
+    normalized_distance = _edit_distance(pred_tokens, target_tokens) / max_len
+
+    prefix_len = 0
+    for p, t in zip(pred_tokens, target_tokens):
+        if p == t:
+            prefix_len += 1
+        else:
+            break
+    prefix_accuracy = prefix_len / len(target_tokens)
+
+    return {
+        "exact_match": exact_match,
+        "token_accuracy": token_accuracy,
+        "normalized_distance": min(1.0, normalized_distance),
+        "prefix_accuracy": prefix_accuracy,
+    }
+
+
+def _edit_distance(a: List[str], b: List[str]) -> int:
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, n + 1):
+            temp = dp[j]
+            dp[j] = min(
+                dp[j] + 1,
+                dp[j - 1] + 1,
+                prev + (a[i - 1] != b[j - 1]),
+            )
+            prev = temp
+    return dp[n]
+
+
+def _classification_metrics(pred: str, target: str, exact_match: float) -> Dict[str, float]:
+    token_accuracy = exact_match
+    normalized_distance = 1.0 - exact_match
+
+    if pred and target:
+        max_len = max(len(pred), len(target))
+        prefix_len = 0
+        for p, t in zip(pred, target):
+            if p == t:
+                prefix_len += 1
+            else:
+                break
+        prefix_accuracy = prefix_len / max_len
+    else:
+        prefix_accuracy = exact_match
+
+    return {
+        "exact_match": exact_match,
+        "token_accuracy": token_accuracy,
+        "normalized_distance": normalized_distance,
+        "prefix_accuracy": prefix_accuracy,
+    }
+
+
+@dataclass
+class AggregatedMetrics:
+    task: str
+    n: int
+    accuracy: float
+    mean_token_accuracy: float
+    mean_distance: float
+    mean_prefix_accuracy: float
+
+
+def aggregate(task: str, results: List[Dict[str, float]]) -> AggregatedMetrics:
+    n = len(results)
+    if n == 0:
+        return AggregatedMetrics(task, 0, 0.0, 0.0, 1.0, 0.0)
+
+    return AggregatedMetrics(
+        task=task,
+        n=n,
+        accuracy=sum(r["exact_match"] for r in results) / n,
+        mean_token_accuracy=sum(r["token_accuracy"] for r in results) / n,
+        mean_distance=sum(r["normalized_distance"] for r in results) / n,
+        mean_prefix_accuracy=sum(r["prefix_accuracy"] for r in results) / n,
+    )
 
 
 def build_dataset(task: str, n: int, params: Dict[str, Any], seed: int) -> List[Dict[str, Any]]:
@@ -566,6 +744,7 @@ def evaluate_condition(
     total_time = 0.0
     total_gen_len = 0.0
     collected_examples: List[Dict[str, str]] = []
+    metrics_samples: List[Dict[str, float]] = []
 
     for start_idx in range(0, n, batch_size):
         batch = dataset[start_idx : start_idx + batch_size]
@@ -588,7 +767,9 @@ def evaluate_condition(
         total_gen_len += batch_generated
         for pred, tgt, ex in zip(preds, targets, batch):
             norm_tgt = normalize_target(task, tgt)
-            if pred == norm_tgt:
+            metrics = compute_metrics(task, pred, tgt)
+            metrics_samples.append(metrics)
+            if metrics["exact_match"] == 1.0:
                 total_correct += 1
             else:
                 if len(collected_examples) < 10:
@@ -609,7 +790,8 @@ def evaluate_condition(
                 pass
             total_examples += 1
 
-    accuracy = total_correct / total_examples if total_examples else 0.0
+    aggregated = aggregate(task, metrics_samples)
+    accuracy = aggregated.accuracy
     mae = total_absolute_error / total_numeric_samples if total_numeric_samples > 0 else None
     avg_gen_len = total_gen_len / total_examples if total_examples else 0.0
     tokens_per_sec = total_tokens / total_time if total_time > 0 else 0.0
@@ -618,6 +800,9 @@ def evaluate_condition(
         condition=condition,
         task=task,
         accuracy=accuracy,
+        mean_token_accuracy=aggregated.mean_token_accuracy,
+        mean_distance=aggregated.mean_distance,
+        mean_prefix_accuracy=aggregated.mean_prefix_accuracy,
         mae=mae,
         numeric_count=total_numeric_samples,
         n=total_examples,
