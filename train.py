@@ -42,7 +42,13 @@ import torch.nn as nn
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 
-from utils import DEFAULT_TOKENIZER_NAME, normalize_prediction, normalize_target
+from utils import (
+    DEFAULT_TOKENIZER_NAME,
+    aggregate,
+    compute_metrics,
+    normalize_prediction,
+    normalize_target,
+)
 
 plt.switch_backend("Agg")
 
@@ -90,22 +96,50 @@ class MetricsLogger:
             self.metrics[k].append(v)
             self.metric_steps[k].append(step)
     
-    def log_task_accuracy(self, task: str, accuracy: float, step: int, mae: Optional[float] = None):
+    def log_task_accuracy(
+        self,
+        task: str,
+        accuracy: float,
+        step: int,
+        mae: Optional[float] = None,
+        mean_token_accuracy: Optional[float] = None,
+        mean_distance: Optional[float] = None,
+        mean_prefix_accuracy: Optional[float] = None,
+    ):
         if task not in self.task_accuracies:
             self.task_accuracies[task] = []
         entry = {"step": step, "accuracy": accuracy}
         if mae is not None:
             entry["mae"] = mae
+        if mean_token_accuracy is not None:
+            entry["mean_token_accuracy"] = mean_token_accuracy
+        if mean_distance is not None:
+            entry["mean_distance"] = mean_distance
+        if mean_prefix_accuracy is not None:
+            entry["mean_prefix_accuracy"] = mean_prefix_accuracy
         self.task_accuracies[task].append(entry)
 
     def log_train_task_accuracy(
-        self, task: str, accuracy: float, step: int, mae: Optional[float] = None
+        self,
+        task: str,
+        accuracy: float,
+        step: int,
+        mae: Optional[float] = None,
+        mean_token_accuracy: Optional[float] = None,
+        mean_distance: Optional[float] = None,
+        mean_prefix_accuracy: Optional[float] = None,
     ):
         if task not in self.train_task_accuracies:
             self.train_task_accuracies[task] = []
         entry = {"step": step, "accuracy": accuracy}
         if mae is not None:
             entry["mae"] = mae
+        if mean_token_accuracy is not None:
+            entry["mean_token_accuracy"] = mean_token_accuracy
+        if mean_distance is not None:
+            entry["mean_distance"] = mean_distance
+        if mean_prefix_accuracy is not None:
+            entry["mean_prefix_accuracy"] = mean_prefix_accuracy
         self.train_task_accuracies[task].append(entry)
     
     def save(self):
@@ -401,14 +435,13 @@ def _evaluate_numeric_answer(
     return True
 
 
-def _evaluate_generation_answer(
+def _predict_generation_answer(
     model,
     tokenizer,
     prompt: str,
-    target: str,
     device,
     max_new_tokens: int,
-) -> Optional[bool]:
+) -> Optional[str]:
     input_ids = tokenizer(prompt, return_tensors="pt", truncation=True)["input_ids"].to(device)
     output = model.generate(
         input_ids,
@@ -419,10 +452,7 @@ def _evaluate_generation_answer(
     )
     pred = tokenizer.decode(output[0, input_ids.shape[1] :], skip_special_tokens=True)
     pred_norm = _normalize_text(pred)
-    target_norm = _normalize_text(target)
-    if not target_norm:
-        return None
-    return pred_norm.startswith(target_norm)
+    return pred_norm if pred_norm else None
 
 
 def _predict_numeric_answer(
@@ -462,6 +492,7 @@ def evaluate_task_accuracy(
     numeric_tasks = numeric_tasks or NUMERIC_TASKS
     correct = defaultdict(int)
     total = defaultdict(int)
+    metrics_by_task: Dict[str, List[Dict[str, float]]] = defaultdict(list)
     total_abs_error = 0.0
     total_numeric = 0
     per_task_abs_error = defaultdict(float)
@@ -483,11 +514,10 @@ def evaluate_task_accuracy(
             continue
 
         if task in numeric_tasks:
-            result = _evaluate_numeric_answer(model, tokenizer, prompt, target, device, ctx)
             pred_norm = _predict_numeric_answer(
                 model, tokenizer, prompt, task, device, max_new_tokens
             )
-            if pred_norm:
+            if pred_norm is not None:
                 target_norm = normalize_target(task, target)
                 try:
                     pred_val = float(pred_norm)
@@ -501,19 +531,32 @@ def evaluate_task_accuracy(
                     per_task_abs_error[task] += abs_error
                     per_task_numeric[task] += 1
         else:
-            result = _evaluate_generation_answer(
-                model, tokenizer, prompt, target, device, max_new_tokens
+            pred_norm = _predict_generation_answer(
+                model, tokenizer, prompt, device, max_new_tokens
             )
-        if result is None:
+
+        if pred_norm is None:
             continue
 
+        metrics = compute_metrics(task, pred_norm, target)
+        metrics_by_task[task].append(metrics)
         total[task] += 1
-        if result:
+        if metrics["exact_match"] == 1.0:
             correct[task] += 1
 
     model.train()
 
     per_task = {task: correct[task] / total[task] for task in total}
+    per_task_token_accuracy = {}
+    per_task_distance = {}
+    per_task_prefix_accuracy = {}
+    total_metrics: List[Dict[str, float]] = []
+    for task, metrics in metrics_by_task.items():
+        aggregated = aggregate(task, metrics)
+        per_task_token_accuracy[task] = aggregated.mean_token_accuracy
+        per_task_distance[task] = aggregated.mean_distance
+        per_task_prefix_accuracy[task] = aggregated.mean_prefix_accuracy
+        total_metrics.extend(metrics)
     per_task_mae = {
         task: (
             per_task_abs_error[task] / per_task_numeric[task]
@@ -523,10 +566,17 @@ def evaluate_task_accuracy(
         for task in per_task_abs_error
     }
     overall = sum(correct.values()) / max(sum(total.values()), 1)
+    overall_aggregated = aggregate("overall", total_metrics)
     overall_mae = total_abs_error / total_numeric if total_numeric else None
     return {
         "overall_accuracy": overall,
         "per_task_accuracy": per_task,
+        "overall_token_accuracy": overall_aggregated.mean_token_accuracy,
+        "overall_distance": overall_aggregated.mean_distance,
+        "overall_prefix_accuracy": overall_aggregated.mean_prefix_accuracy,
+        "per_task_token_accuracy": per_task_token_accuracy,
+        "per_task_distance": per_task_distance,
+        "per_task_prefix_accuracy": per_task_prefix_accuracy,
         "overall_mae": overall_mae,
         "per_task_mae": per_task_mae,
     }
@@ -1052,9 +1102,22 @@ def train(args):
                         print(f"  Algorithmic MAE (numeric tasks): {overall_mae:.3f}")
 
                     per_task_mae = alg_results.get("per_task_mae", {}) or {}
+                    per_task_token_accuracy = alg_results.get("per_task_token_accuracy", {}) or {}
+                    per_task_distance = alg_results.get("per_task_distance", {}) or {}
+                    per_task_prefix_accuracy = (
+                        alg_results.get("per_task_prefix_accuracy", {}) or {}
+                    )
                     for task, acc in alg_results.get("per_task_accuracy", {}).items():
                         task_mae = per_task_mae.get(task)
-                        logger.log_task_accuracy(task, acc, global_step, mae=task_mae)
+                        logger.log_task_accuracy(
+                            task,
+                            acc,
+                            global_step,
+                            mae=task_mae,
+                            mean_token_accuracy=per_task_token_accuracy.get(task),
+                            mean_distance=per_task_distance.get(task),
+                            mean_prefix_accuracy=per_task_prefix_accuracy.get(task),
+                        )
                         line = f"    {task}: {acc*100:.1f}%"
                         if task_mae is not None:
                             line += f" | MAE: {task_mae:.3f}"
@@ -1108,13 +1171,27 @@ def train(args):
                         train_accuracy=train_acc,
                         train_eval_loss=train_loss_eval,
                         train_eval_mae=overall_task_mae,
+                        train_eval_token_accuracy=task_eval.get("overall_token_accuracy"),
+                        train_eval_distance=task_eval.get("overall_distance"),
+                        train_eval_prefix_accuracy=task_eval.get("overall_prefix_accuracy"),
                     )
 
                     per_task_mae = task_eval.get("per_task_mae", {}) or {}
+                    per_task_token_accuracy = task_eval.get("per_task_token_accuracy", {}) or {}
+                    per_task_distance = task_eval.get("per_task_distance", {}) or {}
+                    per_task_prefix_accuracy = (
+                        task_eval.get("per_task_prefix_accuracy", {}) or {}
+                    )
                     for task, acc in task_eval.get("per_task_accuracy", {}).items():
                         task_mae = per_task_mae.get(task)
                         logger.log_train_task_accuracy(
-                            task, acc, global_step, mae=task_mae
+                            task,
+                            acc,
+                            global_step,
+                            mae=task_mae,
+                            mean_token_accuracy=per_task_token_accuracy.get(task),
+                            mean_distance=per_task_distance.get(task),
+                            mean_prefix_accuracy=per_task_prefix_accuracy.get(task),
                         )
                         line = f"    {task}: {acc*100:.1f}%"
                         if task_mae is not None:

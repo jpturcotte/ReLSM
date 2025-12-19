@@ -96,6 +96,9 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
     per_task: Dict[str, Dict[str, Any]] = {}
     total_correct = 0
     total_seen = 0
+    total_token_accuracy = 0.0
+    total_distance = 0.0
+    total_prefix_accuracy = 0.0
     total_abs_error = 0.0
     total_numeric = 0
 
@@ -105,6 +108,9 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
                 "task": res.task,
                 "condition": res.condition,
                 "accuracy": res.accuracy,
+                "mean_token_accuracy": res.mean_token_accuracy,
+                "mean_distance": res.mean_distance,
+                "mean_prefix_accuracy": res.mean_prefix_accuracy,
                 "mae": res.mae,
                 "numeric_count": res.numeric_count,
                 "n": res.n,
@@ -117,13 +123,28 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
         )
         total_correct += res.correct
         total_seen += res.n
+        total_token_accuracy += res.mean_token_accuracy * res.n
+        total_distance += res.mean_distance * res.n
+        total_prefix_accuracy += res.mean_prefix_accuracy * res.n
         per_task.setdefault(
             res.task,
-            {"conditions": [], "correct": 0, "total": 0, "mae_error": 0.0, "mae_count": 0},
+            {
+                "conditions": [],
+                "correct": 0,
+                "total": 0,
+                "token_accuracy": 0.0,
+                "distance": 0.0,
+                "prefix_accuracy": 0.0,
+                "mae_error": 0.0,
+                "mae_count": 0,
+            },
         )
         per_task[res.task]["conditions"].append(res.condition)
         per_task[res.task]["correct"] += res.correct
         per_task[res.task]["total"] += res.n
+        per_task[res.task]["token_accuracy"] += res.mean_token_accuracy * res.n
+        per_task[res.task]["distance"] += res.mean_distance * res.n
+        per_task[res.task]["prefix_accuracy"] += res.mean_prefix_accuracy * res.n
         if res.mae is not None and res.numeric_count > 0:
             error_sum = res.mae * res.numeric_count
             per_task[res.task]["mae_error"] += error_sum
@@ -135,18 +156,39 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
         task: (payload["correct"] / payload["total"] if payload["total"] else 0.0)
         for task, payload in per_task.items()
     }
+    per_task_token_accuracy = {
+        task: (payload["token_accuracy"] / payload["total"] if payload["total"] else 0.0)
+        for task, payload in per_task.items()
+    }
+    per_task_distance = {
+        task: (payload["distance"] / payload["total"] if payload["total"] else 0.0)
+        for task, payload in per_task.items()
+    }
+    per_task_prefix_accuracy = {
+        task: (payload["prefix_accuracy"] / payload["total"] if payload["total"] else 0.0)
+        for task, payload in per_task.items()
+    }
     per_task_mae: Dict[str, Optional[float]] = {
         task: (payload["mae_error"] / payload["mae_count"] if payload["mae_count"] else None)
         for task, payload in per_task.items()
     }
     overall = total_correct / total_seen if total_seen else 0.0
+    overall_token_accuracy = total_token_accuracy / total_seen if total_seen else 0.0
+    overall_distance = total_distance / total_seen if total_seen else 1.0
+    overall_prefix_accuracy = total_prefix_accuracy / total_seen if total_seen else 0.0
     overall_mae = total_abs_error / total_numeric if total_numeric else None
     return {
         "grid_version": ood_grid.OOD_GRID_VERSION,
         "conditions": conditions,
         "per_task_accuracy": per_task_acc,
+        "per_task_token_accuracy": per_task_token_accuracy,
+        "per_task_distance": per_task_distance,
+        "per_task_prefix_accuracy": per_task_prefix_accuracy,
         "per_task_mae": per_task_mae,
         "overall_accuracy": overall,
+        "overall_token_accuracy": overall_token_accuracy,
+        "overall_distance": overall_distance,
+        "overall_prefix_accuracy": overall_prefix_accuracy,
         "overall_mae": overall_mae,
     }
 
