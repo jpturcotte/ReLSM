@@ -474,15 +474,17 @@ class AlgorithmicGenerator:
         sampled_ops = rng.randint(op_counts[0], op_counts[1])
         ops = n_ops if n_ops is not None else sampled_ops
         val = rng.randint(start_range[0], start_range[1])
-        expr = str(val)
+        parts = [str(val)]
 
         for _ in range(ops):
             op = rng.choice(["+", "-"])
             operand = rng.randint(1, operand_high)
             if not allow_negative and op == "-" and val - operand < 0:
                 op = "+"
-            expr += f" {op} {operand}"
+            parts.append(f"{op} {operand}")
             val = val + operand if op == "+" else val - operand
+
+        expr = " ".join(parts)
 
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
@@ -1129,14 +1131,10 @@ class CurriculumSampler:
 
     def _sample_source(self) -> str:
         probs = self._compute_probs()
-        choices = ["alg", "lang", "lex"]
-        cumulative = 0.0
-        pick = self.rng.random()
-        for choice in choices:
-            cumulative += probs[choice]
-            if pick <= cumulative:
-                return choice
-        return "lang"  # Fallback
+        return self.rng.choices(
+            ["alg", "lang", "lex"],
+            weights=[probs["alg"], probs["lang"], probs["lex"]],
+        )[0]
 
     def _next_from(self, which: str) -> Dict[str, torch.Tensor]:
         if which == "alg":

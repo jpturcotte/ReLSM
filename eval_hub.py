@@ -80,7 +80,7 @@ def _parse_answer_from_continuation(decoded: str) -> str:
 
 
 def _prediction_from_output_ids(
-    tokenizer, output_ids: torch.Tensor | Sequence[int], prompt_len: int
+    tokenizer: Any, output_ids: Sequence[int] | torch.Tensor, prompt_len: int
 ) -> str:
     """Decode and parse only the continuation portion of a generation."""
 

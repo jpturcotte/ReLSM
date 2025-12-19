@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -41,8 +41,14 @@ def seed_all(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def select_device(device: Optional[str] = None) -> torch.device:
+def select_device(device: Optional[Union[str, int]] = None) -> torch.device:
     """Return a CUDA device when available unless overridden."""
+    if isinstance(device, torch.device):
+        return device
+    if isinstance(device, int):
+        if torch.cuda.is_available():
+            return torch.device("cuda", device)
+        return torch.device("cpu")
     if device:
         return torch.device(device)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -66,7 +72,7 @@ def prepare_tokenizer(tokenizer_name: str):
     return tokenizer
 
 
-def _resolve_max_length(model: Any, tokenizer: Any) -> Optional[int]:
+def _resolve_max_length(model: BaselineTransformer, tokenizer: Any) -> int | None:
     """Best-effort maximum length derived from model config or tokenizer."""
 
     config = getattr(model, "config", None)
@@ -132,6 +138,8 @@ def load_model_and_tokenizer(
         Tokenizer ready for generation with a defined pad token.
     """
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    if "config" not in checkpoint or "model_state_dict" not in checkpoint:
+        raise ValueError(f"Invalid checkpoint format: {checkpoint_path}")
     config = checkpoint["config"]
     model = BaselineTransformer(config)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -423,7 +431,7 @@ def normalize_prediction(task: str, text: str) -> str:
 
     numeric_tasks = {"mod_add", "parity", "addition", "multiplication", "chain", "successor"}
     if task in numeric_tasks:
-        match = re.search(r"[+-]?\d+(?:\.\d+)?", text)
+        match = re.search(r"[+-]?(?:\d+\.?\d*|\d*\.?\d+)(?:[eE][+-]?\d+)?", text)
         if match:
             return match.group(0)
 
