@@ -31,7 +31,7 @@ from collections import defaultdict
 from multiprocessing import Value
 from pathlib import Path
 from contextlib import nullcontext
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Sequence
 
 import numpy as np
 
@@ -181,7 +181,12 @@ class MetricsLogger:
 
 @torch.no_grad()
 def evaluate_algorithmic(
-    model, tokenizer, device, n_examples: int = 100, max_new_tokens: int = 32
+    model,
+    tokenizer,
+    device,
+    n_examples: int = 100,
+    max_new_tokens: int = 32,
+    tasks: Optional[Sequence[str]] = None,
 ) -> Dict[str, Dict[str, float] | float | None]:
     """Run the canonical algorithmic OOD grid using ``eval_hub``.
 
@@ -207,6 +212,7 @@ def evaluate_algorithmic(
         batch_size=8,
         generation_kwargs=generation_kwargs,
         limit=n_examples,
+        tasks=tasks,
     )
 
     return {
@@ -933,6 +939,7 @@ def train(args):
                     device,
                     n_examples=args.eval_samples,
                     max_new_tokens=args.eval_max_new_tokens,
+                    tasks=alg_tasks,
                 )
                 overall_acc = alg_results.get("overall_accuracy", 0.0)
                 overall_mae = alg_results.get("overall_mae")
