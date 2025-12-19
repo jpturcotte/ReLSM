@@ -939,6 +939,14 @@ def train(args):
         # Evaluation
         if global_step % args.eval_interval == 0:
             print("\nRunning evaluation...")
+            with torch.no_grad():
+                weight_norm = math.sqrt(
+                    sum((param.detach().float() ** 2).sum().item() for param in model.parameters())
+                )
+            effective_wd_pressure = args.weight_decay * weight_norm
+            print(f"  Grad norm: {last_grad_norm:.1f}")
+            print(f"  Weight norm: {weight_norm:.1f}")
+            print(f"  WD pressure: {effective_wd_pressure:.1f}")
 
             # Algorithmic accuracy (OOD grid)
             if args.eval_algorithmic:
