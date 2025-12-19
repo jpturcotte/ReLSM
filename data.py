@@ -722,7 +722,8 @@ class AlgorithmicDataset(IterableDataset):
     def _sample_difficulty(self, rng: random.Random) -> float:
         if self.difficulty_value is not None:
             try:
-                value = float(self.difficulty_value.value)
+                with self.difficulty_value.get_lock():
+                    value = float(self.difficulty_value.value)
             except Exception:
                 value = 0.0
             return min(max(value, 0.0), 1.0)

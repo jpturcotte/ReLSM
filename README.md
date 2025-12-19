@@ -306,4 +306,4 @@ The goal is empirical validation, not advocacy for any particular approach.
 
 ## License
 
-MIT
+Apache License 2.0
