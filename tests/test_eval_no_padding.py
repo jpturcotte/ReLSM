@@ -49,7 +49,7 @@ def test_generate_batch_avoids_padding_and_tracks_lengths():
     device = torch.device("cpu")
 
     prompts = ["short", "a much longer prompt"]
-    pair_preds, pair_lengths, _ = generate_batch(
+    pair_preds, pair_lengths, _, _ = generate_batch(
         model=model,
         tokenizer=tokenizer,
         prompts=prompts,
@@ -59,7 +59,7 @@ def test_generate_batch_avoids_padding_and_tracks_lengths():
         task="dummy",
     )
 
-    solo_preds, solo_lengths, _ = generate_batch(
+    solo_preds, solo_lengths, _, _ = generate_batch(
         model=model,
         tokenizer=tokenizer,
         prompts=[prompts[0]],

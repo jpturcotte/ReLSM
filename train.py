@@ -31,7 +31,7 @@ from collections import defaultdict
 from multiprocessing import Value
 from pathlib import Path
 from contextlib import nullcontext
-from typing import Optional, Dict, List, Sequence, Any
+from typing import Optional, Dict, List, Sequence, Any, Tuple
 
 import numpy as np
 
@@ -42,9 +42,11 @@ import torch.nn as nn
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 
+from data import get_task_weight
 from utils import (
     DEFAULT_TOKENIZER_NAME,
     aggregate,
+    compute_repetition_metrics,
     compute_attention_probs,
     compute_weight_entropy,
     compute_metrics,
@@ -52,6 +54,7 @@ from utils import (
     module_grad_weight_norm,
     normalize_prediction,
     normalize_target,
+    parse_numeric_prediction,
     resolve_diagnostic_modules,
     safe_parse_number,
 )
@@ -529,6 +532,103 @@ def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _token_length(tokenizer, text: str) -> int:
+    try:
+        return len(tokenizer.encode(text, add_special_tokens=False))
+    except Exception:
+        encoded = tokenizer(text, return_tensors="pt", truncation=True)
+        return int(encoded["input_ids"].shape[1])
+
+
+def _compute_task_sampling(
+    tasks: Sequence[str],
+    progress: float,
+    task_weighting: str,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    if not tasks:
+        return {}, {}
+    if task_weighting == "adaptive":
+        weights = {task: get_task_weight(task, progress) for task in tasks}
+    else:
+        weights = {task: 1.0 for task in tasks}
+    total = sum(weights.values())
+    probs = {task: (weights[task] / total if total else 0.0) for task in weights}
+    return weights, probs
+
+
+def _flatten_eval_diagnostics(prefix: str, diagnostics: Dict[str, Any]) -> Dict[str, float]:
+    flat: Dict[str, float] = {}
+    if not diagnostics:
+        return flat
+    answer_len = diagnostics.get("answer_length", {})
+    mean_lengths = answer_len.get("mean", {})
+    for key, value in mean_lengths.items():
+        metric = {
+            "target_len_tokens": "target_len",
+            "pred_len_tokens": "pred_len",
+            "length_ratio": "length_ratio",
+            "abs_len_error": "len_error",
+        }.get(key, key)
+        flat[f"{prefix}.{metric}.mean"] = float(value)
+    for task, payload in answer_len.get("by_task", {}).items():
+        for key, value in payload.items():
+            metric = {
+                "target_len_tokens": "target_len",
+                "pred_len_tokens": "pred_len",
+                "length_ratio": "length_ratio",
+                "abs_len_error": "len_error",
+            }.get(key, key)
+            flat[f"{prefix}.{metric}.by_task.{task}"] = float(value)
+    flat[f"{prefix}.eos_emitted_rate"] = float(answer_len.get("eos_emitted_rate", 0.0))
+    for task, rate in answer_len.get("eos_emitted_rate_by_task", {}).items():
+        flat[f"{prefix}.eos_emitted_rate.by_task.{task}"] = float(rate)
+    for reason, count in answer_len.get("stop_reason_counts", {}).items():
+        flat[f"{prefix}.stop_reason.{reason}"] = float(count)
+    for task, reasons in answer_len.get("stop_reason_counts_by_task", {}).items():
+        for reason, count in reasons.items():
+            flat[f"{prefix}.stop_reason.by_task.{task}.{reason}"] = float(count)
+
+    repetition = diagnostics.get("repetition", {})
+    for metric_name, payload in repetition.items():
+        flat[f"{prefix}.{metric_name.replace('_rate','')}.mean"] = float(payload.get("mean", 0.0))
+        if "median" in payload:
+            flat[f"{prefix}.{metric_name.replace('_rate','')}.median"] = float(
+                payload.get("median", 0.0)
+            )
+        for task, value in payload.get("by_task", {}).items():
+            flat[f"{prefix}.{metric_name.replace('_rate','')}.by_task.{task}"] = float(value)
+
+    parse = diagnostics.get("parse", {})
+    flat[f"{prefix}.parse_success_rate"] = float(parse.get("parse_success_rate", 0.0))
+    flat[f"{prefix}.non_numeric_rate"] = float(parse.get("non_numeric_rate", 0.0))
+    flat[f"{prefix}.numeric_abs_error.mean"] = float(parse.get("numeric_abs_error", 0.0))
+    flat[f"{prefix}.numeric_rel_error.mean"] = float(parse.get("numeric_rel_error", 0.0))
+    for task, payload in parse.get("by_task", {}).items():
+        flat[f"{prefix}.parse_success_rate.by_task.{task}"] = float(
+            payload.get("parse_success_rate", 0.0)
+        )
+        flat[f"{prefix}.non_numeric_rate.by_task.{task}"] = float(
+            payload.get("non_numeric_rate", 0.0)
+        )
+        flat[f"{prefix}.numeric_abs_error.by_task.{task}"] = float(
+            payload.get("numeric_abs_error", 0.0)
+        )
+        flat[f"{prefix}.numeric_rel_error.by_task.{task}"] = float(
+            payload.get("numeric_rel_error", 0.0)
+        )
+    for reason, count in parse.get("failure_counts", {}).items():
+        flat[f"{prefix}.parse_failure.{reason}"] = float(count)
+    for task, reasons in parse.get("failure_counts_by_task", {}).items():
+        for reason, count in reasons.items():
+            flat[f"{prefix}.parse_failure.by_task.{task}.{reason}"] = float(count)
+
+    for task, count in diagnostics.get("task_counts", {}).items():
+        flat[f"{prefix}.task_count.{task}"] = float(count)
+    for task, value in diagnostics.get("difficulty_by_task", {}).items():
+        flat[f"{prefix}.difficulty.by_task.{task}"] = float(value)
+    return flat
+
+
 def _decode_example_text(example: Dict[str, torch.Tensor], tokenizer) -> Optional[str]:
     input_ids = example["input_ids"]
     labels = example["labels"]
@@ -616,45 +716,44 @@ def _evaluate_numeric_answer(
     return True
 
 
-def _predict_generation_answer(
-    model,
-    tokenizer,
-    prompt: str,
-    device,
-    max_new_tokens: int,
-) -> Optional[str]:
-    input_ids = tokenizer(prompt, return_tensors="pt", truncation=True)["input_ids"].to(device)
-    output = model.generate(
-        input_ids,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        temperature=0.0,
-        eos_token_id=getattr(tokenizer, "eos_token_id", None),
-    )
-    pred = tokenizer.decode(output[0, input_ids.shape[1] :], skip_special_tokens=True)
-    pred_norm = _normalize_text(pred)
-    return pred_norm if pred_norm else None
-
-
-def _predict_numeric_answer(
+def _predict_with_tokens(
     model,
     tokenizer,
     prompt: str,
     task: str,
     device,
     max_new_tokens: int,
-) -> Optional[str]:
+) -> Optional[Dict[str, Any]]:
     input_ids = tokenizer(prompt, return_tensors="pt", truncation=True)["input_ids"].to(device)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
     output = model.generate(
         input_ids,
         max_new_tokens=max_new_tokens,
         do_sample=False,
         temperature=0.0,
-        eos_token_id=getattr(tokenizer, "eos_token_id", None),
+        eos_token_id=eos_token_id,
     )
-    pred = tokenizer.decode(output[0, input_ids.shape[1] :], skip_special_tokens=True)
-    pred_norm = normalize_prediction(task, pred)
-    return pred_norm if pred_norm else None
+    prompt_len = input_ids.shape[1]
+    gen_tokens = output[0, prompt_len:]
+    stop_reason = "other"
+    if eos_token_id is not None:
+        eos_positions = (gen_tokens == eos_token_id).nonzero(as_tuple=False)
+        if eos_positions.numel() > 0:
+            gen_tokens = gen_tokens[: eos_positions[0].item() + 1]
+            stop_reason = "eos"
+        elif gen_tokens.size(0) >= max_new_tokens:
+            stop_reason = "max_new_tokens"
+    elif gen_tokens.size(0) >= max_new_tokens:
+        stop_reason = "max_new_tokens"
+
+    pred_raw = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+    pred_norm = normalize_prediction(task, pred_raw) if task in NUMERIC_TASKS else _normalize_text(pred_raw)
+    return {
+        "pred_norm": pred_norm,
+        "pred_raw": pred_raw,
+        "pred_tokens": gen_tokens.tolist(),
+        "stop_reason": stop_reason,
+    }
 
 
 @torch.no_grad()
@@ -684,6 +783,20 @@ def evaluate_task_accuracy(
     seen_samples_by_task: Dict[str, int] = defaultdict(int)
     sample_seed = 0 if sample_seed is None else sample_seed
     sample_rngs: Dict[str, random.Random] = {}
+    target_len_tokens: List[int] = []
+    pred_len_tokens: List[int] = []
+    length_ratio: List[float] = []
+    abs_len_error: List[float] = []
+    stop_reason_counts = {"eos": 0, "max_new_tokens": 0, "other": 0}
+    eos_emitted = 0
+    repeat_1gram_rates: List[float] = []
+    repeat_2gram_rates: List[float] = []
+    unique_token_fractions: List[float] = []
+    max_run_lengths: List[float] = []
+    parse_successes = 0
+    parse_failure_counts = defaultdict(int)
+    numeric_abs_errors: List[float] = []
+    numeric_rel_errors: List[float] = []
 
     for example in _iter_eval_examples(loader, max_samples):
         task = example.get("task")
@@ -700,33 +813,52 @@ def evaluate_task_accuracy(
         if not prompt or not target:
             continue
 
-        if task in numeric_tasks:
-            pred_norm = _predict_numeric_answer(
-                model, tokenizer, prompt, task, device, max_new_tokens
-            )
-            if pred_norm is not None and task in MAE_TASKS:
-                target_norm = normalize_target(task, target)
-                pred_val = safe_parse_number(pred_norm)
-                target_val = safe_parse_number(target_norm)
-                if not (math.isnan(pred_val) or math.isnan(target_val)):
-                    abs_error = abs(pred_val - target_val)
-                    total_abs_error += abs_error
-                    total_numeric += 1
-                    per_task_abs_error[task] += abs_error
-                    per_task_numeric[task] += 1
-        else:
-            pred_norm = _predict_generation_answer(
-                model, tokenizer, prompt, device, max_new_tokens
-            )
-
-        if pred_norm is None:
+        pred_bundle = _predict_with_tokens(
+            model, tokenizer, prompt, task, device, max_new_tokens
+        )
+        if pred_bundle is None:
             continue
+        pred_norm = pred_bundle["pred_norm"]
 
         metrics = compute_metrics(task, pred_norm, target)
         metrics_by_task[task].append(metrics)
         total[task] += 1
         if metrics["exact_match"] == 1.0:
             correct[task] += 1
+
+        target_len = _token_length(tokenizer, normalize_target(task, target))
+        pred_tokens = pred_bundle["pred_tokens"]
+        pred_len = len(pred_tokens)
+        target_len_tokens.append(target_len)
+        pred_len_tokens.append(pred_len)
+        length_ratio.append(pred_len / max(target_len, 1))
+        abs_len_error.append(abs(pred_len - target_len))
+        stop_reason = pred_bundle["stop_reason"]
+        stop_reason_counts[stop_reason] = stop_reason_counts.get(stop_reason, 0) + 1
+        eos_emitted += 1 if stop_reason == "eos" else 0
+        repetition = compute_repetition_metrics(pred_tokens)
+        repeat_1gram_rates.append(repetition["repeat_1gram_rate"])
+        repeat_2gram_rates.append(repetition["repeat_2gram_rate"])
+        unique_token_fractions.append(repetition["unique_token_fraction"])
+        max_run_lengths.append(repetition["max_run_length"])
+
+        parse_ok = None
+        if task in numeric_tasks:
+            parsed_pred, failure_reason = parse_numeric_prediction(pred_bundle["pred_raw"])
+            parsed_tgt, tgt_failure = parse_numeric_prediction(target)
+            parse_ok = failure_reason is None
+            if not parse_ok:
+                parse_failure_counts[failure_reason] += 1
+            elif tgt_failure is None and task in MAE_TASKS:
+                abs_error = abs(parsed_pred - parsed_tgt)
+                rel_error = abs_error / max(abs(parsed_tgt), 1.0)
+                total_abs_error += abs_error
+                total_numeric += 1
+                per_task_abs_error[task] += abs_error
+                per_task_numeric[task] += 1
+                parse_successes += 1
+                numeric_abs_errors.append(abs_error)
+                numeric_rel_errors.append(rel_error)
         if sample_count_per_task > 0:
             rng = sample_rngs.get(task)
             if rng is None:
@@ -737,6 +869,11 @@ def evaluate_task_accuracy(
                 "target": target,
                 "expected_output": target,
                 "prediction": pred_norm,
+                "target_len_tokens": target_len,
+                "pred_len_tokens": pred_len,
+                "stop_reason": stop_reason,
+                "parse_ok": parse_ok,
+                "repeat_1gram_rate": repetition["repeat_1gram_rate"],
             }
             seen = seen_samples_by_task[task]
             if len(sampled_examples_by_task[task]) < sample_count_per_task:
@@ -771,6 +908,7 @@ def evaluate_task_accuracy(
     overall = sum(correct.values()) / max(sum(total.values()), 1)
     overall_aggregated = aggregate("overall", total_metrics)
     overall_mae = total_abs_error / total_numeric if total_numeric else None
+    total_numeric_samples = parse_successes + sum(parse_failure_counts.values())
     return {
         "overall_accuracy": overall,
         "per_task_accuracy": per_task,
@@ -783,6 +921,61 @@ def evaluate_task_accuracy(
         "overall_mae": overall_mae,
         "per_task_mae": per_task_mae,
         "sampled_examples_by_task": dict(sampled_examples_by_task),
+        "diagnostics": {
+            "answer_length": {
+                "mean": {
+                    "target_len_tokens": sum(target_len_tokens) / len(target_len_tokens)
+                    if target_len_tokens
+                    else 0.0,
+                    "pred_len_tokens": sum(pred_len_tokens) / len(pred_len_tokens)
+                    if pred_len_tokens
+                    else 0.0,
+                    "length_ratio": sum(length_ratio) / len(length_ratio) if length_ratio else 0.0,
+                    "abs_len_error": sum(abs_len_error) / len(abs_len_error)
+                    if abs_len_error
+                    else 0.0,
+                },
+                "eos_emitted_rate": eos_emitted / sum(total.values()) if total else 0.0,
+                "stop_reason_counts": stop_reason_counts,
+            },
+            "repetition": {
+                "repeat_1gram_rate": {
+                    "mean": sum(repeat_1gram_rates) / len(repeat_1gram_rates)
+                    if repeat_1gram_rates
+                    else 0.0,
+                },
+                "repeat_2gram_rate": {
+                    "mean": sum(repeat_2gram_rates) / len(repeat_2gram_rates)
+                    if repeat_2gram_rates
+                    else 0.0,
+                },
+                "unique_token_fraction": {
+                    "mean": sum(unique_token_fractions) / len(unique_token_fractions)
+                    if unique_token_fractions
+                    else 0.0,
+                },
+                "max_run_length": {
+                    "mean": sum(max_run_lengths) / len(max_run_lengths)
+                    if max_run_lengths
+                    else 0.0,
+                },
+            },
+            "parse": {
+                "parse_success_rate": parse_successes / total_numeric_samples
+                if total_numeric_samples
+                else 0.0,
+                "non_numeric_rate": 1.0 - (parse_successes / total_numeric_samples)
+                if total_numeric_samples
+                else 0.0,
+                "numeric_abs_error": sum(numeric_abs_errors) / len(numeric_abs_errors)
+                if numeric_abs_errors
+                else 0.0,
+                "numeric_rel_error": sum(numeric_rel_errors) / len(numeric_rel_errors)
+                if numeric_rel_errors
+                else 0.0,
+                "failure_counts": dict(parse_failure_counts),
+            },
+        },
     }
 
 
@@ -797,10 +990,18 @@ def _print_sampled_examples(label: str, samples_by_task: Dict[str, List[Dict[str
         print(f"    {task}:")
         for idx, sample in enumerate(samples, start=1):
             expected_output = sample.get("expected_output", sample.get("target"))
+            target_len = sample.get("target_len_tokens")
+            pred_len = sample.get("pred_len_tokens")
+            stop_reason = sample.get("stop_reason")
+            parse_ok = sample.get("parse_ok")
+            repeat_1gram = sample.get("repeat_1gram_rate")
             print(
                 f"      {idx}. prompt={sample['prompt']!r} "
                 f"prediction={sample['prediction']!r} "
-                f"expected_output={expected_output!r}"
+                f"expected_output={expected_output!r} "
+                f"target_len={target_len} pred_len={pred_len} "
+                f"stop_reason={stop_reason} parse_ok={parse_ok} "
+                f"repeat_1gram_rate={repeat_1gram}"
             )
 
 
@@ -1034,6 +1235,7 @@ def train(args):
             difficulty_schedule=args.difficulty_schedule,
             task_weighting=args.task_weighting,
             easy_mix_frac=args.easy_mix_frac,
+            include_lengths=True,
         )
         alg_loader = DataLoader(
             alg_dataset,
@@ -1054,6 +1256,7 @@ def train(args):
             task_weighting=args.task_weighting,
             total_tokens=args.alg_tokens,
             easy_mix_frac=args.easy_mix_frac,
+            include_lengths=True,
         )
         alg_loader = DataLoader(
             alg_dataset,
@@ -1103,6 +1306,7 @@ def train(args):
                 difficulty_schedule=args.difficulty_schedule,
                 task_weighting=args.task_weighting,
                 easy_mix_frac=args.easy_mix_frac,
+                include_lengths=True,
             )
             if args.train_eval_samples is not None:
                 capped = min(args.train_eval_samples, len(base_dataset))
@@ -1119,6 +1323,7 @@ def train(args):
                 task_weighting=args.task_weighting,
                 total_tokens=args.alg_tokens,
                 easy_mix_frac=args.easy_mix_frac,
+                include_lengths=True,
             )
 
         train_eval_loader = DataLoader(
@@ -1142,6 +1347,7 @@ def train(args):
         difficulty_schedule=args.difficulty_schedule,
         task_weighting=args.task_weighting,
         easy_mix_frac=args.easy_mix_frac,
+        include_lengths=True,
     )
     probe_loader = DataLoader(
         probe_dataset,
@@ -1288,6 +1494,9 @@ def train(args):
     last_token_accuracy = float("nan")
     last_pct_masked_tokens = float("nan")
     flush_diagnostic_metrics: Optional[Dict[str, float]] = None
+    task_window_counts = defaultdict(int)
+    task_window_input_len = defaultdict(int)
+    task_window_target_len = defaultdict(int)
     
     try:
         while curriculum.tokens_seen < args.total_tokens:
@@ -1302,6 +1511,27 @@ def train(args):
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             tokens_seen = curriculum.tokens_seen
+
+            batch_tasks = batch.get("task")
+            if batch_tasks is not None:
+                if torch.is_tensor(batch_tasks):
+                    task_list = batch_tasks.tolist()
+                elif isinstance(batch_tasks, (list, tuple)):
+                    task_list = list(batch_tasks)
+                else:
+                    task_list = [batch_tasks]
+                input_lens = batch.get("input_len_tokens")
+                target_lens = batch.get("target_len_tokens")
+                if torch.is_tensor(input_lens):
+                    input_lens = input_lens.tolist()
+                if torch.is_tensor(target_lens):
+                    target_lens = target_lens.tolist()
+                for idx, task in enumerate(task_list):
+                    task_window_counts[task] += 1
+                    if isinstance(input_lens, list) and idx < len(input_lens):
+                        task_window_input_len[task] += int(input_lens[idx])
+                    if isinstance(target_lens, list) and idx < len(target_lens):
+                        task_window_target_len[task] += int(target_lens[idx])
             
             # Learning rate (token-based decay to align with actual budget consumption)
             lr = get_lr(
@@ -1463,6 +1693,26 @@ def train(args):
                         args.grad_clip / (last_grad_norm + 1e-12) if grad_clipped else 1.0
                     )
 
+                task_metrics: Dict[str, float] = {}
+                active_tasks = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
+                progress_ratio = min(curriculum.tokens_seen / max(args.alg_tokens, 1), 1.0)
+                task_weights, task_probs = _compute_task_sampling(
+                    active_tasks, progress_ratio, args.task_weighting
+                )
+                for task, prob in task_probs.items():
+                    task_metrics[f"train.task_prob.{task}"] = prob
+                for task, weight in task_weights.items():
+                    task_metrics[f"train.task_weight.{task}"] = weight
+                for task, count in task_window_counts.items():
+                    task_metrics[f"train.task_count_window.{task}"] = float(count)
+                    if count > 0:
+                        task_metrics[f"train.task_input_len.{task}"] = (
+                            task_window_input_len[task] / count
+                        )
+                        task_metrics[f"train.task_target_len.{task}"] = (
+                            task_window_target_len[task] / count
+                        )
+
                 logger.log(
                     step=global_step,
                     phase=phase,
@@ -1478,6 +1728,7 @@ def train(args):
                     grad_norm=last_grad_norm,
                     weight_norm=weight_norm,
                     **diagnostic_metrics,
+                    **task_metrics,
                 )
                 if args.extended_logging and diagnostic_metrics:
                     log_print(f"  Diagnostics: {format_metrics_line(diagnostic_metrics)}")
@@ -1485,6 +1736,9 @@ def train(args):
                 running_loss = 0.0
                 running_inner_steps = 0.0
                 running_ponder = 0.0
+                task_window_counts.clear()
+                task_window_input_len.clear()
+                task_window_target_len.clear()
             
             # Evaluation
             if global_step % args.eval_interval == 0:
@@ -1503,6 +1757,17 @@ def train(args):
                         f"  Train token acc: {last_token_accuracy:.3f} | "
                         f"pct masked: {last_pct_masked_tokens:.3f}"
                     )
+                active_tasks = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
+                progress_ratio = min(curriculum.tokens_seen / max(args.alg_tokens, 1), 1.0)
+                eval_task_weights, eval_task_probs = _compute_task_sampling(
+                    active_tasks, progress_ratio, args.task_weighting
+                )
+                eval_task_metrics = {
+                    f"eval.task_prob.{task}": prob for task, prob in eval_task_probs.items()
+                }
+                eval_task_metrics.update(
+                    {f"eval.task_weight.{task}": weight for task, weight in eval_task_weights.items()}
+                )
                 with torch.no_grad():
                     weight_norm = math.sqrt(
                         sum((param.detach().float() ** 2).sum().item() for param in model.parameters())
@@ -1525,7 +1790,12 @@ def train(args):
                     probe_seed=probe_seed,
                 )
                 if eval_diagnostic_metrics:
-                    logger.log(step=global_step, phase="eval", **eval_diagnostic_metrics)
+                    logger.log(
+                        step=global_step,
+                        phase="eval",
+                        **eval_diagnostic_metrics,
+                        **eval_task_metrics,
+                    )
                     if args.extended_logging:
                         log_print(
                             "  Eval diagnostics: "
@@ -1582,6 +1852,8 @@ def train(args):
                         eval_difficulty=difficulty_logged,
                         algorithmic_samples=alg_results.get("sampled_examples_by_task", {}),
                         algorithmic_iid_samples=alg_results.get("sampled_examples_by_task", {}),
+                        **_flatten_eval_diagnostics("eval", alg_results.get("diagnostics", {})),
+                        **eval_task_metrics,
                     )
 
                     per_task_mae = alg_results.get("per_task_mae", {}) or {}
@@ -1672,6 +1944,10 @@ def train(args):
                         algorithmic_ood_mae=overall_mae,
                         eval_difficulty=difficulty_logged,
                         algorithmic_ood_samples=ood_results.get("sampled_examples_by_task", {}),
+                        **_flatten_eval_diagnostics(
+                            "eval_ood", ood_results.get("diagnostics", {})
+                        ),
+                        **eval_task_metrics,
                     )
 
                     per_task_mae = ood_results.get("per_task_mae", {}) or {}
@@ -1756,6 +2032,10 @@ def train(args):
                         train_eval_prefix_accuracy=task_eval.get("overall_prefix_accuracy"),
                         eval_difficulty=difficulty_logged,
                         train_eval_samples=task_eval.get("sampled_examples_by_task", {}),
+                        **_flatten_eval_diagnostics(
+                            "train_eval", task_eval.get("diagnostics", {})
+                        ),
+                        **eval_task_metrics,
                     )
 
                     per_task_mae = task_eval.get("per_task_mae", {}) or {}
