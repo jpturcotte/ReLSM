@@ -565,7 +565,7 @@ class EvalResult:
     mean_prefix_accuracy: float
     mae: Optional[float]
     numeric_count: int
-    parse_failures: int = 0
+    parse_failures: int
     n: int
     avg_gen_len: float
     tokens_per_sec: float
