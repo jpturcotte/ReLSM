@@ -429,6 +429,7 @@ class EvalResult:
 
     condition: str
     task: str
+    difficulty: float
     accuracy: float
     mean_token_accuracy: float
     mean_distance: float
@@ -439,6 +440,7 @@ class EvalResult:
     avg_gen_len: float
     tokens_per_sec: float
     examples: List[Dict[str, str]]
+    sampled_examples: List[Dict[str, str]]
     correct: int
     tokens_generated: int
     elapsed: float
@@ -645,7 +647,13 @@ def aggregate(task: str, results: List[Dict[str, float]]) -> AggregatedMetrics:
     )
 
 
-def build_dataset(task: str, n: int, params: Dict[str, Any], seed: int) -> List[Dict[str, Any]]:
+def build_dataset(
+    task: str,
+    n: int,
+    params: Dict[str, Any],
+    seed: int,
+    difficulty: float = 0.5,
+) -> List[Dict[str, Any]]:
     """Generate a deterministic dataset for a given task/condition."""
 
     examples: List[Dict[str, Any]] = []
@@ -656,7 +664,7 @@ def build_dataset(task: str, n: int, params: Dict[str, Any], seed: int) -> List[
         kwargs = dict(params)
         if task == "dyck":
             kwargs["force_valid"] = i < n / 2
-        example = gen_fn(rng=rng, difficulty=0.5, **kwargs)
+        example = gen_fn(rng=rng, difficulty=difficulty, **kwargs)
         examples.append(example)
     return examples
 
@@ -750,11 +758,13 @@ def evaluate_condition(
     seed: int,
     batch_size: int = 16,
     generation_kwargs: Optional[Dict[str, Any]] = None,
+    difficulty: float = 0.5,
+    sample_count: int = 0,
 ) -> EvalResult:
     """Evaluate a single algorithmic condition (IID or OOD)."""
 
     seed_all(seed)
-    dataset = build_dataset(task, n, params, seed)
+    dataset = build_dataset(task, n, params, seed, difficulty=difficulty)
     use_autocast = device.type == "cuda"
 
     total_correct = 0
@@ -766,6 +776,10 @@ def evaluate_condition(
     total_gen_len = 0.0
     collected_examples: List[Dict[str, str]] = []
     metrics_samples: List[Dict[str, float]] = []
+    sampled_examples: List[Dict[str, str]] = []
+    sample_seen = 0
+    sample_target = max(sample_count, 0)
+    sample_rng = random.Random(seed + 17)
 
     for start_idx in range(0, n, batch_size):
         batch = dataset[start_idx : start_idx + batch_size]
@@ -790,6 +804,19 @@ def evaluate_condition(
             norm_tgt = normalize_target(task, tgt)
             metrics = compute_metrics(task, pred, tgt)
             metrics_samples.append(metrics)
+            if sample_target:
+                sample_item = {
+                    "prompt": ex["input"],
+                    "target": tgt,
+                    "prediction": pred,
+                }
+                if len(sampled_examples) < sample_target:
+                    sampled_examples.append(sample_item)
+                else:
+                    idx = sample_rng.randint(0, sample_seen)
+                    if idx < sample_target:
+                        sampled_examples[idx] = sample_item
+                sample_seen += 1
             if metrics["exact_match"] == 1.0:
                 total_correct += 1
             else:
@@ -818,6 +845,7 @@ def evaluate_condition(
     return EvalResult(
         condition=condition,
         task=task,
+        difficulty=difficulty,
         accuracy=accuracy,
         mean_token_accuracy=aggregated.mean_token_accuracy,
         mean_distance=aggregated.mean_distance,
@@ -828,6 +856,7 @@ def evaluate_condition(
         avg_gen_len=avg_gen_len,
         tokens_per_sec=tokens_per_sec,
         examples=collected_examples,
+        sampled_examples=sampled_examples,
         correct=total_correct,
         tokens_generated=total_tokens,
         elapsed=total_time,

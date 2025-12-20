@@ -31,7 +31,7 @@ from collections import defaultdict
 from multiprocessing import Value
 from pathlib import Path
 from contextlib import nullcontext
-from typing import Optional, Dict, List, Sequence
+from typing import Optional, Dict, List, Sequence, Any
 
 import numpy as np
 
@@ -232,7 +232,8 @@ def evaluate_algorithmic(
     max_new_tokens: int = 32,
     tasks: Optional[Sequence[str]] = None,
     seed: int = 42,
-) -> Dict[str, Dict[str, float] | float | None]:
+    sample_count_per_task: int = 5,
+) -> Dict[str, Any]:
     """Run the canonical algorithmic OOD grid using ``eval_hub``.
 
     The ``n_examples`` argument caps the number of examples per condition
@@ -258,6 +259,7 @@ def evaluate_algorithmic(
         generation_kwargs=generation_kwargs,
         limit=n_examples,
         tasks=tasks,
+        sample_count_per_task=sample_count_per_task,
     )
 
     return {
@@ -271,6 +273,7 @@ def evaluate_algorithmic(
         "per_task_prefix_accuracy": results.get("per_task_prefix_accuracy", {}),
         "overall_mae": results.get("overall_mae"),
         "per_task_mae": results.get("per_task_mae", {}),
+        "sampled_examples_by_task": results.get("sampled_examples_by_task", {}),
     }
 
 
@@ -485,7 +488,9 @@ def evaluate_task_accuracy(
     max_samples: Optional[int] = 200,
     max_new_tokens: int = 32,
     numeric_tasks: Optional[set] = None,
-) -> Dict[str, Dict[str, float | None] | float | None]:
+    sample_count_per_task: int = 5,
+    sample_seed: Optional[int] = None,
+) -> Dict[str, Any]:
     """Evaluate task completion accuracy on a training split."""
     model.eval()
     numeric_tasks = numeric_tasks or NUMERIC_TASKS
@@ -496,6 +501,10 @@ def evaluate_task_accuracy(
     total_numeric = 0
     per_task_abs_error = defaultdict(float)
     per_task_numeric = defaultdict(int)
+    sampled_examples_by_task: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    seen_samples_by_task: Dict[str, int] = defaultdict(int)
+    sample_seed = 0 if sample_seed is None else sample_seed
+    sample_rngs: Dict[str, random.Random] = {}
 
     for example in _iter_eval_examples(loader, max_samples):
         task = example.get("task")
@@ -542,6 +551,24 @@ def evaluate_task_accuracy(
         total[task] += 1
         if metrics["exact_match"] == 1.0:
             correct[task] += 1
+        if sample_count_per_task > 0:
+            rng = sample_rngs.get(task)
+            if rng is None:
+                rng = random.Random(hash((sample_seed, task)))
+                sample_rngs[task] = rng
+            sample_item = {
+                "prompt": prompt,
+                "target": target,
+                "prediction": pred_norm,
+            }
+            seen = seen_samples_by_task[task]
+            if len(sampled_examples_by_task[task]) < sample_count_per_task:
+                sampled_examples_by_task[task].append(sample_item)
+            else:
+                idx = rng.randint(0, seen)
+                if idx < sample_count_per_task:
+                    sampled_examples_by_task[task][idx] = sample_item
+            seen_samples_by_task[task] = seen + 1
 
     model.train()
 
@@ -578,7 +605,25 @@ def evaluate_task_accuracy(
         "per_task_prefix_accuracy": per_task_prefix_accuracy,
         "overall_mae": overall_mae,
         "per_task_mae": per_task_mae,
+        "sampled_examples_by_task": dict(sampled_examples_by_task),
     }
+
+
+def _print_sampled_examples(label: str, samples_by_task: Dict[str, List[Dict[str, str]]]) -> None:
+    if not samples_by_task:
+        return
+    print(f"  {label} samples:")
+    for task in sorted(samples_by_task):
+        samples = samples_by_task[task]
+        if not samples:
+            continue
+        print(f"    {task}:")
+        for idx, sample in enumerate(samples, start=1):
+            print(
+                f"      {idx}. prompt={sample['prompt']!r} "
+                f"prediction={sample['prediction']!r} "
+                f"target={sample['target']!r}"
+            )
 
 
 def build_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> torch.optim.Optimizer:
@@ -1090,6 +1135,10 @@ def train(args):
             # Evaluation
             if global_step % args.eval_interval == 0:
                 print("\nRunning evaluation...")
+                difficulty_logged = (
+                    float(difficulty_value.value) if difficulty_value is not None else 0.5
+                )
+                print(f"  Eval difficulty: {difficulty_logged:.3f}")
                 with torch.no_grad():
                     weight_norm = math.sqrt(
                         sum((param.detach().float() ** 2).sum().item() for param in model.parameters())
@@ -1109,6 +1158,7 @@ def train(args):
                         max_new_tokens=args.eval_max_new_tokens,
                         tasks=alg_tasks,
                         seed=args.seed,
+                        sample_count_per_task=args.eval_sample_count_per_task,
                     )
                     overall_acc = alg_results.get("overall_accuracy", 0.0)
                     overall_mae = alg_results.get("overall_mae")
@@ -1125,6 +1175,11 @@ def train(args):
                     if overall_mae is not None:
                         print(f"  Algorithmic MAE (numeric tasks): {overall_mae:.3f}")
 
+                    _print_sampled_examples(
+                        "Algorithmic eval",
+                        alg_results.get("sampled_examples_by_task", {}),
+                    )
+
                     logger.log(
                         step=global_step,
                         phase="eval",
@@ -1133,6 +1188,8 @@ def train(args):
                         algorithmic_distance=overall_distance,
                         algorithmic_prefix_accuracy=overall_prefix_accuracy,
                         algorithmic_mae=overall_mae,
+                        eval_difficulty=difficulty_logged,
+                        algorithmic_samples=alg_results.get("sampled_examples_by_task", {}),
                     )
 
                     per_task_mae = alg_results.get("per_task_mae", {}) or {}
@@ -1197,6 +1254,8 @@ def train(args):
                         ctx,
                         max_samples=args.train_eval_samples,
                         max_new_tokens=args.eval_max_new_tokens,
+                        sample_count_per_task=args.eval_sample_count_per_task,
+                        sample_seed=args.seed,
                     )
                     overall_task_acc = task_eval.get("overall_accuracy", 0.0)
                     overall_task_mae = task_eval.get("overall_mae")
@@ -1208,6 +1267,11 @@ def train(args):
                     if overall_task_mae is not None:
                         print(f"  Training task MAE (numeric tasks): {overall_task_mae:.3f}")
 
+                    _print_sampled_examples(
+                        "Training eval",
+                        task_eval.get("sampled_examples_by_task", {}),
+                    )
+
                     logger.log(
                         step=global_step,
                         phase="eval",
@@ -1217,6 +1281,8 @@ def train(args):
                         train_eval_token_accuracy=task_eval.get("overall_token_accuracy"),
                         train_eval_distance=task_eval.get("overall_distance"),
                         train_eval_prefix_accuracy=task_eval.get("overall_prefix_accuracy"),
+                        eval_difficulty=difficulty_logged,
+                        train_eval_samples=task_eval.get("sampled_examples_by_task", {}),
                     )
 
                     per_task_mae = task_eval.get("per_task_mae", {}) or {}
@@ -1485,6 +1551,12 @@ def main():
         type=int,
         default=100,
         help="Number of examples to evaluate per interval",
+    )
+    parser.add_argument(
+        "--eval_sample_count_per_task",
+        type=int,
+        default=5,
+        help="Number of sampled eval prompts to log per task",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (recommended for Linux only)")
