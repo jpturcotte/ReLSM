@@ -983,16 +983,20 @@ class AlgorithmicDataset(IterableDataset):
             if len(tokens) > self.max_seq_len:
                 tokens = tokens[:self.max_seq_len]
 
-            input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
-            labels = torch.tensor(tokens[1:], dtype=torch.long)
-
-            pad_len = self.max_seq_len - 1 - len(input_ids)
+            input_ids = torch.tensor(tokens, dtype=torch.long)
+            pad_len = self.max_seq_len - len(input_ids)
+            pad_id = self.tokenizer.pad_token_id or 0
             if pad_len > 0:
-                pad_id = self.tokenizer.pad_token_id or 0
                 input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
-                labels = torch.cat([labels, torch.full((pad_len,), -100)])
 
-            n_tokens = int((labels != -100).sum().item())
+            attention_mask = torch.ones_like(input_ids)
+            if pad_len > 0:
+                attention_mask[-pad_len:] = 0
+
+            labels = input_ids.clone()
+            labels = labels.masked_fill(attention_mask == 0, -100)
+
+            n_tokens = int((labels[1:] != -100).sum().item())
             self.tokens_seen += n_tokens
 
             yield {
@@ -1085,14 +1089,18 @@ class FixedAlgorithmicDataset(Dataset):
             if len(tokens) > self.max_seq_len:
                 tokens = tokens[: self.max_seq_len]
 
-            input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
-            labels = torch.tensor(tokens[1:], dtype=torch.long)
-
-            pad_len = self.max_seq_len - 1 - len(input_ids)
+            input_ids = torch.tensor(tokens, dtype=torch.long)
+            pad_len = self.max_seq_len - len(input_ids)
+            pad_id = self.tokenizer.pad_token_id or 0
             if pad_len > 0:
-                pad_id = self.tokenizer.pad_token_id or 0
                 input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
-                labels = torch.cat([labels, torch.full((pad_len,), -100)])
+
+            attention_mask = torch.ones_like(input_ids)
+            if pad_len > 0:
+                attention_mask[-pad_len:] = 0
+
+            labels = input_ids.clone()
+            labels = labels.masked_fill(attention_mask == 0, -100)
 
             self.examples.append(
                 {
@@ -1367,14 +1375,18 @@ class LanguageDataset(IterableDataset):
             if len(tokens) > self.max_seq_len:
                 tokens = tokens[:self.max_seq_len]
 
-            input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
-            labels = torch.tensor(tokens[1:], dtype=torch.long)
-
-            pad_len = self.max_seq_len - 1 - len(input_ids)
+            input_ids = torch.tensor(tokens, dtype=torch.long)
+            pad_len = self.max_seq_len - len(input_ids)
+            pad_id = self.tokenizer.pad_token_id or 0
             if pad_len > 0:
-                pad_id = self.tokenizer.pad_token_id or 0
                 input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
-                labels = torch.cat([labels, torch.full((pad_len,), -100)])
+
+            attention_mask = torch.ones_like(input_ids)
+            if pad_len > 0:
+                attention_mask[-pad_len:] = 0
+
+            labels = input_ids.clone()
+            labels = labels.masked_fill(attention_mask == 0, -100)
 
             yield {"input_ids": input_ids, "labels": labels}
 
@@ -1504,7 +1516,7 @@ class CurriculumSampler:
             batch = self._next_from("lang")
 
         # Count tokens (non-padding)
-        n_tokens = (batch["labels"] != -100).sum().item()
+        n_tokens = (batch["labels"][..., 1:] != -100).sum().item()
         self.tokens_seen += n_tokens
 
         return batch

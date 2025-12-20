@@ -48,7 +48,7 @@ def test_next_batch_recycles_iterators_without_stopiteration():
     batches = [_first_label_value(sampler.next_batch()) for _ in range(5)]
 
     assert batches == [1, 2, 3, 1, 2]
-    assert sampler.tokens_seen == 5 * 2  # two tokens per example
+    assert sampler.tokens_seen == 5 * 1  # one next-token target per example
 
 
 def test_next_batch_respects_batch_size_when_recycling():
@@ -65,7 +65,7 @@ def test_next_batch_respects_batch_size_when_recycling():
 
     sampler._sample_source = lambda: "alg"
 
-    # Two batches from a batch_size=2, seq_len=2 dataset should each count 4 tokens.
+    # Two batches from a batch_size=2, seq_len=2 dataset should each count 2 tokens.
     first_batch = sampler.next_batch()
     second_batch = sampler.next_batch()
     third_batch = sampler.next_batch()
@@ -73,7 +73,7 @@ def test_next_batch_respects_batch_size_when_recycling():
     assert first_batch["labels"].shape == (2, 2)
     assert second_batch["labels"].shape == (2, 2)
     assert third_batch["labels"].shape == (2, 2)
-    assert sampler.tokens_seen == 3 * 2 * 2
+    assert sampler.tokens_seen == 3 * 2 * 1
     assert _first_label_value(first_batch) == 1
     assert _first_label_value(second_batch) == 3
     # After recycling the iterator, we loop back to the start of the dataset.
@@ -99,7 +99,7 @@ def test_reset_restores_loader_positions_and_token_counter():
     sampler._sample_source = lambda: next(first_cycle_sources)
 
     first_batches = [_first_label_value(sampler.next_batch()) for _ in range(3)]
-    assert sampler.tokens_seen == 3 * 2
+    assert sampler.tokens_seen == 3 * 1
 
     sampler.reset()
     assert sampler.tokens_seen == 0
@@ -132,5 +132,5 @@ def test_falls_back_to_language_when_lexical_loader_absent():
     batches = [_first_label_value(sampler.next_batch()) for _ in range(4)]
 
     assert batches == [101, 102, 103, 101]
-    # Each batch has batch_size=1 and seq_len=2, so tokens_seen is 8.
-    assert sampler.tokens_seen == 4 * 2
+    # Each batch has batch_size=1 and seq_len=2, so tokens_seen is 4.
+    assert sampler.tokens_seen == 4 * 1
