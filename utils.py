@@ -21,9 +21,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
+import torch.nn as nn
 
 from data import AlgorithmicGenerator
-from model import BaselineTransformer, TransformerConfig
+from model import BaselineTransformer, TransformerConfig, apply_rotary_emb
 
 DEFAULT_TOKENIZER_NAME = "EleutherAI/llemma_7b"
 
@@ -97,6 +98,134 @@ def prepare_tokenizer(tokenizer_name: str):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
+
+
+def _find_first_module(root: nn.Module, candidates: Sequence[str]) -> Optional[nn.Module]:
+    for name in candidates:
+        module = getattr(root, name, None)
+        if isinstance(module, nn.Module):
+            return module
+    return None
+
+
+def get_transformer_blocks(model: nn.Module) -> List[nn.Module]:
+    candidates = [
+        "layers",
+        "blocks",
+        "h",
+        "transformer_blocks",
+        "encoder_layers",
+        "decoder_layers",
+        "unique_layers",
+    ]
+    for name in candidates:
+        blocks = getattr(model, name, None)
+        if isinstance(blocks, (nn.ModuleList, list, tuple)) and len(blocks) > 0:
+            filtered = [
+                block
+                for block in blocks
+                if isinstance(block, nn.Module) and hasattr(block, "attn") and hasattr(block, "ff")
+            ]
+            return filtered
+    return []
+
+
+def resolve_diagnostic_modules(model: nn.Module) -> Dict[str, Optional[nn.Module]]:
+    blocks = get_transformer_blocks(model)
+    diagnostic: Dict[str, Optional[nn.Module]] = {
+        "embedding": _find_first_module(
+            model, ("tok_emb", "token_embedding", "embedding", "embed_tokens", "wte")
+        ),
+        "head": _find_first_module(model, ("lm_head", "head", "output_head", "output_proj", "proj")),
+    }
+
+    if blocks:
+        diagnostic["block0"] = blocks[0]
+        diagnostic["block_mid"] = blocks[len(blocks) // 2]
+        diagnostic["block_last"] = blocks[-1]
+
+    return diagnostic
+
+
+def module_grad_weight_norm(module: Optional[nn.Module]) -> Tuple[float, float]:
+    if module is None:
+        return float("nan"), float("nan")
+    grad_sq = 0.0
+    weight_sq = 0.0
+    has_weight = False
+    has_grad = False
+    for param in module.parameters(recurse=True):
+        has_weight = True
+        weight_sq += param.detach().float().pow(2).sum().item()
+        if param.grad is not None:
+            has_grad = True
+            grad_sq += param.grad.detach().float().pow(2).sum().item()
+    weight_norm = math.sqrt(weight_sq) if has_weight else float("nan")
+    grad_norm = math.sqrt(grad_sq) if has_grad else float("nan")
+    return grad_norm, weight_norm
+
+
+def compute_weight_entropy(module: Optional[nn.Module], bins: int = 256) -> float:
+    if module is None:
+        return float("nan")
+
+    abs_max = 0.0
+    has_param = False
+    for param in module.parameters(recurse=True):
+        if param.numel() == 0:
+            continue
+        has_param = True
+        abs_max = max(abs_max, float(param.detach().abs().max().item()))
+
+    if not has_param:
+        return float("nan")
+    if abs_max == 0.0:
+        return 0.0
+
+    hist = torch.zeros(bins, dtype=torch.float64)
+    for param in module.parameters(recurse=True):
+        if param.numel() == 0:
+            continue
+        values = param.detach().abs().float().cpu()
+        hist += torch.histc(values, bins=bins, min=0.0, max=abs_max).double()
+
+    total = float(hist.sum().item())
+    if total <= 0:
+        return 0.0
+    probs = hist / total
+    entropy = -(probs * (probs + 1e-12).log()).sum().item()
+    return float(entropy)
+
+
+def compute_attention_probs(
+    attn_module: nn.Module,
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor] = None,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    B, T, _ = hidden_states.shape
+
+    q = attn_module.q_proj(hidden_states).view(B, T, attn_module.n_heads, attn_module.d_head).transpose(1, 2)
+    k = attn_module.k_proj(hidden_states).view(B, T, attn_module.n_kv_heads, attn_module.d_head).transpose(1, 2)
+
+    cos, sin = attn_module.rotary(T, hidden_states.device)
+    if position_ids is None:
+        position_ids = torch.arange(T, device=hidden_states.device).unsqueeze(0)
+
+    q, k = apply_rotary_emb(q, k, cos, sin, position_ids)
+
+    k = attn_module._repeat_kv(k)
+
+    q = q.float()
+    k = k.float()
+    scores = torch.matmul(q, k.transpose(-2, -1)) * float(attn_module.scale)
+
+    if mask is None:
+        causal_mask = torch.full((T, T), float("-inf"), device=hidden_states.device)
+        mask = torch.triu(causal_mask, diagonal=1)
+    scores = scores + mask
+    probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
+    return probs
 
 
 def _resolve_max_length(model: BaselineTransformer, tokenizer: Any) -> int | None:
