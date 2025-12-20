@@ -66,6 +66,7 @@ class MetricsLogger:
     
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
+        self.hyperparameters = {}
         self.metrics = {
             "train_loss": [],
             "val_loss": [],
@@ -133,8 +134,12 @@ class MetricsLogger:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._append_snapshot()
 
+    def set_hyperparameters(self, hyperparameters: Dict) -> None:
+        self.hyperparameters = hyperparameters
+
     def _append_snapshot(self):
         snapshot = {
+            "hyperparameters": self.hyperparameters,
             "training": self.metrics,
             "evaluations": self.evaluations,
             "task_accuracies": self.task_accuracies,
@@ -662,6 +667,7 @@ def train(args):
     output_dir.mkdir(parents=True, exist_ok=True)
     
     logger = MetricsLogger(output_dir)
+    logger.set_hyperparameters(vars(args))
     
     # =========================================================================
     # TOKENIZER
