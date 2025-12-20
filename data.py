@@ -157,6 +157,71 @@ def get_task_weight(task: str, progress: float) -> float:
         return base * 0.5
     return base
 
+
+def sample_difficulty_smooth(
+    progress: float,
+    easy_mix_frac: float = 0.2,
+    rng: Optional[random.Random] = None,
+) -> float:
+    """
+    Sample difficulty with smooth phase transitions and guaranteed easy mixing.
+
+    Args:
+        progress: Training progress from 0.0 to 1.0
+        easy_mix_frac: Fraction of samples that should be easy (0.0-0.3 difficulty)
+        rng: Random number generator
+
+    Returns:
+        Difficulty value from 0.0 to 1.0
+    """
+    rng = rng or random
+
+    if rng.random() < easy_mix_frac:
+        return rng.uniform(0.0, 0.3)
+
+    boundaries = [0.15, 0.35, 0.60]
+    target_difficulties = [0.25, 0.45, 0.70, 1.0]
+
+    result = target_difficulties[0]
+
+    for i, boundary in enumerate(boundaries):
+        transition_width = 0.05
+        blend = 1.0 / (1.0 + math.exp(-(progress - boundary) / (transition_width / 4)))
+        result = result * (1 - blend) + target_difficulties[i + 1] * blend
+
+    noise = rng.gauss(0, 0.05)
+    result = max(0.0, min(1.0, result + noise))
+
+    return result
+
+
+def sample_difficulty_warmup_ramp(
+    progress: float,
+    warmup_frac: float = 0.1,
+    hold_frac: float = 0.2,
+    easy_mix_frac: float = 0.2,
+    rng: Optional[random.Random] = None,
+) -> float:
+    """
+    Stay easy during warmup, hold, then ramp difficulty.
+
+    This is more conservative than smooth_phased - good for harder tasks.
+    """
+    rng = rng or random
+
+    if rng.random() < easy_mix_frac:
+        return rng.uniform(0.0, 0.3)
+
+    if progress < warmup_frac:
+        return rng.uniform(0.1, 0.25)
+    if progress < warmup_frac + hold_frac:
+        return rng.uniform(0.2, 0.4)
+
+    ramp_progress = (progress - warmup_frac - hold_frac) / (1 - warmup_frac - hold_frac)
+    base = 0.3 + 0.7 * ramp_progress
+    noise = rng.gauss(0, 0.05)
+    return max(0.0, min(1.0, base + noise))
+
 class AlgorithmicGenerator:
     """
     Generates synthetic algorithmic tasks for grokking.
@@ -851,9 +916,10 @@ class AlgorithmicDataset(IterableDataset):
         tasks: Optional[List[str]] = None,
         seed: Optional[int] = None,
         difficulty_value=None,
-        difficulty_schedule: str = "linear",
+        difficulty_schedule: str = "smooth",
         task_weighting: str = "uniform",
         total_tokens: Optional[int] = None,
+        easy_mix_frac: float = 0.2,
     ):
         self.tokenizer = tokenizer
         self.num_examples = num_examples
@@ -863,6 +929,7 @@ class AlgorithmicDataset(IterableDataset):
         self.difficulty_value = difficulty_value
         self.difficulty_schedule = difficulty_schedule
         self.task_weighting = task_weighting
+        self.easy_mix_frac = easy_mix_frac
         self.tokens_seen = 0
         self._token_budget = max(
             1,
@@ -936,6 +1003,7 @@ class AlgorithmicDataset(IterableDataset):
             }
 
     def _sample_difficulty(self, rng: random.Random, progress: float) -> float:
+        """Sample difficulty based on schedule type."""
         if self.difficulty_value is not None:
             try:
                 with self.difficulty_value.get_lock():
@@ -947,11 +1015,30 @@ class AlgorithmicDataset(IterableDataset):
         if self.difficulty_schedule == "fixed":
             return 0.5
 
+        if self.difficulty_schedule == "linear":
+            upper = min(1.0, 0.5 + 0.5 * progress)
+            return rng.uniform(0.0, upper)
+
         if self.difficulty_schedule == "phased":
             return min(max(progress, 0.0), 1.0)
 
-        upper = min(1.0, 0.5 + 0.5 * progress)
-        return rng.uniform(0.0, upper)
+        if self.difficulty_schedule == "smooth":
+            return sample_difficulty_smooth(
+                progress,
+                easy_mix_frac=self.easy_mix_frac,
+                rng=rng,
+            )
+
+        if self.difficulty_schedule == "warmup_ramp":
+            return sample_difficulty_warmup_ramp(
+                progress,
+                warmup_frac=0.1,
+                hold_frac=0.2,
+                easy_mix_frac=self.easy_mix_frac,
+                rng=rng,
+            )
+
+        return sample_difficulty_smooth(progress, rng=rng)
 
 
 class FixedAlgorithmicDataset(Dataset):
@@ -967,6 +1054,7 @@ class FixedAlgorithmicDataset(Dataset):
         difficulty: float = 0.5,
         difficulty_schedule: str = "linear",
         task_weighting: str = "uniform",
+        easy_mix_frac: float = 0.2,
     ):
         self.tokenizer = tokenizer
         self.num_examples = num_examples
@@ -976,6 +1064,7 @@ class FixedAlgorithmicDataset(Dataset):
         self.difficulty = difficulty
         self.difficulty_schedule = difficulty_schedule
         self.task_weighting = task_weighting
+        self.easy_mix_frac = easy_mix_frac
 
         self.examples: List[Dict[str, torch.Tensor]] = []
 
@@ -1032,9 +1121,10 @@ def create_algorithmic_dataset(
     tasks: Optional[List[str]] = None,
     seed: int = 42,
     difficulty_value=None,
-    difficulty_schedule: str = "linear",
+    difficulty_schedule: str = "smooth",
     task_weighting: str = "uniform",
     total_tokens: Optional[int] = None,
+    easy_mix_frac: float = 0.2,
 ) -> Union[AlgorithmicDataset, FixedAlgorithmicDataset]:
     """Factory that returns fixed or infinite dataset based on flag."""
 
@@ -1055,6 +1145,7 @@ def create_algorithmic_dataset(
             difficulty=difficulty,
             difficulty_schedule=difficulty_schedule,
             task_weighting=task_weighting,
+            easy_mix_frac=easy_mix_frac,
         )
 
     return AlgorithmicDataset(
@@ -1067,6 +1158,7 @@ def create_algorithmic_dataset(
         difficulty_schedule=difficulty_schedule,
         task_weighting=task_weighting,
         total_tokens=total_tokens,
+        easy_mix_frac=easy_mix_frac,
     )
 
 
