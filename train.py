@@ -500,6 +500,7 @@ def run_eval_diagnostics(
 
 
 NUMERIC_TASKS = {"mod_add", "addition", "multiplication", "chain", "successor", "parity"}
+MAE_TASKS = {"mod_add", "addition", "multiplication", "chain", "successor"}
 SEQUENCE_TASKS = {"copy", "reverse"}
 
 
@@ -682,7 +683,7 @@ def evaluate_task_accuracy(
             pred_norm = _predict_numeric_answer(
                 model, tokenizer, prompt, task, device, max_new_tokens
             )
-            if pred_norm is not None:
+            if pred_norm is not None and task in MAE_TASKS:
                 target_norm = normalize_target(task, target)
                 pred_val = safe_parse_number(pred_norm)
                 target_val = safe_parse_number(target_norm)
