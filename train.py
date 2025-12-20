@@ -559,6 +559,7 @@ def evaluate_task_accuracy(
             sample_item = {
                 "prompt": prompt,
                 "target": target,
+                "expected_output": target,
                 "prediction": pred_norm,
             }
             seen = seen_samples_by_task[task]
@@ -619,10 +620,11 @@ def _print_sampled_examples(label: str, samples_by_task: Dict[str, List[Dict[str
             continue
         print(f"    {task}:")
         for idx, sample in enumerate(samples, start=1):
+            expected_output = sample.get("expected_output", sample.get("target"))
             print(
                 f"      {idx}. prompt={sample['prompt']!r} "
                 f"prediction={sample['prediction']!r} "
-                f"target={sample['target']!r}"
+                f"expected_output={expected_output!r}"
             )
 
 

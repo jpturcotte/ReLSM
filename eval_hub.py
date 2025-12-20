@@ -257,11 +257,12 @@ def run_algorithmic_suite(
                     f"samples={len(res.sampled_examples)}"
                 )
                 for idx, sample in enumerate(res.sampled_examples, start=1):
+                    expected_output = sample.get("expected_output", sample.get("target"))
                     print(
                         "  "
                         f"{idx}. prompt={sample['prompt']!r} "
                         f"prediction={sample['prediction']!r} "
-                        f"target={sample['target']!r}"
+                        f"expected_output={expected_output!r}"
                     )
 
     payload = _algorithmic_results_to_dict(results)
