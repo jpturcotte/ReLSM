@@ -961,6 +961,11 @@ def train(args):
 
     diagnostic_modules = resolve_diagnostic_modules(model)
     diagnostic_blocks = get_transformer_blocks(model)
+    if diagnostic_modules.get("embedding") and diagnostic_modules.get("head"):
+        emb_params = {id(p) for p in diagnostic_modules["embedding"].parameters(recurse=True)}
+        head_params = {id(p) for p in diagnostic_modules["head"].parameters(recurse=True)}
+        if emb_params & head_params:
+            diagnostic_modules["head"] = None
     
     log_print(f"\nModel: {args.model_size} / {args.variant}")
     log_print(f"Parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
@@ -1258,6 +1263,7 @@ def train(args):
     running_inner_steps = 0.0
     running_ponder = 0.0
     last_grad_norm = float("nan")
+    flush_diagnostic_metrics: Optional[Dict[str, float]] = None
     
     try:
         while curriculum.tokens_seen < args.total_tokens:
@@ -1319,6 +1325,17 @@ def train(args):
             if (global_step + 1) % args.grad_accum_steps == 0:
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if (global_step + 1) % args.log_interval == 0:
+                    flush_diagnostic_metrics = {}
+                    for key, module in diagnostic_modules.items():
+                        if module is None:
+                            continue
+                        mod_grad_norm, mod_weight_norm = module_grad_weight_norm(module)
+                        flush_diagnostic_metrics[f"grad_norm.{key}"] = mod_grad_norm
+                        if not math.isnan(mod_grad_norm) and not math.isnan(mod_weight_norm):
+                            flush_diagnostic_metrics[f"grad_to_weight.{key}"] = (
+                                mod_grad_norm / (mod_weight_norm + 1e-12)
+                            )
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -1380,15 +1397,19 @@ def train(args):
 
                 # DIAGNOSTIC METRICS (cheap)
                 diagnostic_metrics: Dict[str, float] = {}
-                for key, module in diagnostic_modules.items():
-                    if module is None:
-                        continue
-                    grad_norm, module_weight_norm = module_grad_weight_norm(module)
-                    diagnostic_metrics[f"grad_norm.{key}"] = grad_norm
-                    if not math.isnan(grad_norm) and not math.isnan(module_weight_norm):
-                        diagnostic_metrics[f"grad_to_weight.{key}"] = grad_norm / (
-                            module_weight_norm + 1e-12
-                        )
+                if flush_diagnostic_metrics is not None:
+                    diagnostic_metrics.update(flush_diagnostic_metrics)
+                    flush_diagnostic_metrics = None
+                else:
+                    for key, module in diagnostic_modules.items():
+                        if module is None:
+                            continue
+                        mod_grad_norm, mod_weight_norm = module_grad_weight_norm(module)
+                        diagnostic_metrics[f"grad_norm.{key}"] = mod_grad_norm
+                        if not math.isnan(mod_grad_norm) and not math.isnan(mod_weight_norm):
+                            diagnostic_metrics[f"grad_to_weight.{key}"] = (
+                                mod_grad_norm / (mod_weight_norm + 1e-12)
+                            )
 
                 if math.isnan(last_grad_norm):
                     diagnostic_metrics["grad_clipped"] = float("nan")

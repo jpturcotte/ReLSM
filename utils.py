@@ -150,18 +150,20 @@ def resolve_diagnostic_modules(model: nn.Module) -> Dict[str, Optional[nn.Module
 def module_grad_weight_norm(module: Optional[nn.Module]) -> Tuple[float, float]:
     if module is None:
         return float("nan"), float("nan")
-    grad_sq = 0.0
-    weight_sq = 0.0
-    has_weight = False
+    params = list(module.parameters(recurse=True))
+    if not params:
+        return float("nan"), float("nan")
+    device = params[0].device
+    weight_sq = torch.zeros((), dtype=torch.float64, device=device)
+    grad_sq = torch.zeros((), dtype=torch.float64, device=device)
     has_grad = False
-    for param in module.parameters(recurse=True):
-        has_weight = True
-        weight_sq += param.detach().float().pow(2).sum().item()
+    for param in params:
+        weight_sq += param.detach().double().pow(2).sum()
         if param.grad is not None:
             has_grad = True
-            grad_sq += param.grad.detach().float().pow(2).sum().item()
-    weight_norm = math.sqrt(weight_sq) if has_weight else float("nan")
-    grad_norm = math.sqrt(grad_sq) if has_grad else float("nan")
+            grad_sq += param.grad.detach().double().pow(2).sum()
+    weight_norm = math.sqrt(weight_sq.item())
+    grad_norm = math.sqrt(grad_sq.item()) if has_grad else float("nan")
     return grad_norm, weight_norm
 
 
