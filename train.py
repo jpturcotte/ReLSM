@@ -451,9 +451,7 @@ def run_eval_diagnostics(
 
     for label in ("early", "mid", "late"):
         ff_out = ff_outputs.get(label)
-        if ff_out is None:
-            metrics[f"act_sparsity.ff.{label}"] = float("nan")
-        else:
+        if ff_out is not None:
             metrics[f"act_sparsity.ff.{label}"] = (
                 (ff_out.abs() < 1e-4).float().mean().item()
             )
@@ -488,15 +486,12 @@ def run_eval_diagnostics(
             mean_by_head = entropy.mean(dim=1)
             metrics["attn_entropy_last_mean"] = mean_by_head.mean().item()
             metrics["attn_entropy_last_std"] = mean_by_head.std(unbiased=False).item()
-        else:
-            metrics["attn_entropy_last_mean"] = float("nan")
-            metrics["attn_entropy_last_std"] = float("nan")
-    else:
-        metrics["attn_entropy_last_mean"] = float("nan")
-        metrics["attn_entropy_last_std"] = float("nan")
 
-    metrics["weight_entropy.last_block"] = compute_weight_entropy(last_block)
-    metrics["weight_entropy.head"] = compute_weight_entropy(diagnostic_modules.get("head"))
+    if last_block is not None:
+        metrics["weight_entropy.last_block"] = compute_weight_entropy(last_block)
+    head_module = diagnostic_modules.get("head")
+    if head_module is not None:
+        metrics["weight_entropy.head"] = compute_weight_entropy(head_module)
 
     if was_training:
         model.train()
@@ -787,7 +782,13 @@ def _print_sampled_examples(label: str, samples_by_task: Dict[str, List[Dict[str
             )
 
 
-def build_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> torch.optim.Optimizer:
+def build_optimizer(
+    model: torch.nn.Module,
+    lr: float,
+    weight_decay: float,
+    *,
+    extended_logging: bool = False,
+) -> torch.optim.Optimizer:
     """Create AdamW optimizer with decay and no-decay parameter groups."""
 
     decay_params = []
@@ -827,7 +828,8 @@ def build_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> t
 
     n_decay = sum(p.numel() for p in decay_params)
     n_no_decay = sum(p.numel() for p in no_decay_params)
-    print(f"[optimizer] decay params: {n_decay:,}, no_decay params: {n_no_decay:,}")
+    if extended_logging:
+        print(f"[optimizer] decay params: {n_decay:,}, no_decay params: {n_no_decay:,}")
 
     return torch.optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.95))
 
@@ -873,7 +875,8 @@ def train(args):
     # =========================================================================
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    log_print = print if args.extended_logging else (lambda *args, **kwargs: None)
+    log_print(f"Device: {device}")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -884,8 +887,8 @@ def train(args):
         torch.backends.cudnn.benchmark = False
 
     if device.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name()}")
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        log_print(f"GPU: {torch.cuda.get_device_name()}")
+        log_print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -933,7 +936,7 @@ def train(args):
 
     # Optimize model execution
     if args.compile and hasattr(torch, "compile"):
-        print("Compiling model with torch.compile...")
+        log_print("Compiling model with torch.compile...")
         # 'reduce-overhead' is excellent for smaller models or CPU training
         # If this errors on your setup, try mode="default"
         model = torch.compile(model, mode="reduce-overhead")
@@ -943,8 +946,8 @@ def train(args):
     diagnostic_modules = resolve_diagnostic_modules(model)
     diagnostic_blocks = get_transformer_blocks(model)
     
-    print(f"\nModel: {args.model_size} / {args.variant}")
-    print(f"Parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
+    log_print(f"\nModel: {args.model_size} / {args.variant}")
+    log_print(f"Parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
     
     # =========================================================================
     # DATA
@@ -959,7 +962,7 @@ def train(args):
         create_curriculum_loaders,
     )
     
-    print("\nLoading datasets...")
+    log_print("\nLoading datasets...")
 
     if not args.fixed_data and args.difficulty_schedule in {"linear", "phased", "fixed"}:
         difficulty_value = Value("d", 0.0)
@@ -974,7 +977,7 @@ def train(args):
             raise ValueError(
                 f"Invalid alg_tasks {invalid}; choose from {sorted(available_tasks)}"
             )
-        print(f"Restricting algorithmic tasks to: {', '.join(alg_tasks)}")
+        log_print(f"Restricting algorithmic tasks to: {', '.join(alg_tasks)}")
 
     # Phase 1: Algorithmic
     if args.fixed_data:
@@ -1123,7 +1126,12 @@ def train(args):
     # OPTIMIZER
     # =========================================================================
 
-    optimizer = build_optimizer(model, lr=args.max_lr, weight_decay=args.weight_decay)
+    optimizer = build_optimizer(
+        model,
+        lr=args.max_lr,
+        weight_decay=args.weight_decay,
+        extended_logging=args.extended_logging,
+    )
 
     # Mixed precision
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -1140,24 +1148,24 @@ def train(args):
     # TRAINING LOOP
     # =========================================================================
     
-    print(f"\nTraining config:")
-    print(f"  Phase 1 (algorithmic): {args.alg_tokens/1e6:.1f}M tokens")
-    print(f"  Phase 2 (language): {(args.total_tokens - args.alg_tokens)/1e6:.1f}M tokens")
-    print(f"  Total: {args.total_tokens/1e6:.1f}M tokens")
-    print(f"  Mix band: {args.mix_band_tokens/1e6:.2f}M tokens")
-    print(f"  Persistent alg frac: {args.persistent_alg_frac:.2f}")
-    print(f"  Lexical frac (phase1): {args.lexical_frac_phase1:.2f}")
-    print(f"  Variant: {args.variant}")
-    print(
+    log_print(f"\nTraining config:")
+    log_print(f"  Phase 1 (algorithmic): {args.alg_tokens/1e6:.1f}M tokens")
+    log_print(f"  Phase 2 (language): {(args.total_tokens - args.alg_tokens)/1e6:.1f}M tokens")
+    log_print(f"  Total: {args.total_tokens/1e6:.1f}M tokens")
+    log_print(f"  Mix band: {args.mix_band_tokens/1e6:.2f}M tokens")
+    log_print(f"  Persistent alg frac: {args.persistent_alg_frac:.2f}")
+    log_print(f"  Lexical frac (phase1): {args.lexical_frac_phase1:.2f}")
+    log_print(f"  Variant: {args.variant}")
+    log_print(
         f"  Fixed data: {args.fixed_data}" +
         (f" ({args.fixed_data_size} examples)" if args.fixed_data else "")
     )
-    print(
+    log_print(
         f"  Grokfast: {args.grokfast}" +
         (f" (α={args.grokfast_alpha}, λ={args.grokfast_lambda})" if args.grokfast else "")
     )
-    print(f"  Weight decay: {args.weight_decay}")
-    print(
+    log_print(f"  Weight decay: {args.weight_decay}")
+    log_print(
         f"  Train eval: {train_eval_mode}"
         + (f" ({args.train_eval_samples} samples)" if train_eval_mode != "none" else "")
     )
@@ -1207,7 +1215,7 @@ def train(args):
         # estimate above.
         warmup_tokens = int(warmup_steps * estimated_tokens_per_step)
         if warmup_tokens > 0.05 * args.total_tokens:
-            print(
+            log_print(
                 f"WARNING: warmup_steps={warmup_steps} is "
                 f"{warmup_tokens/args.total_tokens:.1%} of training. Consider reducing."
             )
@@ -1219,13 +1227,13 @@ def train(args):
     warmup_tokens = min(max(warmup_tokens, 1), args.total_tokens)
     warmup_display = f"{warmup_tokens} tokens ({warmup_source})"
 
-    print(
+    log_print(
         f"  Estimated steps (Hybrid calc: Algo ~{algo_steps} + Lang ~{lang_steps}): {estimated_steps}"
     )
-    print(f"  Warmup: {warmup_display}")
-    print("\n" + "="*60)
-    print("Starting training...")
-    print("="*60 + "\n")
+    log_print(f"  Warmup: {warmup_display}")
+    log_print("\n" + "="*60)
+    log_print("Starting training...")
+    log_print("="*60 + "\n")
     
     model.train()
     optimizer.zero_grad()
@@ -1321,15 +1329,7 @@ def train(args):
                     )
                 effective_wd_pressure = args.weight_decay * weight_norm
 
-                print(f"Step {global_step:>6} | "
-                      f"Phase: {phase[:4]:>4} | "
-                      f"Progress: {progress:>5.1f}% | "
-                      f"Loss: {avg_loss:.4f} | "
-                      f"LR: {lr:.2e} | "
-                      f"Tok/s: {toks_per_sec:.0f} | "
-                      f"VRAM: {peak_vram:.1f}GB" +
-                      (f" | K: {avg_K:.1f}" if avg_K > 0 else "") +
-                      (f" | ponder: {avg_ponder:.3f}" if avg_ponder > 0 else ""))
+                print(f"Loss: {avg_loss:.4f} | LR: {lr:.2e}")
 
                 difficulty_logged = (
                     float(difficulty_value.value)
@@ -1339,29 +1339,37 @@ def train(args):
                     )
                 )
 
-                print(f"  Difficulty: {difficulty_logged:.3f} (easy_mix: {args.easy_mix_frac})")
-                expected_lr = get_lr(
-                    tokens_seen,
-                    warmup_tokens,
-                    args.total_tokens,
-                    args.max_lr,
-                    args.min_lr,
-                    schedule=args.lr_schedule,
-                )
-                print(f"  LR: {expected_lr:.2e} (schedule: {args.lr_schedule})")
-                print(f"  Grad norm: {last_grad_norm:.1f}")
-                print(f"  Weight norm: {weight_norm:.1f}")
-                if args.weight_decay != 0.0:
-                    print(f"  WD pressure: {effective_wd_pressure:.1f}")
+                if args.extended_logging:
+                    log_print(f"Step {global_step:>6} | "
+                              f"Phase: {phase[:4]:>4} | "
+                              f"Progress: {progress:>5.1f}% | "
+                              f"Tok/s: {toks_per_sec:.0f} | "
+                              f"VRAM: {peak_vram:.1f}GB" +
+                              (f" | K: {avg_K:.1f}" if avg_K > 0 else "") +
+                              (f" | ponder: {avg_ponder:.3f}" if avg_ponder > 0 else ""))
+                    log_print(f"  Difficulty: {difficulty_logged:.3f} (easy_mix: {args.easy_mix_frac})")
+                    expected_lr = get_lr(
+                        tokens_seen,
+                        warmup_tokens,
+                        args.total_tokens,
+                        args.max_lr,
+                        args.min_lr,
+                        schedule=args.lr_schedule,
+                    )
+                    log_print(f"  LR: {expected_lr:.2e} (schedule: {args.lr_schedule})")
+                    log_print(f"  Grad norm: {last_grad_norm:.1f}")
+                    log_print(f"  Weight norm: {weight_norm:.1f}")
+                    if args.weight_decay != 0.0:
+                        log_print(f"  WD pressure: {effective_wd_pressure:.1f}")
 
                 # DIAGNOSTIC METRICS (cheap)
                 diagnostic_metrics: Dict[str, float] = {}
                 for key, module in diagnostic_modules.items():
+                    if module is None:
+                        continue
                     grad_norm, module_weight_norm = module_grad_weight_norm(module)
                     diagnostic_metrics[f"grad_norm.{key}"] = grad_norm
-                    if math.isnan(grad_norm) or math.isnan(module_weight_norm):
-                        diagnostic_metrics[f"grad_to_weight.{key}"] = float("nan")
-                    else:
+                    if not math.isnan(grad_norm) and not math.isnan(module_weight_norm):
                         diagnostic_metrics[f"grad_to_weight.{key}"] = grad_norm / (
                             module_weight_norm + 1e-12
                         )
@@ -1397,7 +1405,8 @@ def train(args):
             
             # Evaluation
             if global_step % args.eval_interval == 0:
-                print("\nRunning evaluation...")
+                if args.extended_logging:
+                    log_print("\nRunning evaluation...")
                 difficulty_logged = (
                     float(difficulty_value.value)
                     if difficulty_value is not None
@@ -1405,16 +1414,18 @@ def train(args):
                         curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
                     )
                 )
-                print(f"  Eval difficulty: {difficulty_logged:.3f}")
+                if args.extended_logging:
+                    log_print(f"  Eval difficulty: {difficulty_logged:.3f}")
                 with torch.no_grad():
                     weight_norm = math.sqrt(
                         sum((param.detach().float() ** 2).sum().item() for param in model.parameters())
                     )
                 effective_wd_pressure = args.weight_decay * weight_norm
-                print(f"  Grad norm: {last_grad_norm:.1f}")
-                print(f"  Weight norm: {weight_norm:.1f}")
-                if args.weight_decay != 0.0:
-                    print(f"  WD pressure: {effective_wd_pressure:.1f}")
+                if args.extended_logging:
+                    log_print(f"  Grad norm: {last_grad_norm:.1f}")
+                    log_print(f"  Weight norm: {weight_norm:.1f}")
+                    if args.weight_decay != 0.0:
+                        log_print(f"  WD pressure: {effective_wd_pressure:.1f}")
 
                 # DIAGNOSTIC METRICS (eval-only)
                 eval_diagnostic_metrics = run_eval_diagnostics(
@@ -1446,20 +1457,21 @@ def train(args):
                     overall_token_accuracy = alg_results.get("overall_token_accuracy", 0.0)
                     overall_distance = alg_results.get("overall_distance", 1.0)
                     overall_prefix_accuracy = alg_results.get("overall_prefix_accuracy", 0.0)
-                    print(
-                        "  Algorithmic metrics: "
-                        f"acc={overall_acc*100:.1f}% | "
-                        f"token={overall_token_accuracy:.3f} | "
-                        f"dist={overall_distance:.3f} | "
-                        f"prefix={overall_prefix_accuracy:.3f}"
-                    )
-                    if overall_mae is not None:
-                        print(f"  Algorithmic MAE (numeric tasks): {overall_mae:.3f}")
+                    if args.extended_logging:
+                        log_print(
+                            "  Algorithmic metrics: "
+                            f"acc={overall_acc*100:.1f}% | "
+                            f"token={overall_token_accuracy:.3f} | "
+                            f"dist={overall_distance:.3f} | "
+                            f"prefix={overall_prefix_accuracy:.3f}"
+                        )
+                        if overall_mae is not None:
+                            log_print(f"  Algorithmic MAE (numeric tasks): {overall_mae:.3f}")
 
-                    _print_sampled_examples(
-                        "Algorithmic eval",
-                        alg_results.get("sampled_examples_by_task", {}),
-                    )
+                        _print_sampled_examples(
+                            "Algorithmic eval",
+                            alg_results.get("sampled_examples_by_task", {}),
+                        )
 
                     logger.log(
                         step=global_step,
@@ -1494,15 +1506,16 @@ def train(args):
                         token_acc = per_task_token_accuracy.get(task, 0.0)
                         distance = per_task_distance.get(task, 1.0)
                         prefix_acc = per_task_prefix_accuracy.get(task, 0.0)
-                        line = (
-                            f"    {task}: {acc*100:.1f}%"
-                            f" | token={token_acc:.3f}"
-                            f" | dist={distance:.3f}"
-                            f" | prefix={prefix_acc:.3f}"
-                        )
-                        if task_mae is not None:
-                            line += f" | MAE: {task_mae:.3f}"
-                        print(line)
+                        if args.extended_logging:
+                            line = (
+                                f"    {task}: {acc*100:.1f}%"
+                                f" | token={token_acc:.3f}"
+                                f" | dist={distance:.3f}"
+                                f" | prefix={prefix_acc:.3f}"
+                            )
+                            if task_mae is not None:
+                                line += f" | MAE: {task_mae:.3f}"
+                            log_print(line)
 
                     # Track best
                     if overall_acc > best_alg_acc:
@@ -1513,7 +1526,8 @@ def train(args):
                             "step": global_step,
                             "alg_accuracy": best_alg_acc,
                         }, output_dir / "best_model.pt")
-                        print(f"  New best! Saved checkpoint.")
+                        if args.extended_logging:
+                            log_print(f"  New best! Saved checkpoint.")
 
                 # Training data accuracy (memorization tracking)
                 if train_eval_loader is not None:
@@ -1540,18 +1554,19 @@ def train(args):
                     )
                     overall_task_acc = task_eval.get("overall_accuracy", 0.0)
                     overall_task_mae = task_eval.get("overall_mae")
-                    print(
-                        f"  Training accuracy ({train_eval_label}): {train_acc*100:.2f}% | "
-                        f"Loss: {train_loss_eval:.4f}"
-                    )
-                    print(f"  Training task accuracy: {overall_task_acc*100:.1f}%")
-                    if overall_task_mae is not None:
-                        print(f"  Training task MAE (numeric tasks): {overall_task_mae:.3f}")
+                    if args.extended_logging:
+                        log_print(
+                            f"  Training accuracy ({train_eval_label}): {train_acc*100:.2f}% | "
+                            f"Loss: {train_loss_eval:.4f}"
+                        )
+                        log_print(f"  Training task accuracy: {overall_task_acc*100:.1f}%")
+                        if overall_task_mae is not None:
+                            log_print(f"  Training task MAE (numeric tasks): {overall_task_mae:.3f}")
 
-                    _print_sampled_examples(
-                        "Training eval",
-                        task_eval.get("sampled_examples_by_task", {}),
-                    )
+                        _print_sampled_examples(
+                            "Training eval",
+                            task_eval.get("sampled_examples_by_task", {}),
+                        )
 
                     logger.log(
                         step=global_step,
@@ -1584,34 +1599,37 @@ def train(args):
                             mean_distance=per_task_distance.get(task),
                             mean_prefix_accuracy=per_task_prefix_accuracy.get(task),
                         )
-                        line = f"    {task}: {acc*100:.1f}%"
-                        if task_mae is not None:
-                            line += f" | MAE: {task_mae:.3f}"
-                        print(line)
+                        if args.extended_logging:
+                            line = f"    {task}: {acc*100:.1f}%"
+                            if task_mae is not None:
+                                line += f" | MAE: {task_mae:.3f}"
+                            log_print(line)
 
                 # Perplexity (only in Phase 2)
                 if curriculum.phase == "language":
                     ppl = evaluate_perplexity(model, lang_loader, device, ctx)
-                    print(f"  Language PPL: {ppl:.2f}")
+                    if args.extended_logging:
+                        log_print(f"  Language PPL: {ppl:.2f}")
                     logger.log(step=global_step, phase="eval", val_loss=math.log(ppl))
 
                 logger.plot()
                 logger.save()
 
                 checkpoint_path = save_rotating_checkpoint(global_step, tokens_seen)
-                if checkpoint_path is not None:
-                    print(
+                if checkpoint_path is not None and args.extended_logging:
+                    log_print(
                         f"  Saved checkpoint: {checkpoint_path.name} "
                         f"(keeping last {args.eval_checkpoints})"
                     )
 
-                print()
+                if args.extended_logging:
+                    log_print()
                 model.train()
     except KeyboardInterrupt:
-        print("\nKeyboard interrupt detected. Saving checkpoint before exit.")
+        log_print("\nKeyboard interrupt detected. Saving checkpoint before exit.")
         interrupt_checkpoint = save_rotating_checkpoint(global_step, tokens_seen, tag="interrupt")
         if interrupt_checkpoint is not None:
-            print(
+            log_print(
                 f"  Saved checkpoint: {interrupt_checkpoint.name} "
                 f"(keeping last {args.eval_checkpoints})"
             )
@@ -1642,13 +1660,13 @@ def train(args):
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
     
-    print("\n" + "="*60)
-    print("Training complete!")
-    print(f"  Total time: {total_time/3600:.2f} hours")
-    print(f"  Tokens seen: {tokens_seen/1e9:.2f}B")
-    print(f"  Best algorithmic accuracy: {best_alg_acc*100:.1f}%")
-    print(f"  Output: {output_dir}")
-    print("="*60)
+    log_print("\n" + "="*60)
+    log_print("Training complete!")
+    log_print(f"  Total time: {total_time/3600:.2f} hours")
+    log_print(f"  Tokens seen: {tokens_seen/1e9:.2f}B")
+    log_print(f"  Best algorithmic accuracy: {best_alg_acc*100:.1f}%")
+    log_print(f"  Output: {output_dir}")
+    log_print("="*60)
     
     return model
 
@@ -1851,6 +1869,11 @@ def main():
         type=int,
         default=5,
         help="Number of sampled eval prompts to log per task",
+    )
+    parser.add_argument(
+        "--extended_logging",
+        action="store_true",
+        help="Print extended metrics beyond loss/LR to the console.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (recommended for Linux only)")

@@ -121,7 +121,12 @@ def get_transformer_blocks(model: nn.Module) -> List[nn.Module]:
     for name in candidates:
         blocks = getattr(model, name, None)
         if isinstance(blocks, (nn.ModuleList, list, tuple)) and len(blocks) > 0:
-            return list(blocks)
+            filtered = [
+                block
+                for block in blocks
+                if isinstance(block, nn.Module) and hasattr(block, "attn") and hasattr(block, "ff")
+            ]
+            return filtered
     return []
 
 
@@ -131,9 +136,6 @@ def resolve_diagnostic_modules(model: nn.Module) -> Dict[str, Optional[nn.Module
         "embedding": _find_first_module(
             model, ("tok_emb", "token_embedding", "embedding", "embed_tokens", "wte")
         ),
-        "block0": None,
-        "block_mid": None,
-        "block_last": None,
         "head": _find_first_module(model, ("lm_head", "head", "output_head", "output_proj", "proj")),
     }
 
