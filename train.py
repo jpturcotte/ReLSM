@@ -45,9 +45,14 @@ from torch.utils.data import DataLoader, Subset
 from utils import (
     DEFAULT_TOKENIZER_NAME,
     aggregate,
+    compute_attention_probs,
+    compute_weight_entropy,
     compute_metrics,
+    get_transformer_blocks,
+    module_grad_weight_norm,
     normalize_prediction,
     normalize_target,
+    resolve_diagnostic_modules,
     safe_parse_number,
 )
 
@@ -382,6 +387,121 @@ def evaluate_training_split(
     avg_loss = total_loss / denom
     accuracy = total_correct / denom
     return {"loss": avg_loss, "accuracy": accuracy}
+
+
+@torch.no_grad()
+def run_eval_diagnostics(
+    model: nn.Module,
+    probe_batch: Dict[str, torch.Tensor],
+    device: torch.device,
+    ctx,
+    diagnostic_blocks: Sequence[nn.Module],
+    diagnostic_modules: Dict[str, Optional[nn.Module]],
+    probe_seed: int,
+) -> Dict[str, float]:
+    """DIAGNOSTIC METRICS (eval-only): inexpensive probe batch diagnostics."""
+
+    metrics: Dict[str, float] = {}
+    if not probe_batch:
+        return metrics
+
+    was_training = model.training
+    model.eval()
+
+    input_ids = probe_batch["input_ids"].to(device)
+    labels = probe_batch.get("labels")
+    if labels is not None:
+        labels = labels.to(device)
+
+    ff_outputs: Dict[str, torch.Tensor] = {}
+    last_block_input: Dict[str, torch.Tensor] = {}
+    hooks = []
+
+    def _make_ff_hook(label: str):
+        def _hook(_module, _inputs, output):
+            ff_outputs[label] = output.detach()
+        return _hook
+
+    def _capture_block_input(_module, inputs, _output):
+        if inputs:
+            last_block_input["x"] = inputs[0].detach()
+        if len(inputs) > 4 and inputs[4] is not None:
+            last_block_input["position_ids"] = inputs[4].detach()
+
+    if diagnostic_blocks:
+        indices = {
+            "early": 0,
+            "mid": len(diagnostic_blocks) // 2,
+            "late": len(diagnostic_blocks) - 1,
+        }
+        for label, idx in indices.items():
+            block = diagnostic_blocks[idx]
+            ff_module = getattr(block, "ff", None)
+            if isinstance(ff_module, nn.Module):
+                hooks.append(ff_module.register_forward_hook(_make_ff_hook(label)))
+
+        last_block = diagnostic_blocks[-1]
+        hooks.append(last_block.register_forward_hook(_capture_block_input))
+
+    with ctx:
+        model(input_ids, labels=labels)
+
+    for hook in hooks:
+        hook.remove()
+
+    for label in ("early", "mid", "late"):
+        ff_out = ff_outputs.get(label)
+        if ff_out is None:
+            metrics[f"act_sparsity.ff.{label}"] = float("nan")
+        else:
+            metrics[f"act_sparsity.ff.{label}"] = (
+                (ff_out.abs() < 1e-4).float().mean().item()
+            )
+
+    last_block = diagnostic_blocks[-1] if diagnostic_blocks else None
+    attn_module = getattr(last_block, "attn", None) if last_block is not None else None
+    if attn_module is not None and "x" in last_block_input:
+        attn_input = last_block.attn_norm(last_block_input["x"])
+        probs = compute_attention_probs(
+            attn_module,
+            attn_input,
+            position_ids=last_block_input.get("position_ids"),
+        )
+        B, H, T, _ = probs.shape
+        total_positions = B * T
+        if total_positions > 0:
+            gen = torch.Generator(device=probs.device)
+            gen.manual_seed(probe_seed)
+            num_samples = min(32, total_positions)
+            indices = torch.randint(
+                0,
+                total_positions,
+                (H, num_samples),
+                generator=gen,
+                device=probs.device,
+            )
+            batch_ids = indices // T
+            pos_ids = indices % T
+            head_ids = torch.arange(H, device=probs.device).unsqueeze(1).expand(H, num_samples)
+            selected = probs[batch_ids, head_ids, pos_ids, :]
+            entropy = -(selected * (selected + 1e-12).log()).sum(dim=-1)
+            mean_by_head = entropy.mean(dim=1)
+            metrics["attn_entropy_last_mean"] = mean_by_head.mean().item()
+            metrics["attn_entropy_last_std"] = mean_by_head.std(unbiased=False).item()
+        else:
+            metrics["attn_entropy_last_mean"] = float("nan")
+            metrics["attn_entropy_last_std"] = float("nan")
+    else:
+        metrics["attn_entropy_last_mean"] = float("nan")
+        metrics["attn_entropy_last_std"] = float("nan")
+
+    metrics["weight_entropy.last_block"] = compute_weight_entropy(last_block)
+    metrics["weight_entropy.head"] = compute_weight_entropy(diagnostic_modules.get("head"))
+
+    if was_training:
+        model.train()
+
+    return metrics
 
 
 NUMERIC_TASKS = {"mod_add", "addition", "multiplication", "chain", "successor", "parity"}
@@ -819,6 +939,9 @@ def train(args):
         model = torch.compile(model, mode="reduce-overhead")
 
     config = model.config
+
+    diagnostic_modules = resolve_diagnostic_modules(model)
+    diagnostic_blocks = get_transformer_blocks(model)
     
     print(f"\nModel: {args.model_size} / {args.variant}")
     print(f"Parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
@@ -959,6 +1082,29 @@ def train(args):
             num_workers=args.num_workers,
             pin_memory=True,
         )
+
+    # Fixed probe batch for eval-only diagnostics
+    probe_seed = args.seed + 4242
+    probe_batch = None
+    probe_dataset = FixedAlgorithmicDataset(
+        tokenizer=tokenizer,
+        num_examples=args.alg_batch_size,
+        max_seq_len=args.alg_seq_len,
+        tasks=alg_tasks,
+        seed=probe_seed,
+        difficulty=0.5,
+        difficulty_schedule=args.difficulty_schedule,
+        task_weighting=args.task_weighting,
+        easy_mix_frac=args.easy_mix_frac,
+    )
+    probe_loader = DataLoader(
+        probe_dataset,
+        batch_size=args.alg_batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+    )
+    probe_batch = next(iter(probe_loader))
     
     # Curriculum sampler
     curriculum = CurriculumSampler(
@@ -1087,6 +1233,7 @@ def train(args):
     running_loss = 0.0
     running_inner_steps = 0.0
     running_ponder = 0.0
+    last_grad_norm = float("nan")
     
     try:
         while curriculum.tokens_seen < args.total_tokens:
@@ -1207,6 +1354,28 @@ def train(args):
                 if args.weight_decay != 0.0:
                     print(f"  WD pressure: {effective_wd_pressure:.1f}")
 
+                # DIAGNOSTIC METRICS (cheap)
+                diagnostic_metrics: Dict[str, float] = {}
+                for key, module in diagnostic_modules.items():
+                    grad_norm, module_weight_norm = module_grad_weight_norm(module)
+                    diagnostic_metrics[f"grad_norm.{key}"] = grad_norm
+                    if math.isnan(grad_norm) or math.isnan(module_weight_norm):
+                        diagnostic_metrics[f"grad_to_weight.{key}"] = float("nan")
+                    else:
+                        diagnostic_metrics[f"grad_to_weight.{key}"] = grad_norm / (
+                            module_weight_norm + 1e-12
+                        )
+
+                if math.isnan(last_grad_norm):
+                    diagnostic_metrics["grad_clipped"] = float("nan")
+                    diagnostic_metrics["grad_clip_frac"] = float("nan")
+                else:
+                    grad_clipped = 1.0 if last_grad_norm > args.grad_clip else 0.0
+                    diagnostic_metrics["grad_clipped"] = grad_clipped
+                    diagnostic_metrics["grad_clip_frac"] = (
+                        args.grad_clip / (last_grad_norm + 1e-12) if grad_clipped else 1.0
+                    )
+
                 logger.log(
                     step=global_step,
                     phase=phase,
@@ -1219,6 +1388,7 @@ def train(args):
                     difficulty=difficulty_logged,
                     grad_norm=last_grad_norm,
                     weight_norm=weight_norm,
+                    **diagnostic_metrics,
                 )
 
                 running_loss = 0.0
@@ -1245,6 +1415,19 @@ def train(args):
                 print(f"  Weight norm: {weight_norm:.1f}")
                 if args.weight_decay != 0.0:
                     print(f"  WD pressure: {effective_wd_pressure:.1f}")
+
+                # DIAGNOSTIC METRICS (eval-only)
+                eval_diagnostic_metrics = run_eval_diagnostics(
+                    model=model,
+                    probe_batch=probe_batch,
+                    device=device,
+                    ctx=ctx,
+                    diagnostic_blocks=diagnostic_blocks,
+                    diagnostic_modules=diagnostic_modules,
+                    probe_seed=probe_seed,
+                )
+                if eval_diagnostic_metrics:
+                    logger.log(step=global_step, phase="eval", **eval_diagnostic_metrics)
 
                 # Algorithmic accuracy (OOD grid)
                 if args.eval_algorithmic:
