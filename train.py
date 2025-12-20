@@ -48,17 +48,56 @@ from utils import (
     compute_metrics,
     normalize_prediction,
     normalize_target,
+    safe_parse_number,
 )
 
 plt.switch_backend("Agg")
 
-def get_lr(progress: int, warmup_progress: int, max_progress: int, max_lr: float, min_lr: float) -> float:
-    """Cosine schedule with warmup based on generic progress units (e.g., tokens)."""
-    current_progress = min(progress, max_progress)
-    if progress < warmup_progress:
-        return max_lr * (progress + 1) / max(1, warmup_progress)
-    progress_frac = (current_progress - warmup_progress) / max(1, max_progress - warmup_progress)
-    return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress_frac))
+def get_lr(
+    tokens_seen: int,
+    warmup_tokens: int,
+    total_tokens: int,
+    max_lr: float,
+    min_lr: float,
+    schedule: str = "cosine",
+) -> float:
+    """
+    Learning rate schedule with multiple options.
+
+    Schedules:
+      - cosine: Original cosine decay (aggressive, loses capacity fast)
+      - wsd: Warmup-Stable-Decay (hold at max 40%, then linear decay)
+      - plateau: Hold at max 40%, then cosine decay
+      - constant: No decay after warmup (for debugging)
+    """
+    progress = min(tokens_seen / max(total_tokens, 1), 1.0)
+    warmup_frac = warmup_tokens / max(total_tokens, 1)
+
+    if progress < warmup_frac:
+        return max_lr * (progress / warmup_frac)
+
+    if schedule == "cosine":
+        decay_progress = (progress - warmup_frac) / (1 - warmup_frac)
+        return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * decay_progress))
+
+    if schedule == "wsd":
+        stable_end = 0.4
+        if progress < stable_end:
+            return max_lr
+        decay_progress = (progress - stable_end) / (1 - stable_end)
+        return max_lr - (max_lr - min_lr) * min(decay_progress, 1.0)
+
+    if schedule == "plateau":
+        plateau_end = 0.4
+        if progress < plateau_end:
+            return max_lr
+        decay_progress = (progress - plateau_end) / (1 - plateau_end)
+        return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * decay_progress))
+
+    if schedule == "constant":
+        return max_lr
+
+    raise ValueError(f"Unknown LR schedule: {schedule}")
 
 
 class MetricsLogger:
@@ -411,6 +450,9 @@ def _evaluate_numeric_answer(
     device,
     ctx,
 ) -> Optional[bool]:
+    target_val = safe_parse_number(target)
+    if math.isnan(target_val):
+        return None
     prompt_ids = tokenizer(prompt, return_tensors="pt", truncation=True)["input_ids"].to(device)
     target_ids = tokenizer(target, add_special_tokens=False)["input_ids"]
     if not target_ids:
@@ -527,12 +569,9 @@ def evaluate_task_accuracy(
             )
             if pred_norm is not None:
                 target_norm = normalize_target(task, target)
-                try:
-                    pred_val = float(pred_norm)
-                    target_val = float(target_norm)
-                except ValueError:
-                    pass
-                else:
+                pred_val = safe_parse_number(pred_norm)
+                target_val = safe_parse_number(target_norm)
+                if not (math.isnan(pred_val) or math.isnan(target_val)):
                     abs_error = abs(pred_val - target_val)
                     total_abs_error += abs_error
                     total_numeric += 1
@@ -684,6 +723,24 @@ def difficulty_schedule(tokens_seen: int, alg_tokens: int, schedule: str = "line
         return progress
     if schedule == "fixed":
         return 0.5
+    if schedule == "smooth":
+        boundaries = [0.15, 0.35, 0.60]
+        target_difficulties = [0.25, 0.45, 0.70, 1.0]
+        result = target_difficulties[0]
+        for i, boundary in enumerate(boundaries):
+            transition_width = 0.05
+            blend = 1.0 / (1.0 + math.exp(-(progress - boundary) / (transition_width / 4)))
+            result = result * (1 - blend) + target_difficulties[i + 1] * blend
+        return result
+    if schedule == "warmup_ramp":
+        warmup_frac = 0.1
+        hold_frac = 0.2
+        if progress < warmup_frac:
+            return 0.175
+        if progress < warmup_frac + hold_frac:
+            return 0.3
+        ramp_progress = (progress - warmup_frac - hold_frac) / (1 - warmup_frac - hold_frac)
+        return 0.3 + 0.7 * ramp_progress
 
     raise ValueError(f"Unknown difficulty schedule: {schedule}")
 
@@ -781,7 +838,10 @@ def train(args):
     
     print("\nLoading datasets...")
 
-    difficulty_value = Value("d", 0.0) if not args.fixed_data else None
+    if not args.fixed_data and args.difficulty_schedule in {"linear", "phased", "fixed"}:
+        difficulty_value = Value("d", 0.0)
+    else:
+        difficulty_value = None
 
     available_tasks = set(AlgorithmicGenerator._get_generators().keys())
     alg_tasks = list(args.alg_tasks) if args.alg_tasks is not None else None
@@ -804,6 +864,7 @@ def train(args):
             difficulty=0.5,
             difficulty_schedule=args.difficulty_schedule,
             task_weighting=args.task_weighting,
+            easy_mix_frac=args.easy_mix_frac,
         )
         alg_loader = DataLoader(
             alg_dataset,
@@ -823,6 +884,7 @@ def train(args):
             difficulty_schedule=args.difficulty_schedule,
             task_weighting=args.task_weighting,
             total_tokens=args.alg_tokens,
+            easy_mix_frac=args.easy_mix_frac,
         )
         alg_loader = DataLoader(
             alg_dataset,
@@ -871,6 +933,7 @@ def train(args):
                 difficulty=0.5,
                 difficulty_schedule=args.difficulty_schedule,
                 task_weighting=args.task_weighting,
+                easy_mix_frac=args.easy_mix_frac,
             )
             if args.train_eval_samples is not None:
                 capped = min(args.train_eval_samples, len(base_dataset))
@@ -886,6 +949,7 @@ def train(args):
                 difficulty_schedule=args.difficulty_schedule,
                 task_weighting=args.task_weighting,
                 total_tokens=args.alg_tokens,
+                easy_mix_frac=args.easy_mix_frac,
             )
 
         train_eval_loader = DataLoader(
@@ -1039,7 +1103,14 @@ def train(args):
             tokens_seen = curriculum.tokens_seen
             
             # Learning rate (token-based decay to align with actual budget consumption)
-            lr = get_lr(tokens_seen, warmup_tokens, args.total_tokens, args.max_lr, args.min_lr)
+            lr = get_lr(
+                tokens_seen,
+                warmup_tokens,
+                args.total_tokens,
+                args.max_lr,
+                args.min_lr,
+                schedule=args.lr_schedule,
+            )
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
             
@@ -1113,8 +1184,23 @@ def train(args):
                       (f" | ponder: {avg_ponder:.3f}" if avg_ponder > 0 else ""))
 
                 difficulty_logged = (
-                    float(difficulty_value.value) if difficulty_value is not None else 0.5
+                    float(difficulty_value.value)
+                    if difficulty_value is not None
+                    else difficulty_schedule(
+                        curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
+                    )
                 )
+
+                print(f"  Difficulty: {difficulty_logged:.3f} (easy_mix: {args.easy_mix_frac})")
+                expected_lr = get_lr(
+                    tokens_seen,
+                    warmup_tokens,
+                    args.total_tokens,
+                    args.max_lr,
+                    args.min_lr,
+                    schedule=args.lr_schedule,
+                )
+                print(f"  LR: {expected_lr:.2e} (schedule: {args.lr_schedule})")
 
                 logger.log(
                     step=global_step,
@@ -1138,7 +1224,11 @@ def train(args):
             if global_step % args.eval_interval == 0:
                 print("\nRunning evaluation...")
                 difficulty_logged = (
-                    float(difficulty_value.value) if difficulty_value is not None else 0.5
+                    float(difficulty_value.value)
+                    if difficulty_value is not None
+                    else difficulty_schedule(
+                        curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
+                    )
                 )
                 print(f"  Eval difficulty: {difficulty_logged:.3f}")
                 with torch.no_grad():
@@ -1399,9 +1489,15 @@ def main():
     parser.add_argument(
         "--difficulty_schedule",
         type=str,
-        default="phased",
-        choices=["linear", "phased", "fixed"],
-        help="Difficulty curriculum type",
+        default="smooth",
+        choices=["linear", "phased", "fixed", "smooth", "warmup_ramp"],
+        help="Difficulty curriculum type (default: smooth)",
+    )
+    parser.add_argument(
+        "--easy_mix_frac",
+        type=float,
+        default=0.2,
+        help="Fraction of training samples that should always be easy (0.0-0.3 difficulty)",
     )
     parser.add_argument(
         "--task_weighting",
@@ -1494,7 +1590,14 @@ def main():
 
     # Optimizer
     parser.add_argument("--max_lr", type=float, default=6e-4)
-    parser.add_argument("--min_lr", type=float, default=6e-5)
+    parser.add_argument("--min_lr", type=float, default=1.5e-4)
+    parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="wsd",
+        choices=["cosine", "wsd", "plateau", "constant"],
+        help="Learning rate schedule type (default: wsd for Warmup-Stable-Decay)",
+    )
     parser.add_argument(
         "--warmup_steps",
         type=int,
