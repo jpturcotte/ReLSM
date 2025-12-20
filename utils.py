@@ -230,15 +230,26 @@ def module_grad_weight_norm(module: Optional[nn.Module]) -> Tuple[float, float]:
         return float("nan"), float("nan")
     device = params[0].device
     weight_sq = torch.zeros((), dtype=torch.float64, device=device)
-    grad_sq = torch.zeros((), dtype=torch.float64, device=device)
+    total_norm = 0.0
     has_grad = False
     for param in params:
         weight_sq += param.detach().double().pow(2).sum()
         if param.grad is not None:
             has_grad = True
-            grad_sq += param.grad.detach().double().pow(2).sum()
+            param_norm = param.grad.detach().to(torch.float32).norm(2.0)
+            total_norm += param_norm.item() ** 2.0
     weight_norm = math.sqrt(weight_sq.item())
-    grad_norm = math.sqrt(grad_sq.item()) if has_grad else float("nan")
+    if has_grad:
+        total_norm = total_norm ** 0.5
+        if math.isnan(total_norm):
+            print(
+                f"WARNING: NaN detected in logging for module: {module.__class__.__name__}"
+            )
+            grad_norm = 0.0
+        else:
+            grad_norm = total_norm
+    else:
+        grad_norm = 0.0
     return grad_norm, weight_norm
 
 
