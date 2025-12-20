@@ -52,3 +52,17 @@ def test_long_context_parsing_only_uses_continuation():
         old_tail = full_decoded.split()
     old_pred = old_tail[0] if old_tail else ""
     assert old_pred != parsed
+
+
+def test_long_context_parsing_prefers_numbers_in_tail():
+    tokenizer = DummyTokenizer()
+    prompt = "Find the code."
+    continuation = "Answer: The code is 1234"
+
+    prompt_ids = tokenizer.encode(prompt)
+    continuation_ids = tokenizer.encode(continuation)
+    output_ids = prompt_ids + continuation_ids
+    prompt_len = len(prompt_ids)
+
+    parsed = _prediction_from_output_ids(tokenizer, output_ids, prompt_len)
+    assert parsed == "1234"
