@@ -112,7 +112,6 @@ class MetricsLogger:
         self.output_dir = output_dir
         self.hyperparameters = {}
         self.records = []
-        self.evaluations = []
         self.task_accuracies = {}
         self.train_task_accuracies = {}
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -124,7 +123,6 @@ class MetricsLogger:
         record = {"step": step, "phase": phase}
         record.update(kwargs)
         self.records.append(record)
-        self.evaluations.append(record)
     
     def log_task_accuracy(
         self,
@@ -178,7 +176,6 @@ class MetricsLogger:
         snapshot = {
             "hyperparameters": self.hyperparameters,
             "records": self.records,
-            "evaluations": self.evaluations,
             "task_accuracies": self.task_accuracies,
             "train_task_accuracies": self.train_task_accuracies,
         }
@@ -336,7 +333,7 @@ def evaluate_perplexity(model, val_loader, device, ctx, max_batches: int = 50) -
         with ctx:
             _, loss, _ = model(input_ids, labels=labels)
         
-        n_tokens = (labels != -100).sum().item()
+        n_tokens = (labels[..., 1:] != -100).sum().item()
         total_loss += loss.item() * n_tokens
         total_tokens += n_tokens
     
@@ -372,8 +369,10 @@ def evaluate_training_split(
             logits, loss, _ = model(input_ids, labels=labels)
 
         predictions = torch.argmax(logits, dim=-1)
-        mask = labels != -100
-        total_correct += (predictions[mask] == labels[mask]).sum().item()
+        shift_labels = labels[..., 1:]
+        shift_predictions = predictions[..., :-1]
+        mask = shift_labels != -100
+        total_correct += (shift_predictions[mask] == shift_labels[mask]).sum().item()
 
         n_tokens = mask.sum().item()
         total_tokens += n_tokens
@@ -1262,6 +1261,8 @@ def train(args):
     running_inner_steps = 0.0
     running_ponder = 0.0
     last_grad_norm = float("nan")
+    last_token_accuracy = float("nan")
+    last_pct_masked_tokens = float("nan")
     flush_diagnostic_metrics: Optional[Dict[str, float]] = None
     
     try:
@@ -1305,6 +1306,24 @@ def train(args):
                 running_ponder += float(ponder)
 
                 loss = loss / args.grad_accum_steps
+
+            with torch.no_grad():
+                if labels.size(1) > 1:
+                    shift_labels = labels[..., 1:]
+                    shift_logits = logits[..., :-1, :]
+                    mask = shift_labels != -100
+                    denom = mask.sum().item()
+                    if denom > 0:
+                        predictions = shift_logits.argmax(dim=-1)
+                        correct = (predictions[mask] == shift_labels[mask]).sum().item()
+                        last_token_accuracy = correct / denom
+                        last_pct_masked_tokens = 1.0 - (denom / mask.numel())
+                    else:
+                        last_token_accuracy = float("nan")
+                        last_pct_masked_tokens = float("nan")
+                else:
+                    last_token_accuracy = float("nan")
+                    last_pct_masked_tokens = float("nan")
             
             # Backward
             scaler.scale(loss).backward()
@@ -1430,6 +1449,8 @@ def train(args):
                     avg_inner_steps=avg_K,
                     ponder=avg_ponder,
                     difficulty=difficulty_logged,
+                    token_accuracy=last_token_accuracy,
+                    pct_masked_tokens=last_pct_masked_tokens,
                     grad_norm=last_grad_norm,
                     weight_norm=weight_norm,
                     **diagnostic_metrics,
@@ -1454,6 +1475,10 @@ def train(args):
                 )
                 if args.extended_logging:
                     log_print(f"  Eval difficulty: {difficulty_logged:.3f}")
+                    log_print(
+                        f"  Train token acc: {last_token_accuracy:.3f} | "
+                        f"pct masked: {last_pct_masked_tokens:.3f}"
+                    )
                 with torch.no_grad():
                     weight_norm = math.sqrt(
                         sum((param.detach().float() ** 2).sum().item() for param in model.parameters())
