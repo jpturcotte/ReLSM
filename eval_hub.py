@@ -9,6 +9,7 @@ writes standardized JSON outputs.
 from __future__ import annotations
 
 import argparse
+import random
 import hashlib
 import json
 from pathlib import Path
@@ -107,6 +108,7 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
             {
                 "task": res.task,
                 "condition": res.condition,
+                "difficulty": res.difficulty,
                 "accuracy": res.accuracy,
                 "mean_token_accuracy": res.mean_token_accuracy,
                 "mean_distance": res.mean_distance,
@@ -119,6 +121,7 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
                 "tokens_generated": res.tokens_generated,
                 "elapsed_seconds": res.elapsed,
                 "examples": res.examples,
+                "sampled_examples": res.sampled_examples,
             }
         )
         total_correct += res.correct
@@ -203,6 +206,7 @@ def run_algorithmic_suite(
     generation_kwargs: Dict[str, Any],
     limit: Optional[int],
     tasks: Optional[Sequence[str]] = None,
+    sample_count_per_task: int = 5,
 ) -> Dict[str, Any]:
     seed_all(seed)
     grid = ood_grid.build_grid(list(tasks) if tasks else None)
@@ -211,10 +215,14 @@ def run_algorithmic_suite(
     use_autocast = device.type == "cuda"
 
     results: List[EvalResult] = []
+    sampled_examples_by_task: Dict[str, List[Dict[str, str]]] = {}
+    sample_seen_by_task: Dict[str, int] = {}
+    sample_rng = random.Random(seed + 101)
     for cond in grid:
         cond_seed_bytes = hashlib.sha256(f"{cond.task}:{cond.name}:{seed}".encode()).digest()
         cond_seed = seed + int.from_bytes(cond_seed_bytes[:4], "little")
         n = limit if limit is not None else cond.n
+        difficulty = cond.params.get("difficulty", 0.5)
         res = evaluate_condition(
             model,
             tokenizer,
@@ -227,10 +235,39 @@ def run_algorithmic_suite(
             seed=cond_seed,
             batch_size=batch_size,
             generation_kwargs=gen_kwargs,
+            difficulty=difficulty,
+            sample_count=sample_count_per_task,
         )
         results.append(res)
+        if sample_count_per_task:
+            task_samples = sampled_examples_by_task.setdefault(cond.task, [])
+            seen = sample_seen_by_task.get(cond.task, 0)
+            for sample in res.sampled_examples:
+                if len(task_samples) < sample_count_per_task:
+                    task_samples.append(sample)
+                else:
+                    idx = sample_rng.randint(0, seen)
+                    if idx < sample_count_per_task:
+                        task_samples[idx] = sample
+                seen += 1
+            sample_seen_by_task[cond.task] = seen
+            if res.sampled_examples:
+                print(
+                    f"[eval] {cond.task}/{cond.name} difficulty={difficulty:.3f} "
+                    f"samples={len(res.sampled_examples)}"
+                )
+                for idx, sample in enumerate(res.sampled_examples, start=1):
+                    print(
+                        "  "
+                        f"{idx}. prompt={sample['prompt']!r} "
+                        f"prediction={sample['prediction']!r} "
+                        f"target={sample['target']!r}"
+                    )
 
-    return _algorithmic_results_to_dict(results)
+    payload = _algorithmic_results_to_dict(results)
+    if sample_count_per_task:
+        payload["sampled_examples_by_task"] = sampled_examples_by_task
+    return payload
 
 
 @torch.no_grad()
@@ -318,6 +355,7 @@ def run_eval_suite(
     compile_model: bool = False,
     limit: Optional[int] = None,
     tasks: Optional[Sequence[str]] = None,
+    sample_count_per_task: int = 5,
 ) -> Dict[str, Any]:
     """Run the requested evaluation suite and persist standardized JSON.
 
@@ -377,6 +415,7 @@ def run_eval_suite(
                     generation_kwargs=base_generation_kwargs,
                     limit=limit,
                     tasks=tasks,
+                    sample_count_per_task=sample_count_per_task,
                 )
             elif selected == "longctx":
                 results["longctx"] = run_longctx_suite(
@@ -441,6 +480,12 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional subset of algorithmic tasks (e.g., addition dyck copy)",
     )
+    parser.add_argument(
+        "--eval_sample_count_per_task",
+        type=int,
+        default=5,
+        help="Number of sample prompts to log per active task",
+    )
     return parser.parse_args()
 
 
@@ -465,6 +510,7 @@ def main() -> None:
         compile_model=args.compile_model,
         limit=args.limit,
         tasks=args.tasks,
+        sample_count_per_task=args.eval_sample_count_per_task,
     )
     print(json.dumps(payload, indent=2))
 
