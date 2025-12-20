@@ -57,7 +57,7 @@ def select_device(device: Optional[Union[str, int]] = None) -> torch.device:
 
 
 SPACE_PATTERN = re.compile(r"\s+")
-_INT_RE = re.compile(r"^-?\d{1,40}$")
+_INT_RE = re.compile(r"^-?(?:\d+\.?\d*|\d*\.?\d+)(?:[eE][+-]?\d+)?$")
 
 
 def safe_parse_number(s: str, default: float = float("nan")) -> float:

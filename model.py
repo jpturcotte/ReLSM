@@ -862,7 +862,7 @@ class BaselineTransformer(nn.Module):
         batch_size = generated.size(0)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=generated.device)
 
-        use_kv_cache = self.config.variant in {"baseline", "shared_loop", "ssm", "ssm_mem"}
+        use_kv_cache = self.config.variant in {"baseline", "shared_loop", "ssm"}
 
         if use_kv_cache:
             kv_cache: List[Any] = [None] * self._cache_slots
