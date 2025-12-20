@@ -436,6 +436,7 @@ class EvalResult:
     mean_prefix_accuracy: float
     mae: Optional[float]
     numeric_count: int
+    parse_failures: int = 0
     n: int
     avg_gen_len: float
     tokens_per_sec: float
@@ -446,12 +447,18 @@ class EvalResult:
     elapsed: float
 
 
-def normalize_prediction(task: str, text: str) -> str:
-    """Normalize model outputs for fair comparisons across tasks."""
+def _base_normalize(text: str) -> str:
+    """Common normalization applied to both predictions and targets."""
 
     text = text.split("\n")[0]
     text = SPACE_PATTERN.sub(" ", text).strip()
-    text = text.strip(" \t\n\r\"'`.,;:!?")
+    return text.strip(" \t\n\r\"'`.,;:!?")
+
+
+def normalize_prediction(task: str, text: str) -> str:
+    """Normalize model outputs for fair comparisons across tasks."""
+
+    text = _base_normalize(text)
 
     if task == "dyck":
         lowered = text.lower()
@@ -463,9 +470,9 @@ def normalize_prediction(task: str, text: str) -> str:
 
     numeric_tasks = {"mod_add", "parity", "addition", "multiplication", "chain", "successor"}
     if task in numeric_tasks:
-        match = re.search(r"[+-]?(?:\d+\.?\d*|\d*\.?\d+)(?:[eE][+-]?\d+)?", text)
-        if match:
-            return match.group(0)
+        matches = re.findall(r"[+-]?(?:\d+\.?\d*|\d*\.?\d+)(?:[eE][+-]?\d+)?", text)
+        if matches:
+            return matches[-1]
 
     return text
 
@@ -473,9 +480,10 @@ def normalize_prediction(task: str, text: str) -> str:
 def normalize_target(task: str, text: str) -> str:
     """Normalize ground-truth targets for matching."""
 
+    text = _base_normalize(text)
     if task == "dyck":
-        return text.lower().strip()
-    return SPACE_PATTERN.sub(" ", text).strip()
+        return text.lower()
+    return text
 
 
 def compute_metrics(task: str, pred: str, target: str) -> Dict[str, float]:
@@ -660,7 +668,8 @@ def build_dataset(
     gen_fn = AlgorithmicGenerator._get_generators()[task]
 
     for i in range(n):
-        rng = random.Random(seed + i)
+        example_seed = hash((seed, task, i)) & 0x7FFFFFFF
+        rng = random.Random(example_seed)
         kwargs = dict(params)
         if task == "dyck":
             kwargs["force_valid"] = i < n / 2
@@ -770,6 +779,7 @@ def evaluate_condition(
     total_correct = 0
     total_absolute_error = 0.0
     total_numeric_samples = 0
+    total_parse_failures = 0
     total_examples = 0
     total_tokens = 0
     total_time = 0.0
@@ -833,7 +843,9 @@ def evaluate_condition(
 
             val_pred = safe_parse_number(pred)
             val_tgt = safe_parse_number(norm_tgt)
-            if not (math.isnan(val_pred) or math.isnan(val_tgt)):
+            if math.isnan(val_pred):
+                total_parse_failures += 1
+            elif not math.isnan(val_tgt):
                 total_absolute_error += abs(val_pred - val_tgt)
                 total_numeric_samples += 1
             total_examples += 1
@@ -854,6 +866,7 @@ def evaluate_condition(
         mean_prefix_accuracy=aggregated.mean_prefix_accuracy,
         mae=mae,
         numeric_count=total_numeric_samples,
+        parse_failures=total_parse_failures,
         n=total_examples,
         avg_gen_len=avg_gen_len,
         tokens_per_sec=tokens_per_sec,

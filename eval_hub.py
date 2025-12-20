@@ -12,6 +12,7 @@ import argparse
 import random
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -74,10 +75,16 @@ def _parse_answer_from_continuation(decoded: str) -> str:
     """Extract the first token of the answer from a decoded continuation."""
 
     if "Answer:" in decoded:
-        tail = decoded.split("Answer:")[-1].strip().split()
+        tail = decoded.split("Answer:")[-1].strip()
     else:
-        tail = decoded.strip().split()
-    return tail[0] if tail else ""
+        tail = decoded.strip()
+
+    number_match = re.search(r"\b\d+\b", tail)
+    if number_match:
+        return number_match.group(0)
+
+    words = tail.split()
+    return words[0] if words else ""
 
 
 def _prediction_from_output_ids(
@@ -102,6 +109,7 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
     total_prefix_accuracy = 0.0
     total_abs_error = 0.0
     total_numeric = 0
+    total_parse_failures = 0
 
     for res in results:
         conditions.append(
@@ -115,6 +123,8 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
                 "mean_prefix_accuracy": res.mean_prefix_accuracy,
                 "mae": res.mae,
                 "numeric_count": res.numeric_count,
+                "parse_failures": res.parse_failures,
+                "parse_failure_rate": (res.parse_failures / res.n if res.n else 0.0),
                 "n": res.n,
                 "avg_gen_len": res.avg_gen_len,
                 "tokens_per_sec": res.tokens_per_sec,
@@ -140,6 +150,7 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
                 "prefix_accuracy": 0.0,
                 "mae_error": 0.0,
                 "mae_count": 0,
+                "parse_failures": 0,
             },
         )
         per_task[res.task]["conditions"].append(res.condition)
@@ -154,6 +165,8 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
             per_task[res.task]["mae_count"] += res.numeric_count
             total_abs_error += error_sum
             total_numeric += res.numeric_count
+        per_task[res.task]["parse_failures"] += res.parse_failures
+        total_parse_failures += res.parse_failures
 
     per_task_acc = {
         task: (payload["correct"] / payload["total"] if payload["total"] else 0.0)
@@ -175,11 +188,16 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
         task: (payload["mae_error"] / payload["mae_count"] if payload["mae_count"] else None)
         for task, payload in per_task.items()
     }
+    per_task_parse_failure_rate = {
+        task: (payload["parse_failures"] / payload["total"] if payload["total"] else 0.0)
+        for task, payload in per_task.items()
+    }
     overall = total_correct / total_seen if total_seen else 0.0
     overall_token_accuracy = total_token_accuracy / total_seen if total_seen else 0.0
     overall_distance = total_distance / total_seen if total_seen else 1.0
     overall_prefix_accuracy = total_prefix_accuracy / total_seen if total_seen else 0.0
     overall_mae = total_abs_error / total_numeric if total_numeric else None
+    overall_parse_failure_rate = total_parse_failures / total_seen if total_seen else 0.0
     return {
         "grid_version": ood_grid.OOD_GRID_VERSION,
         "conditions": conditions,
@@ -188,11 +206,14 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
         "per_task_distance": per_task_distance,
         "per_task_prefix_accuracy": per_task_prefix_accuracy,
         "per_task_mae": per_task_mae,
+        "per_task_parse_failure_rate": per_task_parse_failure_rate,
         "overall_accuracy": overall,
         "overall_token_accuracy": overall_token_accuracy,
         "overall_distance": overall_distance,
         "overall_prefix_accuracy": overall_prefix_accuracy,
         "overall_mae": overall_mae,
+        "overall_parse_failures": total_parse_failures,
+        "overall_parse_failure_rate": overall_parse_failure_rate,
     }
 
 
