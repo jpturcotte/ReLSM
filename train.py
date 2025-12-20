@@ -876,6 +876,22 @@ def train(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log_print = print if args.extended_logging else (lambda *args, **kwargs: None)
+
+    def format_metric_value(value: Any) -> str:
+        if isinstance(value, (float, int)):
+            if math.isnan(value):
+                return "nan"
+            if value == 0:
+                return "0"
+            if abs(value) >= 1000 or abs(value) < 0.01:
+                return f"{value:.2e}"
+            return f"{value:.3f}"
+        return str(value)
+
+    def format_metrics_line(metrics: Dict[str, float]) -> str:
+        return " | ".join(
+            f"{key}={format_metric_value(metrics[key])}" for key in sorted(metrics)
+        )
     log_print(f"Device: {device}")
 
     random.seed(args.seed)
@@ -1359,7 +1375,7 @@ def train(args):
                     log_print(f"  LR: {expected_lr:.2e} (schedule: {args.lr_schedule})")
                     log_print(f"  Grad norm: {last_grad_norm:.1f}")
                     log_print(f"  Weight norm: {weight_norm:.1f}")
-                    if args.weight_decay != 0.0:
+                    if args.weight_decay > 0.0:
                         log_print(f"  WD pressure: {effective_wd_pressure:.1f}")
 
                 # DIAGNOSTIC METRICS (cheap)
@@ -1398,6 +1414,8 @@ def train(args):
                     weight_norm=weight_norm,
                     **diagnostic_metrics,
                 )
+                if args.extended_logging and diagnostic_metrics:
+                    log_print(f"  Diagnostics: {format_metrics_line(diagnostic_metrics)}")
 
                 running_loss = 0.0
                 running_inner_steps = 0.0
@@ -1424,7 +1442,7 @@ def train(args):
                 if args.extended_logging:
                     log_print(f"  Grad norm: {last_grad_norm:.1f}")
                     log_print(f"  Weight norm: {weight_norm:.1f}")
-                    if args.weight_decay != 0.0:
+                    if args.weight_decay > 0.0:
                         log_print(f"  WD pressure: {effective_wd_pressure:.1f}")
 
                 # DIAGNOSTIC METRICS (eval-only)
@@ -1439,6 +1457,11 @@ def train(args):
                 )
                 if eval_diagnostic_metrics:
                     logger.log(step=global_step, phase="eval", **eval_diagnostic_metrics)
+                    if args.extended_logging:
+                        log_print(
+                            "  Eval diagnostics: "
+                            f"{format_metrics_line(eval_diagnostic_metrics)}"
+                        )
 
                 # Algorithmic accuracy (OOD grid)
                 if args.eval_algorithmic:
