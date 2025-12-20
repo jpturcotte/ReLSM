@@ -1,7 +1,7 @@
 """Canonical evaluation orchestrator for ReLSM.
 
 This module exposes ``run_eval_suite`` as the single entrypoint for all
-evaluation flows (algorithmic OOD grid, long-context retrieval, and
+evaluation flows (algorithmic IID/OOD grids, long-context retrieval, and
 lightweight self tests). The accompanying CLI mirrors the same API and
 writes standardized JSON outputs.
 """
@@ -228,9 +228,19 @@ def run_algorithmic_suite(
     limit: Optional[int],
     tasks: Optional[Sequence[str]] = None,
     sample_count_per_task: int = 5,
+    grid: str = "iid",
 ) -> Dict[str, Any]:
     seed_all(seed)
-    grid = ood_grid.build_grid(list(tasks) if tasks else None)
+    grid_key = grid.lower()
+    include_iid = grid_key in {"iid", "all"}
+    include_ood = grid_key in {"ood", "all"}
+    if not include_iid and not include_ood:
+        raise ValueError(f"Unknown algorithmic grid selection: {grid}")
+    grid_conditions = ood_grid.build_grid(
+        list(tasks) if tasks else None,
+        include_iid=include_iid,
+        include_ood=include_ood,
+    )
     gen_kwargs = dict(generation_kwargs)
     gen_kwargs.pop("max_new_tokens", None)
     use_autocast = device.type == "cuda"
@@ -239,7 +249,7 @@ def run_algorithmic_suite(
     sampled_examples_by_task: Dict[str, List[Dict[str, str]]] = {}
     sample_seen_by_task: Dict[str, int] = {}
     sample_rng = random.Random(seed + 101)
-    for cond in grid:
+    for cond in grid_conditions:
         cond_seed_bytes = hashlib.sha256(f"{cond.task}:{cond.name}:{seed}".encode()).digest()
         cond_seed = seed + int.from_bytes(cond_seed_bytes[:4], "little")
         n = limit if limit is not None else cond.n
@@ -287,6 +297,7 @@ def run_algorithmic_suite(
                     )
 
     payload = _algorithmic_results_to_dict(results)
+    payload["grid"] = grid_key
     if sample_count_per_task:
         payload["sampled_examples_by_task"] = sampled_examples_by_task
     return payload
@@ -378,6 +389,7 @@ def run_eval_suite(
     limit: Optional[int] = None,
     tasks: Optional[Sequence[str]] = None,
     sample_count_per_task: int = 5,
+    algorithmic_grid: str = "iid",
 ) -> Dict[str, Any]:
     """Run the requested evaluation suite and persist standardized JSON.
 
@@ -405,7 +417,10 @@ def run_eval_suite(
 
     output_path = Path(out_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    filename = f"results_{suite}.json" if suite != "all" else "results_all.json"
+    if suite == "algorithmic":
+        filename = f"results_{suite}_{algorithmic_grid}.json"
+    else:
+        filename = f"results_{suite}.json" if suite != "all" else "results_all.json"
 
     results: Dict[str, Any] = {}
 
@@ -421,6 +436,8 @@ def run_eval_suite(
             grid_version=ood_grid.OOD_GRID_VERSION if "algorithmic" in results else None,
             model_id=getattr(getattr(model, "config", None), "variant", None),
         )
+        if "algorithmic" in results:
+            meta["algorithmic_grid"] = algorithmic_grid
         if interrupted:
             meta["status"] = "interrupted"
         return {"meta": meta, **results}
@@ -438,6 +455,7 @@ def run_eval_suite(
                     limit=limit,
                     tasks=tasks,
                     sample_count_per_task=sample_count_per_task,
+                    grid=algorithmic_grid,
                 )
             elif selected == "longctx":
                 results["longctx"] = run_longctx_suite(
@@ -508,6 +526,12 @@ def _parse_args() -> argparse.Namespace:
         default=5,
         help="Number of sample prompts to log per active task",
     )
+    parser.add_argument(
+        "--algorithmic_grid",
+        default="iid",
+        choices=["iid", "ood", "all"],
+        help="Select IID vs OOD conditions for the algorithmic suite",
+    )
     return parser.parse_args()
 
 
@@ -533,6 +557,7 @@ def main() -> None:
         limit=args.limit,
         tasks=args.tasks,
         sample_count_per_task=args.eval_sample_count_per_task,
+        algorithmic_grid=args.algorithmic_grid,
     )
     print(json.dumps(payload, indent=2))
 

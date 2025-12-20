@@ -113,6 +113,7 @@ class MetricsLogger:
         self.hyperparameters = {}
         self.records = []
         self.task_accuracies = {}
+        self.ood_task_accuracies = {}
         self.train_task_accuracies = {}
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._metrics_path = self.output_dir / "metrics.json"
@@ -137,6 +138,8 @@ class MetricsLogger:
     ):
         if target == "train":
             store = self.train_task_accuracies
+        elif target == "eval_ood":
+            store = self.ood_task_accuracies
         else:
             store = self.task_accuracies
         if task not in store:
@@ -177,6 +180,7 @@ class MetricsLogger:
             "hyperparameters": self.hyperparameters,
             "records": self.records,
             "task_accuracies": self.task_accuracies,
+            "ood_task_accuracies": self.ood_task_accuracies,
             "train_task_accuracies": self.train_task_accuracies,
         }
         tmp_path = self._metrics_path.with_suffix(".json.tmp")
@@ -243,6 +247,24 @@ class MetricsLogger:
         plt.savefig(self.output_dir / "accuracy.png")
         plt.close()
 
+        # OOD accuracy plot
+        if self.ood_task_accuracies:
+            plt.figure()
+            for task, records in self.ood_task_accuracies.items():
+                steps = [entry["step"] for entry in records]
+                accuracies = [entry["accuracy"] for entry in records]
+                if steps and accuracies:
+                    plt.plot(steps, accuracies, label=task)
+
+            plt.xlabel("Step")
+            plt.ylabel("Accuracy")
+            plt.title("OOD Task Accuracy")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(self.output_dir / "accuracy_ood.png")
+            plt.close()
+
         # Training task accuracy plot
         if self.train_task_accuracies:
             plt.figure()
@@ -272,8 +294,9 @@ def evaluate_algorithmic(
     tasks: Optional[Sequence[str]] = None,
     seed: int = 42,
     sample_count_per_task: int = 5,
+    grid: str = "iid",
 ) -> Dict[str, Any]:
-    """Run the canonical algorithmic OOD grid using ``eval_hub``.
+    """Run the canonical algorithmic grid using ``eval_hub``.
 
     The ``n_examples`` argument caps the number of examples per condition
     (kept for backward compatibility with older training scripts), while
@@ -299,6 +322,7 @@ def evaluate_algorithmic(
         limit=n_examples,
         tasks=tasks,
         sample_count_per_task=sample_count_per_task,
+        grid=grid,
     )
 
     return {
@@ -1508,7 +1532,7 @@ def train(args):
                             f"{format_metrics_line(eval_diagnostic_metrics)}"
                         )
 
-                # Algorithmic accuracy (OOD grid)
+                # Algorithmic accuracy (IID grid)
                 if args.eval_algorithmic:
                     alg_results = evaluate_algorithmic(
                         model,
@@ -1519,6 +1543,7 @@ def train(args):
                         tasks=alg_tasks,
                         seed=args.seed,
                         sample_count_per_task=args.eval_sample_count_per_task,
+                        grid="iid",
                     )
                     overall_acc = alg_results.get("overall_accuracy", 0.0)
                     overall_mae = alg_results.get("overall_mae")
@@ -1527,7 +1552,7 @@ def train(args):
                     overall_prefix_accuracy = alg_results.get("overall_prefix_accuracy", 0.0)
                     if args.extended_logging:
                         log_print(
-                            "  Algorithmic metrics: "
+                            "  Algorithmic IID metrics: "
                             f"acc={overall_acc*100:.1f}% | "
                             f"token={overall_token_accuracy:.3f} | "
                             f"dist={overall_distance:.3f} | "
@@ -1537,7 +1562,7 @@ def train(args):
                             log_print(f"  Algorithmic MAE (numeric tasks): {overall_mae:.3f}")
 
                         _print_sampled_examples(
-                            "Algorithmic eval",
+                            "Algorithmic IID eval",
                             alg_results.get("sampled_examples_by_task", {}),
                         )
 
@@ -1549,8 +1574,14 @@ def train(args):
                         algorithmic_distance=overall_distance,
                         algorithmic_prefix_accuracy=overall_prefix_accuracy,
                         algorithmic_mae=overall_mae,
+                        algorithmic_iid_accuracy=overall_acc,
+                        algorithmic_iid_token_accuracy=overall_token_accuracy,
+                        algorithmic_iid_distance=overall_distance,
+                        algorithmic_iid_prefix_accuracy=overall_prefix_accuracy,
+                        algorithmic_iid_mae=overall_mae,
                         eval_difficulty=difficulty_logged,
                         algorithmic_samples=alg_results.get("sampled_examples_by_task", {}),
+                        algorithmic_iid_samples=alg_results.get("sampled_examples_by_task", {}),
                     )
 
                     per_task_mae = alg_results.get("per_task_mae", {}) or {}
@@ -1596,6 +1627,84 @@ def train(args):
                         }, output_dir / "best_model.pt")
                         if args.extended_logging:
                             log_print(f"  New best! Saved checkpoint.")
+
+                # Algorithmic accuracy (OOD grid)
+                if args.eval_algorithmic_ood:
+                    ood_results = evaluate_algorithmic(
+                        model,
+                        tokenizer,
+                        device,
+                        n_examples=args.eval_samples,
+                        max_new_tokens=args.eval_max_new_tokens,
+                        tasks=alg_tasks,
+                        seed=args.seed,
+                        sample_count_per_task=args.eval_sample_count_per_task,
+                        grid="ood",
+                    )
+                    overall_acc = ood_results.get("overall_accuracy", 0.0)
+                    overall_mae = ood_results.get("overall_mae")
+                    overall_token_accuracy = ood_results.get("overall_token_accuracy", 0.0)
+                    overall_distance = ood_results.get("overall_distance", 1.0)
+                    overall_prefix_accuracy = ood_results.get("overall_prefix_accuracy", 0.0)
+                    if args.extended_logging:
+                        log_print(
+                            "  Algorithmic OOD metrics: "
+                            f"acc={overall_acc*100:.1f}% | "
+                            f"token={overall_token_accuracy:.3f} | "
+                            f"dist={overall_distance:.3f} | "
+                            f"prefix={overall_prefix_accuracy:.3f}"
+                        )
+                        if overall_mae is not None:
+                            log_print(f"  Algorithmic OOD MAE (numeric tasks): {overall_mae:.3f}")
+
+                        _print_sampled_examples(
+                            "Algorithmic OOD eval",
+                            ood_results.get("sampled_examples_by_task", {}),
+                        )
+
+                    logger.log(
+                        step=global_step,
+                        phase="eval",
+                        algorithmic_ood_accuracy=overall_acc,
+                        algorithmic_ood_token_accuracy=overall_token_accuracy,
+                        algorithmic_ood_distance=overall_distance,
+                        algorithmic_ood_prefix_accuracy=overall_prefix_accuracy,
+                        algorithmic_ood_mae=overall_mae,
+                        eval_difficulty=difficulty_logged,
+                        algorithmic_ood_samples=ood_results.get("sampled_examples_by_task", {}),
+                    )
+
+                    per_task_mae = ood_results.get("per_task_mae", {}) or {}
+                    per_task_token_accuracy = ood_results.get("per_task_token_accuracy", {}) or {}
+                    per_task_distance = ood_results.get("per_task_distance", {}) or {}
+                    per_task_prefix_accuracy = (
+                        ood_results.get("per_task_prefix_accuracy", {}) or {}
+                    )
+                    for task, acc in ood_results.get("per_task_accuracy", {}).items():
+                        task_mae = per_task_mae.get(task)
+                        logger.log_task_accuracy(
+                            task,
+                            acc,
+                            global_step,
+                            target="eval_ood",
+                            mae=task_mae,
+                            mean_token_accuracy=per_task_token_accuracy.get(task),
+                            mean_distance=per_task_distance.get(task),
+                            mean_prefix_accuracy=per_task_prefix_accuracy.get(task),
+                        )
+                        token_acc = per_task_token_accuracy.get(task, 0.0)
+                        distance = per_task_distance.get(task, 1.0)
+                        prefix_acc = per_task_prefix_accuracy.get(task, 0.0)
+                        if args.extended_logging:
+                            line = (
+                                f"    {task}: {acc*100:.1f}%"
+                                f" | token={token_acc:.3f}"
+                                f" | dist={distance:.3f}"
+                                f" | prefix={prefix_acc:.3f}"
+                            )
+                            if task_mae is not None:
+                                line += f" | MAE: {task_mae:.3f}"
+                            log_print(line)
 
                 # Training data accuracy (memorization tracking)
                 if train_eval_loader is not None:
@@ -1918,7 +2027,13 @@ def main():
         "--eval_algorithmic",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Run the algorithmic OOD eval suite (disable with --no-eval_algorithmic)",
+        help="Run the algorithmic IID eval suite (disable with --no-eval_algorithmic)",
+    )
+    parser.add_argument(
+        "--eval_algorithmic_ood",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run the algorithmic OOD eval suite (disabled by default)",
     )
     parser.add_argument(
         "--eval_max_new_tokens",
