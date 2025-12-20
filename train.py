@@ -1172,6 +1172,7 @@ def train(args):
                     weight_norm = math.sqrt(
                         sum((param.detach().float() ** 2).sum().item() for param in model.parameters())
                     )
+                effective_wd_pressure = args.weight_decay * weight_norm
 
                 print(f"Step {global_step:>6} | "
                       f"Phase: {phase[:4]:>4} | "
@@ -1201,6 +1202,10 @@ def train(args):
                     schedule=args.lr_schedule,
                 )
                 print(f"  LR: {expected_lr:.2e} (schedule: {args.lr_schedule})")
+                print(f"  Grad norm: {last_grad_norm:.1f}")
+                print(f"  Weight norm: {weight_norm:.1f}")
+                if args.weight_decay != 0.0:
+                    print(f"  WD pressure: {effective_wd_pressure:.1f}")
 
                 logger.log(
                     step=global_step,
@@ -1238,7 +1243,8 @@ def train(args):
                 effective_wd_pressure = args.weight_decay * weight_norm
                 print(f"  Grad norm: {last_grad_norm:.1f}")
                 print(f"  Weight norm: {weight_norm:.1f}")
-                print(f"  WD pressure: {effective_wd_pressure:.1f}")
+                if args.weight_decay != 0.0:
+                    print(f"  WD pressure: {effective_wd_pressure:.1f}")
 
                 # Algorithmic accuracy (OOD grid)
                 if args.eval_algorithmic:
