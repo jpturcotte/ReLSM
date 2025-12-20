@@ -15,7 +15,6 @@ PHASE 2 - Language Generalization:
   - Goal: Map natural language into the learned logic space
 
 Also includes:
-  - Needle-in-haystack evaluation data
   - OOD length testing for algorithmic tasks
 """
 
@@ -1515,81 +1514,6 @@ class CurriculumSampler:
         self.alg_iter = iter(self.alg_loader)
         self.lang_iter = iter(self.lang_loader)
         self.lex_iter = iter(self.lex_loader) if self.lex_loader is not None else None
-
-
-# =============================================================================
-# NEEDLE-IN-HAYSTACK EVALUATION
-# =============================================================================
-
-class NeedleInHaystackGenerator:
-    """
-    Generates needle-in-haystack retrieval tasks for evaluating long-context.
-    """
-    
-    def __init__(self, tokenizer, context_length: int = 4096):
-        self.tokenizer = tokenizer
-        self.context_length = context_length
-        
-        # Filler text (Paul Graham essays style)
-        self.filler_sentences = [
-            "The best way to learn is by doing.",
-            "Ideas are not precious, execution is.",
-            "Start with something small and iterate.",
-            "The market is the ultimate judge.",
-            "Good taste is essential for great work.",
-            "Curiosity drives innovation forward.",
-            "Simple solutions are often the best.",
-            "Focus on what matters most first.",
-            "Learn from failure, celebrate success.",
-            "Build something people actually want.",
-        ]
-    
-    def generate(self, needle_depth: float = 0.5) -> Dict:
-        """
-        Generate a needle-in-haystack example.
-        
-        Args:
-            needle_depth: Position of needle (0.0 = start, 1.0 = end)
-        """
-        # Generate random needle
-        secret_number = random.randint(1000, 9999)
-        needle = f"The secret code is {secret_number}."
-        
-        # Build haystack
-        haystack_tokens = []
-        needle_tokens = self.tokenizer.encode(needle, add_special_tokens=False)
-        target_length = self.context_length - len(needle_tokens) - 50  # Buffer for question
-        
-        while len(haystack_tokens) < target_length:
-            sentence = random.choice(self.filler_sentences)
-            tokens = self.tokenizer.encode(" " + sentence, add_special_tokens=False)
-            haystack_tokens.extend(tokens)
-        
-        haystack_tokens = haystack_tokens[:target_length]
-        
-        # Insert needle at specified depth
-        insert_pos = int(len(haystack_tokens) * needle_depth)
-        full_tokens = haystack_tokens[:insert_pos] + needle_tokens + haystack_tokens[insert_pos:]
-        
-        # Add question
-        question = " Question: What is the secret code? Answer:"
-        question_tokens = self.tokenizer.encode(question, add_special_tokens=False)
-        full_tokens = full_tokens + question_tokens
-        
-        return {
-            "input_ids": torch.tensor(full_tokens),
-            "answer": str(secret_number),
-            "needle_depth": needle_depth,
-            "context_length": len(full_tokens),
-        }
-    
-    def generate_sweep(self, n_depths: int = 10) -> List[Dict]:
-        """Generate examples across depth positions."""
-        examples = []
-        for i in range(n_depths):
-            depth = i / (n_depths - 1) if n_depths > 1 else 0.5
-            examples.append(self.generate(needle_depth=depth))
-        return examples
 
 
 # =============================================================================
