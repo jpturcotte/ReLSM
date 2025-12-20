@@ -98,9 +98,19 @@ OOD_CONDITIONS = build_ood_conditions()
 ALL_CONDITIONS = IID_CONDITIONS + OOD_CONDITIONS
 
 
-def build_grid(tasks: Optional[List[str]] = None) -> List[Condition]:
+def build_grid(
+    tasks: Optional[List[str]] = None,
+    *,
+    include_iid: bool = True,
+    include_ood: bool = True,
+) -> List[Condition]:
     """Build evaluation grid filtered to requested tasks."""
+    conditions: List[Condition] = []
+    if include_iid:
+        conditions.extend(IID_CONDITIONS)
+    if include_ood:
+        conditions.extend(OOD_CONDITIONS)
     if tasks is None:
-        return list(ALL_CONDITIONS)
+        return list(conditions)
     selected = set(tasks)
-    return [condition for condition in ALL_CONDITIONS if condition.task in selected]
+    return [condition for condition in conditions if condition.task in selected]
