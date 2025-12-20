@@ -60,16 +60,26 @@ SPACE_PATTERN = re.compile(r"\s+")
 _INT_RE = re.compile(r"^-?(?:\d+\.?\d*|\d*\.?\d+)(?:[eE][+-]?\d+)?$")
 
 
-def safe_parse_number(s: str, default: float = float("nan")) -> float:
+def safe_parse_number(
+    s: str,
+    default: float = float("nan"),
+    *,
+    max_digits: int = 20,
+    max_magnitude: float = 1e15,
+) -> float:
     """Parse numeric string with overflow protection."""
     s = s.strip()
     if not s or not _INT_RE.match(s):
+        return default
+    if len(s.lstrip("+-")) > max_digits:
         return default
     try:
         val = float(s)
     except (ValueError, OverflowError):
         return default
     if math.isinf(val) or math.isnan(val):
+        return default
+    if abs(val) > max_magnitude:
         return default
     return val
 
@@ -972,13 +982,14 @@ def evaluate_condition(
                         }
                     )
 
-            val_pred = safe_parse_number(pred)
-            val_tgt = safe_parse_number(norm_tgt)
-            if math.isnan(val_pred):
-                total_parse_failures += 1
-            elif not math.isnan(val_tgt):
-                total_absolute_error += abs(val_pred - val_tgt)
-                total_numeric_samples += 1
+            if _is_numeric_task(task):
+                val_pred = safe_parse_number(pred)
+                val_tgt = safe_parse_number(norm_tgt)
+                if math.isnan(val_pred):
+                    total_parse_failures += 1
+                elif not math.isnan(val_tgt):
+                    total_absolute_error += abs(val_pred - val_tgt)
+                    total_numeric_samples += 1
             total_examples += 1
 
     aggregated = aggregate(task, metrics_samples)
