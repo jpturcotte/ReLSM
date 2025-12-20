@@ -31,6 +31,132 @@ from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_in
 # ALGORITHMIC DATA GENERATORS (Phase 1)
 # =============================================================================
 
+TASK_DIFFICULTY_CONFIG = {
+    "addition": {
+        "phases": [
+            (0.00, 0.15, {"digit_range": (1, 2)}),
+            (0.15, 0.35, {"digit_range": (1, 3)}),
+            (0.35, 0.60, {"digit_range": (1, 4)}),
+            (0.60, 1.00, {"digit_range": (1, 5)}),
+        ],
+        "train_max": 5,
+        "ood_start": 6,
+    },
+    "multiplication": {
+        "phases": [
+            (0.00, 0.20, {"digit_range": (1, 2)}),
+            (0.20, 0.50, {"digit_range": (1, 2)}),
+            (0.50, 1.00, {"digit_range": (1, 3)}),
+        ],
+        "train_max": 3,
+        "ood_start": 4,
+    },
+    "successor": {
+        "phases": [
+            (0.00, 0.15, {"digit_range": (1, 2)}),
+            (0.15, 0.35, {"digit_range": (1, 3)}),
+            (0.35, 0.60, {"digit_range": (1, 4)}),
+            (0.60, 1.00, {"digit_range": (1, 5)}),
+        ],
+        "train_max": 5,
+        "ood_start": 6,
+    },
+    "copy": {
+        "phases": [
+            (0.00, 0.10, {"length_range": (4, 6)}),
+            (0.10, 0.30, {"length_range": (4, 9)}),
+            (0.30, 1.00, {"length_range": (4, 12)}),
+        ],
+        "train_max": 12,
+        "ood_start": 16,
+    },
+    "reverse": {
+        "phases": [
+            (0.00, 0.15, {"length_range": (4, 6)}),
+            (0.15, 0.40, {"length_range": (4, 8)}),
+            (0.40, 1.00, {"length_range": (4, 12)}),
+        ],
+        "train_max": 12,
+        "ood_start": 16,
+    },
+    "parity": {
+        "phases": [
+            (0.00, 0.10, {"length_range": (4, 6)}),
+            (0.10, 0.30, {"length_range": (4, 9)}),
+            (0.30, 1.00, {"length_range": (4, 12)}),
+        ],
+        "train_max": 12,
+        "ood_start": 16,
+    },
+    "dyck": {
+        "phases": [
+            (0.00, 0.10, {"depth_range": (2, 2)}),
+            (0.10, 0.30, {"depth_range": (2, 3)}),
+            (0.30, 1.00, {"depth_range": (2, 4)}),
+        ],
+        "train_max": 4,
+        "ood_start": 5,
+    },
+    "mod_add": {
+        "phases": [
+            (0.00, 0.20, {"mod_range": (17, 97)}),
+            (0.20, 1.00, {"mod_range": (97, 997)}),
+        ],
+        "train_max": 997,
+        "ood_start": 2003,
+    },
+    "chain": {
+        "phases": [
+            (0.00, 0.15, {"length_range": (2, 3)}),
+            (0.15, 1.00, {"length_range": (2, 5)}),
+        ],
+        "train_max": 5,
+        "ood_start": 6,
+    },
+    "compare": {
+        "phases": [
+            (0.00, 0.10, {"digit_range": (1, 2)}),
+            (0.10, 1.00, {"digit_range": (1, 4)}),
+        ],
+        "train_max": 4,
+        "ood_start": 5,
+    },
+}
+
+
+def get_difficulty_params(task: str, progress: float) -> Dict[str, Tuple[int, int]]:
+    """Get sampling params for current training progress."""
+    config = TASK_DIFFICULTY_CONFIG.get(task)
+    if not config:
+        return {}
+
+    for start, end, params in config["phases"]:
+        if start <= progress < end:
+            return params
+    return config["phases"][-1][2]
+
+
+TASK_BASE_WEIGHTS = {
+    "addition": 2.0,
+    "multiplication": 2.5,
+    "reverse": 1.5,
+    "successor": 1.0,
+    "mod_add": 1.0,
+    "copy": 1.0,
+    "parity": 1.0,
+    "chain": 0.8,
+    "dyck": 0.7,
+    "compare": 0.7,
+}
+
+
+def get_task_weight(task: str, progress: float) -> float:
+    """Get task sampling weight. Decay easy tasks after 50%."""
+    base = TASK_BASE_WEIGHTS.get(task, 1.0)
+    if task in ["dyck", "compare", "chain"] and progress > 0.5:
+        return base * 0.5
+    return base
+
 class AlgorithmicGenerator:
     """
     Generates synthetic algorithmic tasks for grokking.
@@ -103,6 +229,7 @@ class AlgorithmicGenerator:
         mod: Optional[int] = 97,
         rng: Optional[random.Random] = None,
         difficulty: float = 0.5,
+        mod_range: Optional[Tuple[int, int]] = None,
     ) -> Dict[str, str]:
         """Modular addition: (a + b) mod p"""
         rng = rng or random
@@ -112,7 +239,9 @@ class AlgorithmicGenerator:
         sampled_mod = AlgorithmicGenerator._sample_int_with_digits(
             rng, min(modulus_digits, 5)
         )
-        if mod is None:
+        if mod_range is not None:
+            mod_val = rng.randint(mod_range[0], mod_range[1])
+        elif mod is None:
             mod_val = max(3, sampled_mod)
         else:
             mod_val = max(3, mod)
@@ -145,11 +274,17 @@ class AlgorithmicGenerator:
         length: Optional[int] = None,
         rng: Optional[random.Random] = None,
         difficulty: float = 0.5,
+        length_range: Optional[Tuple[int, int]] = None,
     ) -> Dict[str, str]:
         """Parity of binary string"""
         rng = rng or random
         # NOTE: For OOD evaluation we keep training length fixed at 8 by default.
-        seq_len = length if length is not None else 8
+        if length is not None:
+            seq_len = length
+        elif length_range is not None:
+            seq_len = rng.randint(length_range[0], length_range[1])
+        else:
+            seq_len = 8
         bits = [rng.randint(0, 1) for _ in range(seq_len)]
         parity = sum(bits) % 2
         bit_str = "".join(map(str, bits))
@@ -179,6 +314,7 @@ class AlgorithmicGenerator:
         difficulty: float = 0.5,
         digits: Optional[int] = None,
         digit_bounds: Optional[Tuple[int, int]] = None,
+        digit_range: Optional[Tuple[int, int]] = None,
     ) -> Dict[str, str]:
         """Multi-digit addition.
 
@@ -190,16 +326,18 @@ class AlgorithmicGenerator:
         rng = rng or random
         bucket = AlgorithmicGenerator._difficulty_bucket(difficulty)
         if bucket == "easy":
-            digit_range = (1, 2)
+            default_digit_range = (1, 2)
             default_digit_bounds = (0, 4)  # low carry pressure
         elif bucket == "medium":
-            digit_range = (2, 3)
+            default_digit_range = (2, 3)
             default_digit_bounds = (0, 9)  # neutral carry pressure
         else:
-            digit_range = (4, 4)
+            default_digit_range = (4, 4)
             default_digit_bounds = (5, 9)  # high carry pressure
 
-        digits = digits if digits is not None else rng.randint(digit_range[0], min(digit_range[1], max_digits))
+        active_range = digit_range if digit_range is not None else default_digit_range
+        if digits is None:
+            digits = rng.randint(active_range[0], min(active_range[1], max_digits))
         active_bounds = digit_bounds if digit_bounds is not None else default_digit_bounds
         a = AlgorithmicGenerator._sample_int_with_digit_bounds(
             rng, digits, *active_bounds
@@ -230,11 +368,21 @@ class AlgorithmicGenerator:
         }
 
     @staticmethod
-    def multiplication(max_val: int = 99, rng: Optional[random.Random] = None, difficulty: float = 0.5) -> Dict[str, str]:
+    def multiplication(
+        max_val: int = 99,
+        rng: Optional[random.Random] = None,
+        difficulty: float = 0.5,
+        digits: Optional[int] = None,
+        digit_range: Optional[Tuple[int, int]] = None,
+    ) -> Dict[str, str]:
         """Two-digit multiplication"""
         rng = rng or random
-        digit_range = AlgorithmicGenerator._digit_range(difficulty, cap=4)
-        digits = rng.randint(digit_range[0], digit_range[1])
+        default_range = AlgorithmicGenerator._digit_range(difficulty, cap=4)
+        active_range = digit_range if digit_range is not None else default_range
+        if digits is None:
+            digits = rng.randint(active_range[0], active_range[1])
+        if digits is not None and max_val < 10**digits - 1:
+            max_val = 10**digits - 1
         high = min(max_val, 10**digits - 1)
         low = max(2, 10 ** (digits - 1))
         if low > high:
@@ -267,16 +415,18 @@ class AlgorithmicGenerator:
         length: Optional[int] = None,
         rng: Optional[random.Random] = None,
         difficulty: float = 0.5,
+        length_range: Optional[Tuple[int, int]] = None,
     ) -> Dict[str, str]:
         """Copy task - tests basic sequence modeling"""
         rng = rng or random
-        len_range = AlgorithmicGenerator._length_range(
+        default_range = AlgorithmicGenerator._length_range(
             difficulty,
             easy=(4, 6),
             medium=(7, 10),
             hard=(11, 14),
         )
-        seq_len = length if length is not None else rng.randint(len_range[0], len_range[1])
+        active_range = length_range if length_range is not None else default_range
+        seq_len = length if length is not None else rng.randint(active_range[0], active_range[1])
         seq = [rng.randint(0, 9) for _ in range(seq_len)]
         seq_str = " ".join(map(str, seq))
 
@@ -303,16 +453,18 @@ class AlgorithmicGenerator:
         length: Optional[int] = None,
         rng: Optional[random.Random] = None,
         difficulty: float = 0.5,
+        length_range: Optional[Tuple[int, int]] = None,
     ) -> Dict[str, str]:
         """Reverse task - tests sequential reasoning"""
         rng = rng or random
-        len_range = AlgorithmicGenerator._length_range(
+        default_range = AlgorithmicGenerator._length_range(
             difficulty,
             easy=(4, 6),
             medium=(7, 10),
             hard=(11, 14),
         )
-        seq_len = length if length is not None else rng.randint(len_range[0], len_range[1])
+        active_range = length_range if length_range is not None else default_range
+        seq_len = length if length is not None else rng.randint(active_range[0], active_range[1])
         seq = [rng.randint(0, 9) for _ in range(seq_len)]
         seq_str = " ".join(map(str, seq))
         rev_str = " ".join(map(str, reversed(seq)))
@@ -342,18 +494,23 @@ class AlgorithmicGenerator:
         rng: Optional[random.Random] = None,
         difficulty: float = 0.5,
         force_valid: Optional[bool] = None,
+        depth_range: Optional[Tuple[int, int]] = None,
+        length_range: Optional[Tuple[int, int]] = None,
     ) -> Dict[str, str]:
         """Dyck language (balanced parentheses) - tests stack operations"""
         rng = rng or random
-        len_range = AlgorithmicGenerator._length_range(
+        default_range = AlgorithmicGenerator._length_range(
             difficulty,
             easy=(6, 10),
             medium=(10, 18),
             hard=(18, 30),
         )
-        seq_len = length if length is not None else rng.randint(len_range[0], len_range[1])
+        active_range = length_range if length_range is not None else default_range
+        seq_len = length if length is not None else rng.randint(active_range[0], active_range[1])
         depth_bucket = AlgorithmicGenerator._difficulty_bucket(difficulty)
         bucket = AlgorithmicGenerator._difficulty_bucket(difficulty)
+        if depth_range is not None:
+            max_depth = rng.randint(depth_range[0], depth_range[1])
         if depth_bucket == "easy":
             depth_cap = min(2, max_depth)
         elif depth_bucket == "medium":
@@ -445,15 +602,17 @@ class AlgorithmicGenerator:
         difficulty: float = 0.5,
         operand_high: Optional[int] = None,
         allow_negative: Optional[bool] = None,
+        length_range: Optional[Tuple[int, int]] = None,
     ) -> Dict[str, str]:
         """Chain of arithmetic operations"""
         rng = rng or random
-        op_counts = AlgorithmicGenerator._length_range(
+        default_range = AlgorithmicGenerator._length_range(
             difficulty,
             easy=(2, 3),
             medium=(3, 5),
             hard=(5, 8),
         )
+        op_counts = length_range if length_range is not None else default_range
         bucket = AlgorithmicGenerator._difficulty_bucket(difficulty)
         if bucket == "easy":
             default_operand_high = 9
@@ -505,11 +664,21 @@ class AlgorithmicGenerator:
         }
 
     @staticmethod
-    def comparison(max_val: int = 1000, rng: Optional[random.Random] = None, difficulty: float = 0.5) -> Dict[str, str]:
+    def comparison(
+        max_val: int = 1000,
+        rng: Optional[random.Random] = None,
+        difficulty: float = 0.5,
+        digits: Optional[int] = None,
+        digit_range: Optional[Tuple[int, int]] = None,
+    ) -> Dict[str, str]:
         """Number comparison"""
         rng = rng or random
-        digit_range = AlgorithmicGenerator._digit_range(difficulty, cap=6)
-        digits = rng.randint(digit_range[0], digit_range[1])
+        default_range = AlgorithmicGenerator._digit_range(difficulty, cap=6)
+        active_range = digit_range if digit_range is not None else default_range
+        if digits is None:
+            digits = rng.randint(active_range[0], active_range[1])
+        if digits is not None and max_val < 10**digits - 1:
+            max_val = 10**digits - 1
         high = min(max_val, 10**digits - 1)
         low = max(1, 10 ** (digits - 1))
         if low > high:
@@ -538,11 +707,21 @@ class AlgorithmicGenerator:
         }
 
     @staticmethod
-    def successor(max_val: int = 1000, rng: Optional[random.Random] = None, difficulty: float = 0.5) -> Dict[str, str]:
+    def successor(
+        max_val: int = 1000,
+        rng: Optional[random.Random] = None,
+        difficulty: float = 0.5,
+        digits: Optional[int] = None,
+        digit_range: Optional[Tuple[int, int]] = None,
+    ) -> Dict[str, str]:
         """Successor function"""
         rng = rng or random
-        digit_range = AlgorithmicGenerator._digit_range(difficulty, cap=6)
-        digits = rng.randint(digit_range[0], digit_range[1])
+        default_range = AlgorithmicGenerator._digit_range(difficulty, cap=6)
+        active_range = digit_range if digit_range is not None else default_range
+        if digits is None:
+            digits = rng.randint(active_range[0], active_range[1])
+        if digits is not None and max_val < 10**digits - 1:
+            max_val = 10**digits - 1
         max_n = min(max_val, 10**digits - 1)
         n = rng.randint(0, max_n)
 
@@ -595,6 +774,9 @@ class AlgorithmicGenerator:
         rng: Optional[random.Random] = None,
         generators: Optional[Dict[str, Callable]] = None,
         difficulty: Optional[float] = None,
+        progress: Optional[float] = None,
+        difficulty_schedule: str = "linear",
+        task_weighting: str = "uniform",
     ) -> Dict:
         rng = rng or random
         if difficulty is None:
@@ -605,8 +787,39 @@ class AlgorithmicGenerator:
         if tasks is None:
             tasks = list(generators.keys())
 
-        task = rng.choice(tasks)
-        return generators[task](rng=rng, difficulty=difficulty)
+        if task_weighting == "adaptive" and progress is not None:
+            weights = [get_task_weight(task, progress) for task in tasks]
+            task = rng.choices(tasks, weights=weights, k=1)[0]
+        else:
+            task = rng.choice(tasks)
+
+        if difficulty_schedule == "phased" and progress is not None:
+            params = get_difficulty_params(task, progress)
+            difficulty_value = progress
+        elif difficulty_schedule == "fixed":
+            params = {}
+            difficulty_value = 0.5
+        else:
+            params = {}
+            difficulty_value = difficulty
+
+        kwargs: Dict[str, int | Tuple[int, int]] = {}
+        if "digit_range" in params:
+            kwargs["digits"] = rng.randint(params["digit_range"][0], params["digit_range"][1])
+        if "length_range" in params:
+            sampled_length = rng.randint(params["length_range"][0], params["length_range"][1])
+            if task in {"copy", "reverse", "parity"}:
+                kwargs["length"] = sampled_length
+            elif task == "chain":
+                kwargs["n_ops"] = sampled_length
+            elif task == "dyck":
+                kwargs["length"] = sampled_length
+        if "depth_range" in params:
+            kwargs["max_depth"] = rng.randint(params["depth_range"][0], params["depth_range"][1])
+        if "mod_range" in params:
+            kwargs["mod"] = rng.randint(params["mod_range"][0], params["mod_range"][1])
+
+        return generators[task](rng=rng, difficulty=difficulty_value, **kwargs)
 
     @classmethod
     def _get_generators(cls) -> Dict[str, Callable]:
@@ -638,6 +851,9 @@ class AlgorithmicDataset(IterableDataset):
         tasks: Optional[List[str]] = None,
         seed: Optional[int] = None,
         difficulty_value=None,
+        difficulty_schedule: str = "linear",
+        task_weighting: str = "uniform",
+        total_tokens: Optional[int] = None,
     ):
         self.tokenizer = tokenizer
         self.num_examples = num_examples
@@ -645,8 +861,15 @@ class AlgorithmicDataset(IterableDataset):
         self.tasks = tasks
         self.seed = seed
         self.difficulty_value = difficulty_value
+        self.difficulty_schedule = difficulty_schedule
+        self.task_weighting = task_weighting
         self.tokens_seen = 0
-        self._token_budget = max(1, self.num_examples * max(self.max_seq_len - 1, 1))
+        self._token_budget = max(
+            1,
+            total_tokens
+            if total_tokens is not None
+            else self.num_examples * max(self.max_seq_len - 1, 1),
+        )
         self._worker_token_budget = self._token_budget
 
     def _encode_text(self, text: str) -> List[int]:
@@ -678,9 +901,16 @@ class AlgorithmicDataset(IterableDataset):
         self._worker_token_budget = max(1, self._token_budget / num_workers)
 
         for _ in range(worker_id, self.num_examples, num_workers):
-            difficulty = self._sample_difficulty(rng)
+            progress = min(self.tokens_seen / max(self._worker_token_budget, 1), 1.0)
+            difficulty = self._sample_difficulty(rng, progress)
             example = AlgorithmicGenerator.generate_example(
-                tasks=self.tasks, rng=rng, generators=generators, difficulty=difficulty
+                tasks=self.tasks,
+                rng=rng,
+                generators=generators,
+                difficulty=difficulty,
+                progress=progress,
+                difficulty_schedule=self.difficulty_schedule,
+                task_weighting=self.task_weighting,
             )
             tokens = self._encode_text(example["text"])
 
@@ -705,7 +935,7 @@ class AlgorithmicDataset(IterableDataset):
                 "task": example["task"],
             }
 
-    def _sample_difficulty(self, rng: random.Random) -> float:
+    def _sample_difficulty(self, rng: random.Random, progress: float) -> float:
         if self.difficulty_value is not None:
             try:
                 with self.difficulty_value.get_lock():
@@ -714,11 +944,14 @@ class AlgorithmicDataset(IterableDataset):
                 value = 0.0
             return min(max(value, 0.0), 1.0)
 
-        budget = getattr(self, "_worker_token_budget", self._token_budget)
-        progress = min(self.tokens_seen / budget, 1.0)
+        if self.difficulty_schedule == "fixed":
+            return 0.5
+
+        if self.difficulty_schedule == "phased":
+            return min(max(progress, 0.0), 1.0)
+
         upper = min(1.0, 0.5 + 0.5 * progress)
-        lower = 0.0
-        return rng.uniform(lower, upper)
+        return rng.uniform(0.0, upper)
 
 
 class FixedAlgorithmicDataset(Dataset):
@@ -732,6 +965,8 @@ class FixedAlgorithmicDataset(Dataset):
         tasks: Optional[List[str]] = None,
         seed: int = 42,
         difficulty: float = 0.5,
+        difficulty_schedule: str = "linear",
+        task_weighting: str = "uniform",
     ):
         self.tokenizer = tokenizer
         self.num_examples = num_examples
@@ -739,6 +974,8 @@ class FixedAlgorithmicDataset(Dataset):
         self.tasks = tasks
         self.seed = seed
         self.difficulty = difficulty
+        self.difficulty_schedule = difficulty_schedule
+        self.task_weighting = task_weighting
 
         self.examples: List[Dict[str, torch.Tensor]] = []
 
@@ -747,7 +984,13 @@ class FixedAlgorithmicDataset(Dataset):
 
         for _ in range(self.num_examples):
             example = AlgorithmicGenerator.generate_example(
-                tasks=self.tasks, rng=rng, generators=generators, difficulty=self.difficulty
+                tasks=self.tasks,
+                rng=rng,
+                generators=generators,
+                difficulty=self.difficulty,
+                progress=1.0,
+                difficulty_schedule=self.difficulty_schedule,
+                task_weighting=self.task_weighting,
             )
             tokens = self._encode_text(example["text"])
 
@@ -789,6 +1032,9 @@ def create_algorithmic_dataset(
     tasks: Optional[List[str]] = None,
     seed: int = 42,
     difficulty_value=None,
+    difficulty_schedule: str = "linear",
+    task_weighting: str = "uniform",
+    total_tokens: Optional[int] = None,
 ) -> Union[AlgorithmicDataset, FixedAlgorithmicDataset]:
     """Factory that returns fixed or infinite dataset based on flag."""
 
@@ -807,6 +1053,8 @@ def create_algorithmic_dataset(
             tasks=tasks,
             seed=seed,
             difficulty=difficulty,
+            difficulty_schedule=difficulty_schedule,
+            task_weighting=task_weighting,
         )
 
     return AlgorithmicDataset(
@@ -816,6 +1064,9 @@ def create_algorithmic_dataset(
         tasks=tasks,
         seed=seed,
         difficulty_value=difficulty_value,
+        difficulty_schedule=difficulty_schedule,
+        task_weighting=task_weighting,
+        total_tokens=total_tokens,
     )
 
 

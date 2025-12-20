@@ -56,6 +56,32 @@ def select_device(device: Optional[Union[str, int]] = None) -> torch.device:
 
 
 SPACE_PATTERN = re.compile(r"\s+")
+_INT_RE = re.compile(r"^-?\d{1,40}$")
+
+
+def safe_parse_number(s: str, default: float = float("nan")) -> float:
+    """Parse numeric string with overflow protection."""
+    s = s.strip()
+    if not s or not _INT_RE.match(s):
+        return default
+    try:
+        val = float(s)
+    except (ValueError, OverflowError):
+        return default
+    if math.isinf(val) or math.isnan(val):
+        return default
+    return val
+
+
+def compute_mae(predictions: List[str], targets: List[str]) -> float:
+    """Compute MAE with NaN filtering for invalid parses."""
+    errors: List[float] = []
+    for pred, tgt in zip(predictions, targets):
+        pred_val = safe_parse_number(pred)
+        tgt_val = safe_parse_number(tgt)
+        if not (math.isnan(pred_val) or math.isnan(tgt_val)):
+            errors.append(abs(pred_val - tgt_val))
+    return sum(errors) / len(errors) if errors else float("nan")
 
 
 def prepare_tokenizer(tokenizer_name: str):
@@ -484,14 +510,9 @@ def _is_classification_task(task: str) -> bool:
 
 
 def _numeric_metrics(pred: str, target: str, exact_match: float) -> Dict[str, float]:
-    try:
-        pred_num = float(pred)
-        target_num = float(target)
-        parseable = True
-    except ValueError:
-        parseable = False
-        pred_num = 0.0
-        target_num = 0.0
+    pred_num = safe_parse_number(pred)
+    target_num = safe_parse_number(target)
+    parseable = not (math.isnan(pred_num) or math.isnan(target_num))
 
     pred_digits = re.sub(r"[^0-9\-]", "", pred).lstrip("-") or "0"
     target_digits = re.sub(r"[^0-9\-]", "", target).lstrip("-") or "0"
@@ -781,13 +802,11 @@ def evaluate_condition(
                         }
                     )
 
-            try:
-                val_pred = float(pred)
-                val_tgt = float(norm_tgt)
+            val_pred = safe_parse_number(pred)
+            val_tgt = safe_parse_number(norm_tgt)
+            if not (math.isnan(val_pred) or math.isnan(val_tgt)):
                 total_absolute_error += abs(val_pred - val_tgt)
                 total_numeric_samples += 1
-            except ValueError:
-                pass
             total_examples += 1
 
     aggregated = aggregate(task, metrics_samples)

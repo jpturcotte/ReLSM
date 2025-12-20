@@ -633,10 +633,10 @@ def difficulty_schedule(tokens_seen: int, alg_tokens: int, schedule: str = "line
 
     if schedule == "linear":
         return 0.5 + 0.5 * progress
-    if schedule == "cosine":
-        return 0.5 + 0.5 * (1 - math.cos(math.pi * progress)) / 2
-    if schedule == "step":
-        return 0.5 if progress < 0.5 else 1.0
+    if schedule == "phased":
+        return progress
+    if schedule == "fixed":
+        return 0.5
 
     raise ValueError(f"Unknown difficulty schedule: {schedule}")
 
@@ -755,6 +755,8 @@ def train(args):
             tasks=alg_tasks,
             seed=args.seed,
             difficulty=0.5,
+            difficulty_schedule=args.difficulty_schedule,
+            task_weighting=args.task_weighting,
         )
         alg_loader = DataLoader(
             alg_dataset,
@@ -771,6 +773,9 @@ def train(args):
             tasks=alg_tasks,
             seed=args.seed,
             difficulty_value=difficulty_value,
+            difficulty_schedule=args.difficulty_schedule,
+            task_weighting=args.task_weighting,
+            total_tokens=args.alg_tokens,
         )
         alg_loader = DataLoader(
             alg_dataset,
@@ -817,6 +822,8 @@ def train(args):
                 tasks=alg_tasks,
                 seed=args.seed,
                 difficulty=0.5,
+                difficulty_schedule=args.difficulty_schedule,
+                task_weighting=args.task_weighting,
             )
             if args.train_eval_samples is not None:
                 capped = min(args.train_eval_samples, len(base_dataset))
@@ -829,6 +836,9 @@ def train(args):
                 tasks=alg_tasks,
                 seed=args.seed + 123,
                 difficulty_value=None,
+                difficulty_schedule=args.difficulty_schedule,
+                task_weighting=args.task_weighting,
+                total_tokens=args.alg_tokens,
             )
 
         train_eval_loader = DataLoader(
@@ -939,6 +949,11 @@ def train(args):
         # step count into the equivalent token budget using the hybrid step
         # estimate above.
         warmup_tokens = int(warmup_steps * estimated_tokens_per_step)
+        if warmup_tokens > 0.05 * args.total_tokens:
+            print(
+                f"WARNING: warmup_steps={warmup_steps} is "
+                f"{warmup_tokens/args.total_tokens:.1%} of training. Consider reducing."
+            )
         warmup_source = f"derived from {warmup_steps} manual warmup steps"
     else:
         warmup_tokens = int(args.warmup_frac * args.total_tokens)
@@ -1316,9 +1331,16 @@ def main():
     parser.add_argument(
         "--difficulty_schedule",
         type=str,
-        default="linear",
-        choices=["linear", "cosine", "step"],
-        help="Schedule for ramping algorithmic difficulty",
+        default="phased",
+        choices=["linear", "phased", "fixed"],
+        help="Difficulty curriculum type",
+    )
+    parser.add_argument(
+        "--task_weighting",
+        type=str,
+        default="adaptive",
+        choices=["uniform", "adaptive"],
+        help="Task sampling weights",
     )
     parser.add_argument("--mix_band_tokens", type=int, default=None,
                        help="Transition band (tokens) between algorithmic and language phases")
@@ -1426,10 +1448,10 @@ def main():
     parser.add_argument(
         "--warmup_frac",
         type=float,
-        default=0.1,
+        default=0.02,
         help=(
-            "Fraction of total tokens to use for warmup when warmup_tokens and "
-            "warmup_steps are not set"
+            "Warmup fraction (default 2%) when warmup_tokens and warmup_steps "
+            "are not set"
         ),
     )
     parser.add_argument("--weight_decay", type=float, default=1.0)
