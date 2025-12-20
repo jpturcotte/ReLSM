@@ -111,18 +111,8 @@ class MetricsLogger:
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
         self.hyperparameters = {}
-        self.metrics = {
-            "train_loss": [],
-            "val_loss": [],
-            "tokens_seen": [],
-            "tokens_per_sec": [],
-            "peak_vram_gb": [],
-            "avg_inner_steps": [],
-            "phase": [],
-            "step": [],
-        }
+        self.records = []
         self.evaluations = []
-        self.metric_steps = {}
         self.task_accuracies = {}
         self.train_task_accuracies = {}
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -131,20 +121,10 @@ class MetricsLogger:
             self._append_snapshot()
     
     def log(self, step: int, phase: str, **kwargs):
-        entry = {"step": step, "phase": phase}
-        entry.update(kwargs)
-        self.evaluations.append(entry)
-
-        self.metrics["step"].append(step)
-        self.metrics["phase"].append(phase)
-        
-        for k, v in kwargs.items():
-            if k not in self.metrics:
-                self.metrics[k] = []
-            if k not in self.metric_steps:
-                self.metric_steps[k] = []
-            self.metrics[k].append(v)
-            self.metric_steps[k].append(step)
+        record = {"step": step, "phase": phase}
+        record.update(kwargs)
+        self.records.append(record)
+        self.evaluations.append(record)
     
     def log_task_accuracy(
         self,
@@ -181,10 +161,23 @@ class MetricsLogger:
     def set_hyperparameters(self, hyperparameters: Dict) -> None:
         self.hyperparameters = hyperparameters
 
+    def series(self, key: str, phase: Optional[str] = None):
+        steps = [
+            record["step"]
+            for record in self.records
+            if key in record and (phase is None or record.get("phase") == phase)
+        ]
+        vals = [
+            record[key]
+            for record in self.records
+            if key in record and (phase is None or record.get("phase") == phase)
+        ]
+        return steps, vals
+
     def _append_snapshot(self):
         snapshot = {
             "hyperparameters": self.hyperparameters,
-            "training": self.metrics,
+            "records": self.records,
             "evaluations": self.evaluations,
             "task_accuracies": self.task_accuracies,
             "train_task_accuracies": self.train_task_accuracies,
@@ -196,12 +189,19 @@ class MetricsLogger:
         os.replace(tmp_path, self._metrics_path)
     
     def summary(self) -> Dict:
+        train_losses = self.series("train_loss")[1]
+        val_losses = self.series("val_loss")[1]
+        peak_vram = self.series("peak_vram_gb")[1]
+        tokens_per_sec = self.series("tokens_per_sec")[1]
+        tokens_seen = self.series("tokens_seen")[1]
         return {
-            "final_train_loss": self.metrics["train_loss"][-1] if self.metrics["train_loss"] else None,
-            "final_val_loss": self.metrics["val_loss"][-1] if self.metrics["val_loss"] else None,
-            "peak_vram_gb": max(self.metrics["peak_vram_gb"]) if self.metrics["peak_vram_gb"] else None,
-            "avg_tokens_per_sec": sum(self.metrics["tokens_per_sec"]) / len(self.metrics["tokens_per_sec"]) if self.metrics["tokens_per_sec"] else None,
-            "total_tokens": self.metrics["tokens_seen"][-1] if self.metrics["tokens_seen"] else 0,
+            "final_train_loss": train_losses[-1] if train_losses else None,
+            "final_val_loss": val_losses[-1] if val_losses else None,
+            "peak_vram_gb": max(peak_vram) if peak_vram else None,
+            "avg_tokens_per_sec": (
+                sum(tokens_per_sec) / len(tokens_per_sec) if tokens_per_sec else None
+            ),
+            "total_tokens": tokens_seen[-1] if tokens_seen else 0,
         }
 
     def plot(self):
@@ -209,13 +209,11 @@ class MetricsLogger:
 
         # Loss plot
         plt.figure()
-        train_steps = self.metric_steps.get("train_loss", [])
-        train_losses = self.metrics.get("train_loss", [])
+        train_steps, train_losses = self.series("train_loss", phase="train")
         if train_steps and train_losses:
             plt.plot(train_steps, train_losses, label="train")
 
-        val_steps = self.metric_steps.get("val_loss", [])
-        val_losses = self.metrics.get("val_loss", [])
+        val_steps, val_losses = self.series("val_loss", phase="eval")
         if val_steps and val_losses:
             plt.plot(val_steps, val_losses, label="val")
 
