@@ -1431,11 +1431,11 @@ def train(args):
 
                 if math.isnan(last_grad_norm):
                     diagnostic_metrics["grad_clipped"] = float("nan")
-                    diagnostic_metrics["grad_clip_frac"] = float("nan")
+                    diagnostic_metrics["grad_clip_ratio"] = float("nan")
                 else:
                     grad_clipped = 1.0 if last_grad_norm > args.grad_clip else 0.0
                     diagnostic_metrics["grad_clipped"] = grad_clipped
-                    diagnostic_metrics["grad_clip_frac"] = (
+                    diagnostic_metrics["grad_clip_ratio"] = (
                         args.grad_clip / (last_grad_norm + 1e-12) if grad_clipped else 1.0
                     )
 
