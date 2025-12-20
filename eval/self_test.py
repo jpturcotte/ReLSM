@@ -25,7 +25,7 @@ def run_self_test_suite(
 
     seed_all(seed)
     prompts = ["Hello, world!", "2 + 2 ="]
-    preds, gen_lengths, elapsed = generate_batch(
+    preds, gen_lengths, elapsed, _ = generate_batch(
         model,
         tokenizer,
         prompts,

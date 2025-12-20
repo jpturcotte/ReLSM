@@ -919,6 +919,7 @@ class AlgorithmicDataset(IterableDataset):
         task_weighting: str = "uniform",
         total_tokens: Optional[int] = None,
         easy_mix_frac: float = 0.2,
+        include_lengths: bool = False,
     ):
         self.tokenizer = tokenizer
         self.num_examples = num_examples
@@ -929,6 +930,7 @@ class AlgorithmicDataset(IterableDataset):
         self.difficulty_schedule = difficulty_schedule
         self.task_weighting = task_weighting
         self.easy_mix_frac = easy_mix_frac
+        self.include_lengths = include_lengths
         self.tokens_seen = 0
         self._token_budget = max(
             1,
@@ -941,6 +943,12 @@ class AlgorithmicDataset(IterableDataset):
     def _encode_text(self, text: str) -> List[int]:
         """Encode text with the tokenizer to align training and evaluation."""
         return self.tokenizer.encode(text, add_special_tokens=True)
+
+    def _encode_length(self, text: str) -> int:
+        try:
+            return len(self.tokenizer.encode(text, add_special_tokens=False))
+        except Exception:
+            return len(self.tokenizer(text, truncation=True)["input_ids"])
 
     def __len__(self):
         return self.num_examples
@@ -999,11 +1007,15 @@ class AlgorithmicDataset(IterableDataset):
             n_tokens = int((labels[1:] != -100).sum().item())
             self.tokens_seen += n_tokens
 
-            yield {
+            payload = {
                 "input_ids": input_ids,
                 "labels": labels,
                 "task": example["task"],
             }
+            if self.include_lengths:
+                payload["input_len_tokens"] = self._encode_length(example["input"])
+                payload["target_len_tokens"] = self._encode_length(example["target"])
+            yield payload
 
     def _sample_difficulty(self, rng: random.Random, progress: float) -> float:
         """Sample difficulty based on schedule type."""
@@ -1058,6 +1070,7 @@ class FixedAlgorithmicDataset(Dataset):
         difficulty_schedule: str = "linear",
         task_weighting: str = "uniform",
         easy_mix_frac: float = 0.2,
+        include_lengths: bool = False,
     ):
         self.tokenizer = tokenizer
         self.num_examples = num_examples
@@ -1068,6 +1081,7 @@ class FixedAlgorithmicDataset(Dataset):
         self.difficulty_schedule = difficulty_schedule
         self.task_weighting = task_weighting
         self.easy_mix_frac = easy_mix_frac
+        self.include_lengths = include_lengths
 
         self.examples: List[Dict[str, torch.Tensor]] = []
 
@@ -1102,13 +1116,19 @@ class FixedAlgorithmicDataset(Dataset):
             labels = input_ids.clone()
             labels = labels.masked_fill(attention_mask == 0, -100)
 
-            self.examples.append(
-                {
-                    "input_ids": input_ids,
-                    "labels": labels,
-                    "task": example["task"],
-                }
-            )
+            payload = {
+                "input_ids": input_ids,
+                "labels": labels,
+                "task": example["task"],
+            }
+            if self.include_lengths:
+                payload["input_len_tokens"] = len(
+                    self.tokenizer.encode(example["input"], add_special_tokens=False)
+                )
+                payload["target_len_tokens"] = len(
+                    self.tokenizer.encode(example["target"], add_special_tokens=False)
+                )
+            self.examples.append(payload)
 
     def _encode_text(self, text: str) -> List[int]:
         return self.tokenizer.encode(text, add_special_tokens=True)

@@ -58,6 +58,7 @@ def select_device(device: Optional[Union[str, int]] = None) -> torch.device:
 
 SPACE_PATTERN = re.compile(r"\s+")
 _INT_RE = re.compile(r"^-?(?:\d+\.?\d*|\d*\.?\d+)(?:[eE][+-]?\d+)?$")
+_INTEGER_RE = re.compile(r"^[+-]?\d+$")
 
 
 def safe_parse_number(
@@ -82,6 +83,70 @@ def safe_parse_number(
     if abs(val) > max_magnitude:
         return default
     return val
+
+
+def parse_numeric_prediction(text: str) -> Tuple[float, Optional[str]]:
+    """Parse a numeric prediction with failure categorization."""
+    cleaned = text.strip()
+    if not cleaned:
+        return float("nan"), "empty_output"
+
+    candidate = cleaned.split()[0]
+    if candidate in {"+", "-"}:
+        return float("nan"), "wrong_sign_or_format"
+    if not _INTEGER_RE.match(candidate):
+        return float("nan"), "contains_non_digit"
+    try:
+        return float(int(candidate)), None
+    except ValueError:
+        return float("nan"), "wrong_sign_or_format"
+
+
+def compute_repetition_metrics(token_ids: Sequence[int]) -> Dict[str, float]:
+    """Compute repetition/degeneration metrics for a token sequence."""
+    length = len(token_ids)
+    if length <= 0:
+        return {
+            "repeat_1gram_rate": 0.0,
+            "repeat_2gram_rate": 0.0,
+            "unique_token_fraction": 0.0,
+            "max_run_length": 0.0,
+        }
+
+    repeat_1 = 0
+    max_run = 1
+    current_run = 1
+    bigram_counts: Dict[Tuple[int, int], int] = {}
+    unique_tokens = set()
+
+    prev = token_ids[0]
+    unique_tokens.add(prev)
+    for idx in range(1, length):
+        token = token_ids[idx]
+        unique_tokens.add(token)
+        if token == prev:
+            repeat_1 += 1
+            current_run += 1
+        else:
+            max_run = max(max_run, current_run)
+            current_run = 1
+        bigram = (prev, token)
+        bigram_counts[bigram] = bigram_counts.get(bigram, 0) + 1
+        prev = token
+
+    max_run = max(max_run, current_run)
+    bigram_total = max(length - 1, 1)
+    repeated_bigrams = sum(count - 1 for count in bigram_counts.values() if count > 1)
+    repeat_2_rate = repeated_bigrams / bigram_total
+    repeat_1_rate = repeat_1 / bigram_total
+    unique_fraction = len(unique_tokens) / max(length, 1)
+
+    return {
+        "repeat_1gram_rate": repeat_1_rate,
+        "repeat_2gram_rate": repeat_2_rate,
+        "unique_token_fraction": unique_fraction,
+        "max_run_length": float(max_run),
+    }
 
 
 def compute_mae(predictions: List[str], targets: List[str]) -> float:
@@ -586,6 +651,20 @@ class EvalResult:
     correct: int
     tokens_generated: int
     elapsed: float
+    target_len_tokens: List[int]
+    pred_len_tokens: List[int]
+    length_ratio: List[float]
+    abs_len_error: List[float]
+    stop_reason_counts: Dict[str, int]
+    eos_emitted: int
+    repeat_1gram_rate: List[float]
+    repeat_2gram_rate: List[float]
+    unique_token_fraction: List[float]
+    max_run_length: List[float]
+    parse_successes: int
+    parse_failure_counts: Dict[str, int]
+    numeric_abs_errors: List[float]
+    numeric_rel_errors: List[float]
 
 
 def _base_normalize(text: str) -> str:
@@ -829,6 +908,14 @@ def score_predictions(task: str, preds: List[str], targets: List[str]) -> Tuple[
     return correct, len(targets)
 
 
+def _token_length(tokenizer: Any, text: str) -> int:
+    try:
+        return len(tokenizer.encode(text, add_special_tokens=False))
+    except Exception:
+        encoded = tokenizer(text, return_tensors="pt", truncation=True)
+        return int(encoded["input_ids"].shape[1])
+
+
 def generate_batch(
     model,
     tokenizer,
@@ -839,7 +926,7 @@ def generate_batch(
     task: str,
     batch_size: int = 16,
     generation_kwargs: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[str], List[int], float]:
+) -> Tuple[List[str], List[int], float, Dict[str, List[Any]]]:
     """Generate model completions and return predictions and throughput stats."""
 
     prompts_list = list(prompts)
@@ -865,7 +952,11 @@ def generate_batch(
         buckets.setdefault(seq_len, []).append(item)
 
     preds: List[str] = [""] * len(prompts_list)
+    raw_preds: List[str] = [""] * len(prompts_list)
     generation_lengths: List[int] = [0] * len(prompts_list)
+    stop_reasons: List[str] = ["other"] * len(prompts_list)
+    eos_emitted: List[bool] = [False] * len(prompts_list)
+    pred_token_ids: List[List[int]] = [[] for _ in prompts_list]
     eos_token_id = gen_kwargs.get("eos_token_id")
 
     start = time.time()
@@ -885,15 +976,33 @@ def generate_batch(
                     gen_tokens = outputs[i, prompt_len:]
                     if eos_token_id is not None:
                         eos_positions = (gen_tokens == eos_token_id).nonzero(as_tuple=False)
-                        if eos_positions.numel() > 0:
-                            gen_tokens = gen_tokens[: eos_positions[0].item() + 1]
+                    if eos_positions.numel() > 0:
+                        eos_at = eos_positions[0].item()
+                        gen_tokens = gen_tokens[: eos_at + 1]
+                        stop_reasons[orig_idx] = "eos"
+                        eos_emitted[orig_idx] = True
+                    else:
+                        if gen_tokens.size(0) >= max_new_tokens:
+                            stop_reasons[orig_idx] = "max_new_tokens"
+                        else:
+                            stop_reasons[orig_idx] = "other"
+                else:
+                    if gen_tokens.size(0) >= max_new_tokens:
+                        stop_reasons[orig_idx] = "max_new_tokens"
 
-                    generation_lengths[orig_idx] = int(gen_tokens.size(0))
-                    decoded = tokenizer.decode(gen_tokens, skip_special_tokens=True)
-                    preds[orig_idx] = normalize_prediction(task, decoded)
+                generation_lengths[orig_idx] = int(gen_tokens.size(0))
+                pred_token_ids[orig_idx] = gen_tokens.tolist()
+                decoded = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                raw_preds[orig_idx] = decoded
+                preds[orig_idx] = normalize_prediction(task, decoded)
 
     elapsed = max(1e-6, time.time() - start)
-    return preds, generation_lengths, elapsed
+    return preds, generation_lengths, elapsed, {
+        "raw_predictions": raw_preds,
+        "pred_token_ids": pred_token_ids,
+        "stop_reasons": stop_reasons,
+        "eos_emitted": eos_emitted,
+    }
 
 
 def evaluate_condition(
@@ -928,6 +1037,20 @@ def evaluate_condition(
     collected_examples: List[Dict[str, str]] = []
     metrics_samples: List[Dict[str, float]] = []
     sampled_examples: List[Dict[str, str]] = []
+    target_len_tokens_list: List[int] = []
+    pred_len_tokens_list: List[int] = []
+    length_ratio_list: List[float] = []
+    abs_len_error_list: List[float] = []
+    stop_reason_counts = {"eos": 0, "max_new_tokens": 0, "other": 0}
+    eos_emitted_count = 0
+    repeat_1gram_list: List[float] = []
+    repeat_2gram_list: List[float] = []
+    unique_token_fraction_list: List[float] = []
+    max_run_length_list: List[float] = []
+    parse_successes = 0
+    parse_failure_counts: Dict[str, int] = {}
+    numeric_abs_errors: List[float] = []
+    numeric_rel_errors: List[float] = []
     sample_seen = 0
     sample_target = max(sample_count, 0)
     sample_rng = random.Random(seed + 17)
@@ -936,7 +1059,7 @@ def evaluate_condition(
         batch = dataset[start_idx : start_idx + batch_size]
         prompts = [ex["input"] for ex in batch]
         targets = [ex["target"] for ex in batch]
-        preds, gen_lengths, elapsed = generate_batch(
+        preds, gen_lengths, elapsed, gen_info = generate_batch(
             model,
             tokenizer,
             prompts,
@@ -951,24 +1074,27 @@ def evaluate_condition(
         total_tokens += batch_generated
         total_time += elapsed
         total_gen_len += batch_generated
-        for pred, tgt, ex in zip(preds, targets, batch):
+        raw_preds = gen_info["raw_predictions"]
+        pred_token_ids = gen_info["pred_token_ids"]
+        stop_reasons = gen_info["stop_reasons"]
+        eos_emitted = gen_info["eos_emitted"]
+        for idx, (pred, tgt, ex) in enumerate(zip(preds, targets, batch)):
             norm_tgt = normalize_target(task, tgt)
             metrics = compute_metrics(task, pred, tgt)
             metrics_samples.append(metrics)
-            if sample_target:
-                sample_item = {
-                    "prompt": ex["input"],
-                    "target": tgt,
-                    "expected_output": tgt,
-                    "prediction": pred,
-                }
-                if len(sampled_examples) < sample_target:
-                    sampled_examples.append(sample_item)
-                else:
-                    idx = sample_rng.randint(0, sample_seen)
-                    if idx < sample_target:
-                        sampled_examples[idx] = sample_item
-                sample_seen += 1
+            target_len_tokens = _token_length(tokenizer, norm_tgt)
+            pred_tokens = pred_token_ids[idx]
+            pred_len_tokens = len(pred_tokens)
+            length_ratio = pred_len_tokens / max(target_len_tokens, 1)
+            abs_len_error = abs(pred_len_tokens - target_len_tokens)
+            repeat_metrics = compute_repetition_metrics(pred_tokens)
+            stop_reason = stop_reasons[idx]
+            eos_hit = eos_emitted[idx]
+            if stop_reason not in stop_reason_counts:
+                stop_reason = "other"
+            stop_reason_counts[stop_reason] += 1
+            eos_emitted_count += 1 if eos_hit else 0
+
             if metrics["exact_match"] == 1.0:
                 total_correct += 1
             else:
@@ -982,14 +1108,55 @@ def evaluate_condition(
                         }
                     )
 
+            target_len_tokens_list.append(target_len_tokens)
+            pred_len_tokens_list.append(pred_len_tokens)
+            length_ratio_list.append(length_ratio)
+            abs_len_error_list.append(abs_len_error)
+            repeat_1gram_list.append(repeat_metrics["repeat_1gram_rate"])
+            repeat_2gram_list.append(repeat_metrics["repeat_2gram_rate"])
+            unique_token_fraction_list.append(repeat_metrics["unique_token_fraction"])
+            max_run_length_list.append(repeat_metrics["max_run_length"])
+
+            parse_ok = None
             if _is_numeric_task(task):
-                val_pred = safe_parse_number(pred)
-                val_tgt = safe_parse_number(norm_tgt)
-                if math.isnan(val_pred):
+                parsed_pred, failure_reason = parse_numeric_prediction(raw_preds[idx])
+                parsed_tgt, tgt_failure = parse_numeric_prediction(norm_tgt)
+                parse_ok = failure_reason is None
+                if not parse_ok:
                     total_parse_failures += 1
-                elif not math.isnan(val_tgt):
-                    total_absolute_error += abs(val_pred - val_tgt)
+                    parse_failure_counts[failure_reason] = (
+                        parse_failure_counts.get(failure_reason, 0) + 1
+                    )
+                elif tgt_failure is None:
+                    abs_error = abs(parsed_pred - parsed_tgt)
+                    rel_error = abs_error / max(abs(parsed_tgt), 1.0)
+                    total_absolute_error += abs_error
                     total_numeric_samples += 1
+                    parse_successes += 1
+                    numeric_abs_errors.append(abs_error)
+                    numeric_rel_errors.append(rel_error)
+                else:
+                    total_parse_failures += 1
+
+            if sample_target:
+                sample_item = {
+                    "prompt": ex["input"],
+                    "target": tgt,
+                    "expected_output": tgt,
+                    "prediction": pred,
+                    "target_len_tokens": target_len_tokens,
+                    "pred_len_tokens": pred_len_tokens,
+                    "stop_reason": stop_reason,
+                    "parse_ok": parse_ok,
+                    "repeat_1gram_rate": repeat_metrics["repeat_1gram_rate"],
+                }
+                if len(sampled_examples) < sample_target:
+                    sampled_examples.append(sample_item)
+                else:
+                    idx = sample_rng.randint(0, sample_seen)
+                    if idx < sample_target:
+                        sampled_examples[idx] = sample_item
+                sample_seen += 1
             total_examples += 1
 
     aggregated = aggregate(task, metrics_samples)
@@ -1017,6 +1184,20 @@ def evaluate_condition(
         correct=total_correct,
         tokens_generated=total_tokens,
         elapsed=total_time,
+        target_len_tokens=target_len_tokens_list,
+        pred_len_tokens=pred_len_tokens_list,
+        length_ratio=length_ratio_list,
+        abs_len_error=abs_len_error_list,
+        stop_reason_counts=stop_reason_counts,
+        eos_emitted=eos_emitted_count,
+        repeat_1gram_rate=repeat_1gram_list,
+        repeat_2gram_rate=repeat_2gram_list,
+        unique_token_fraction=unique_token_fraction_list,
+        max_run_length=max_run_length_list,
+        parse_successes=parse_successes,
+        parse_failure_counts=parse_failure_counts,
+        numeric_abs_errors=numeric_abs_errors,
+        numeric_rel_errors=numeric_rel_errors,
     )
 
 
