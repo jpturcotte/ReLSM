@@ -808,6 +808,7 @@ def evaluate_condition(
                 sample_item = {
                     "prompt": ex["input"],
                     "target": tgt,
+                    "expected_output": tgt,
                     "prediction": pred,
                 }
                 if len(sampled_examples) < sample_target:
@@ -825,6 +826,7 @@ def evaluate_condition(
                         {
                             "prompt": ex["input"],
                             "target": tgt,
+                            "expected_output": tgt,
                             "prediction": pred,
                         }
                     )
