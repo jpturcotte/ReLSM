@@ -221,6 +221,34 @@ def sample_difficulty_warmup_ramp(
     noise = rng.gauss(0, 0.05)
     return max(0.0, min(1.0, base + noise))
 
+# =============================================================================
+# TASK WEIGHTING LOGIC
+# =============================================================================
+
+TASK_BASE_WEIGHTS = {
+    "addition": 2.0,
+    "multiplication": 2.5,
+    "reverse": 1.5,
+    "successor": 1.0,
+    "mod_add": 1.0,
+    "copy": 1.0,
+    "parity": 1.0,
+    "chain": 0.8,
+    "dyck": 0.7,
+    "compare": 0.7,
+}
+
+
+def get_task_weight(task: str, progress: float) -> float:
+    """Get task sampling weight. Decay easy tasks after 50%."""
+    base = TASK_BASE_WEIGHTS.get(task, 1.0)
+    # Decay simple algorithmic tasks in the second half of training
+    # to focus capacity on harder tasks or language data.
+    if task in ["dyck", "compare", "chain"] and progress > 0.5:
+        return base * 0.5
+    return base
+
+
 class AlgorithmicGenerator:
     """
     Generates synthetic algorithmic tasks for grokking.
@@ -916,6 +944,7 @@ class AlgorithmicDataset(IterableDataset):
         seed: Optional[int] = None,
         difficulty_value=None,
         difficulty_fn: Optional[Callable[[str], float]] = None,
+        weighting_fn: Optional[Callable[[str], float]] = None,
         difficulty_schedule: str = "smooth",
         task_weighting: str = "uniform",
         total_tokens: Optional[int] = None,
@@ -929,6 +958,7 @@ class AlgorithmicDataset(IterableDataset):
         self.seed = seed
         self.difficulty_value = difficulty_value
         self.difficulty_fn = difficulty_fn
+        self.weighting_fn = weighting_fn
         self.difficulty_schedule = difficulty_schedule
         self.task_weighting = task_weighting
         self.easy_mix_frac = easy_mix_frac
@@ -1042,6 +1072,11 @@ class AlgorithmicDataset(IterableDataset):
         generators: Dict[str, Callable],
     ) -> str:
         tasks = self.tasks or list(generators.keys())
+        if self.weighting_fn is not None:
+            weights = [self.weighting_fn(task) for task in tasks]
+            if sum(weights) <= 0:
+                weights = [1.0] * len(tasks)
+            return rng.choices(tasks, weights=weights, k=1)[0]
         if self.task_weighting == "adaptive":
             weights = [get_task_weight(task, progress) for task in tasks]
             return rng.choices(tasks, weights=weights, k=1)[0]
@@ -1179,6 +1214,7 @@ def create_algorithmic_dataset(
     seed: int = 42,
     difficulty_value=None,
     difficulty_fn: Optional[Callable[[str], float]] = None,
+    weighting_fn: Optional[Callable[[str], float]] = None,
     difficulty_schedule: str = "smooth",
     task_weighting: str = "uniform",
     total_tokens: Optional[int] = None,
@@ -1214,6 +1250,7 @@ def create_algorithmic_dataset(
         seed=seed,
         difficulty_value=difficulty_value,
         difficulty_fn=difficulty_fn,
+        weighting_fn=weighting_fn,
         difficulty_schedule=difficulty_schedule,
         task_weighting=task_weighting,
         total_tokens=total_tokens,
