@@ -651,7 +651,7 @@ def _decode_example_text(example: Dict[str, torch.Tensor], tokenizer) -> Optiona
     if valid.numel() == 0:
         return None
     last_pos = int(valid[-1].item())
-    full_tokens = torch.cat([input_ids[: last_pos + 1], labels[last_pos : last_pos + 1]])
+    full_tokens = input_ids[: last_pos + 1]
     return tokenizer.decode(full_tokens, skip_special_tokens=True)
 
 
