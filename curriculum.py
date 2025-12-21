@@ -20,7 +20,7 @@ class TaskCurriculumState:
         step_size: float = 0.05,
     ) -> None:
         self._manager = manager
-        self._state = manager.dict()
+        self._state = manager.dict() if manager is not None else {}
         self.init_difficulty = init_difficulty
         self.ema_decay = ema_decay
         self.step_size = step_size
@@ -138,6 +138,16 @@ class TaskCurriculumState:
         state = self._state[task]
         ema_acc = float(state.get("ema_acc", 0.0))
         return max(min_weight, 1.0 - ema_acc)
+
+    def get_difficulty_snapshot(self) -> Dict[str, float]:
+        """Return a plain dict snapshot for worker-local caching."""
+        return {
+            task: self.get_task_state(task)["difficulty"] for task in self._state
+        }
+
+    def get_sampling_weights_snapshot(self) -> Dict[str, float]:
+        """Return a plain dict of sampling weights."""
+        return {task: self.get_sampling_weight(task) for task in self._state}
 
     def get_task_state(self, task: str) -> Dict[str, float]:
         self._ensure_task(task)

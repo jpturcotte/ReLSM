@@ -1372,21 +1372,31 @@ def train(args):
         log_print(f"Restricting algorithmic tasks to: {', '.join(alg_tasks)}")
 
     if args.use_task_curriculum:
-        manager = Manager()
+        manager = None if args.num_workers == 0 else Manager()
         curriculum_tasks = alg_tasks or sorted(available_tasks)
         task_curriculum = TaskCurriculumState(manager, tasks=curriculum_tasks)
-        difficulty_fn = partial(
-            task_curriculum.get_difficulty,
-            jitter_prob=args.curriculum_jitter,
-        )
-        eval_difficulty_fn = partial(
-            task_curriculum.get_difficulty,
-            jitter_prob=0.0,
-        )
-        weighting_fn = partial(
-            task_curriculum.get_sampling_weight,
-            min_weight=0.05,
-        )
+
+        difficulty_snapshot: Dict[str, float] = {}
+        weights_snapshot: Dict[str, float] = {}
+
+        def refresh_curriculum_snapshots() -> None:
+            nonlocal difficulty_snapshot, weights_snapshot
+            difficulty_snapshot = task_curriculum.get_difficulty_snapshot()
+            weights_snapshot = task_curriculum.get_sampling_weights_snapshot()
+
+        refresh_curriculum_snapshots()
+
+        def difficulty_fn(task: str) -> float:
+            difficulty = difficulty_snapshot.get(task, 0.2)
+            if args.curriculum_jitter > 0.0 and random.random() < args.curriculum_jitter:
+                return random.uniform(0.0, difficulty)
+            return difficulty
+
+        def eval_difficulty_fn(task: str) -> float:
+            return difficulty_snapshot.get(task, 0.2)
+
+        def weighting_fn(task: str) -> float:
+            return weights_snapshot.get(task, 1.0)
 
     # Phase 1: Algorithmic
     if args.fixed_data:
@@ -2235,6 +2245,7 @@ def train(args):
                         if curriculum_metrics:
                             logger.log(step=global_step, phase="eval", **curriculum_metrics)
                             log_print("  Curriculum: " + " | ".join(sorted(curriculum_log_lines)))
+                        refresh_curriculum_snapshots()
                     if args.extended_logging:
                         log_print(
                             f"  Training accuracy ({train_eval_label}): {train_acc*100:.2f}% | "
