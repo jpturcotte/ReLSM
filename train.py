@@ -529,6 +529,18 @@ def run_eval_diagnostics(
 NUMERIC_TASKS = {"mod_add", "addition", "multiplication", "chain", "successor", "parity"}
 MAE_TASKS = {"mod_add", "addition", "multiplication", "chain", "successor"}
 SEQUENCE_TASKS = {"copy", "reverse"}
+TASK_SEPARATORS = {
+    "copy": ["->", "=>", "=", ":"],
+    "reverse": ["->", "=>", "=", ":"],
+    "parity": ["=", "?"],
+    "dyck": ["?"],
+    "addition": ["="],
+    "multiplication": ["="],
+    "mod_add": ["=", "?"],
+    "chain": ["="],
+    "compare": ["->", "?"],
+    "successor": ["=", "=>"],
+}
 
 
 def _normalize_text(text: str) -> str:
@@ -644,25 +656,27 @@ def _decode_example_text(example: Dict[str, torch.Tensor], tokenizer) -> Optiona
 
 
 def _extract_prompt_target(full_text: str, task: str) -> Optional[Dict[str, str]]:
-    if task in SEQUENCE_TASKS:
-        separators = ["->", "=>", "=", ":"]
-        sep_index = -1
-        chosen_sep = None
-        for sep in separators:
-            idx = full_text.rfind(sep)
-            if idx > sep_index:
-                sep_index = idx
-                chosen_sep = sep
-        if sep_index == -1 or chosen_sep is None:
-            return None
-        prompt = full_text[: sep_index + len(chosen_sep)].rstrip() + " "
-        target = full_text[sep_index + len(chosen_sep) :].strip()
-        return {"prompt": prompt, "target": target}
+    separators = TASK_SEPARATORS.get(task, ["=", "->", "=>"])
 
-    if " " not in full_text:
+    sep_index = -1
+    chosen_sep = None
+    for sep in separators:
+        idx = full_text.rfind(sep)
+        if idx > sep_index:
+            sep_index = idx
+            chosen_sep = sep
+
+    if sep_index == -1 or chosen_sep is None:
+        if " " not in full_text:
+            return None
+        prompt, target = full_text.rsplit(" ", 1)
+        return {"prompt": prompt.rstrip() + " ", "target": target.strip()}
+
+    prompt = full_text[: sep_index + len(chosen_sep)].rstrip() + " "
+    target = full_text[sep_index + len(chosen_sep) :].strip()
+    if not prompt or not target:
         return None
-    prompt, target = full_text.rsplit(" ", 1)
-    return {"prompt": prompt.rstrip() + " ", "target": target.strip()}
+    return {"prompt": prompt, "target": target}
 
 
 def _iter_eval_examples(loader, max_samples: Optional[int]):
