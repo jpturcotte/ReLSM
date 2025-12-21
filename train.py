@@ -1339,6 +1339,7 @@ def train(args):
     task_curriculum = None
     difficulty_fn = None
     eval_difficulty_fn = None
+    weighting_fn = None
     if args.use_task_curriculum:
         difficulty_value = None
     elif not args.fixed_data and args.difficulty_schedule in {"linear", "phased", "fixed"}:
@@ -1367,6 +1368,10 @@ def train(args):
         eval_difficulty_fn = partial(
             task_curriculum.get_difficulty,
             jitter_prob=0.0,
+        )
+        weighting_fn = partial(
+            task_curriculum.get_sampling_weight,
+            min_weight=0.05,
         )
 
     # Phase 1: Algorithmic
@@ -1399,6 +1404,7 @@ def train(args):
             seed=args.seed,
             difficulty_value=difficulty_value,
             difficulty_fn=difficulty_fn,
+            weighting_fn=weighting_fn,
             difficulty_schedule=args.difficulty_schedule,
             task_weighting=args.task_weighting,
             total_tokens=args.alg_tokens,

@@ -128,6 +128,17 @@ class TaskCurriculumState:
             return random.uniform(0.0, difficulty)
         return difficulty
 
+    def get_sampling_weight(self, task: str, min_weight: float = 0.05) -> float:
+        """
+        Return sampling weight inversely proportional to competence.
+        High error -> High weight (sample more often).
+        High accuracy -> Low weight (maintenance mode).
+        """
+        self._ensure_task(task)
+        state = self._state[task]
+        ema_acc = float(state.get("ema_acc", 0.0))
+        return max(min_weight, 1.0 - ema_acc)
+
     def get_task_state(self, task: str) -> Dict[str, float]:
         self._ensure_task(task)
         task_state = self._state[task]
