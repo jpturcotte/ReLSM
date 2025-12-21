@@ -1821,9 +1821,16 @@ def train(args):
                 progress = curriculum.progress * 100
 
                 with torch.no_grad():
-                    weight_norm = math.sqrt(
-                        sum((param.detach().float() ** 2).sum().item() for param in model.parameters())
-                    )
+                    params = [
+                        param.detach().view(-1)
+                        for param in model.parameters()
+                        if param.numel() > 0
+                    ]
+                    if params:
+                        all_params = torch.cat(params)
+                        weight_norm = all_params.norm(2.0, dtype=torch.float32).item()
+                    else:
+                        weight_norm = float("nan")
                 effective_wd_pressure = args.weight_decay * weight_norm
 
                 print(f"Loss: {avg_loss:.4f} | LR: {lr:.2e}")
@@ -1950,9 +1957,16 @@ def train(args):
                     {f"eval.task_weight.{task}": weight for task, weight in eval_task_weights.items()}
                 )
                 with torch.no_grad():
-                    weight_norm = math.sqrt(
-                        sum((param.detach().float() ** 2).sum().item() for param in model.parameters())
-                    )
+                    params = [
+                        param.detach().view(-1)
+                        for param in model.parameters()
+                        if param.numel() > 0
+                    ]
+                    if params:
+                        all_params = torch.cat(params)
+                        weight_norm = all_params.norm(2.0, dtype=torch.float32).item()
+                    else:
+                        weight_norm = float("nan")
                 effective_wd_pressure = args.weight_decay * weight_norm
                 if args.extended_logging:
                     log_print(f"  Grad norm: {last_grad_norm:.1f}")
