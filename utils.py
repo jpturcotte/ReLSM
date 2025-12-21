@@ -750,16 +750,27 @@ def _is_classification_task(task: str) -> bool:
     return task in {"parity", "dyck", "compare"}
 
 
+def _normalize_numeric_str(value: str) -> str:
+    if value.startswith("-"):
+        rest = value[1:].lstrip("0") or "0"
+        return f"-{rest}"
+    return value.lstrip("0") or "0"
+
+
 def _numeric_metrics(pred: str, target: str, exact_match: float) -> Dict[str, float]:
     pred_num = safe_parse_number(pred)
     target_num = safe_parse_number(target)
     parseable = not (math.isnan(pred_num) or math.isnan(target_num))
 
-    pred_digits = re.sub(r"[^0-9\-]", "", pred).lstrip("-") or "0"
-    target_digits = re.sub(r"[^0-9\-]", "", target).lstrip("-") or "0"
-    max_len = max(len(pred_digits), len(target_digits))
-    pred_padded = pred_digits.zfill(max_len)
-    target_padded = target_digits.zfill(max_len)
+    pred_clean = re.sub(r"[^\d\-]", "", pred) or "0"
+    target_clean = re.sub(r"[^\d\-]", "", target) or "0"
+
+    pred_clean = _normalize_numeric_str(pred_clean)
+    target_clean = _normalize_numeric_str(target_clean)
+
+    max_len = max(len(pred_clean), len(target_clean))
+    pred_padded = pred_clean.rjust(max_len)
+    target_padded = target_clean.rjust(max_len)
     token_accuracy = sum(p == t for p, t in zip(pred_padded, target_padded)) / max_len
 
     if parseable:
@@ -903,7 +914,8 @@ def build_dataset(
         rng = random.Random(example_seed)
         kwargs = dict(params)
         if task == "dyck":
-            kwargs["force_valid"] = i < n / 2
+            valid_ratio = params.get("valid_ratio", 0.5)
+            kwargs["force_valid"] = rng.random() < valid_ratio
         example = gen_fn(rng=rng, difficulty=difficulty, **kwargs)
         examples.append(example)
     return examples
