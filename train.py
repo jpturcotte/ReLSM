@@ -1431,7 +1431,10 @@ def train(args):
 
     # Training-eval loader (for grokking memorization tracking)
     if args.train_eval_mode == "auto":
-        train_eval_mode = "fixed" if args.fixed_data else "none"
+        if args.use_task_curriculum:
+            train_eval_mode = "procedural"
+        else:
+            train_eval_mode = "fixed" if args.fixed_data else "none"
     else:
         train_eval_mode = args.train_eval_mode
 
