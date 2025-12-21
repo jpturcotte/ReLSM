@@ -228,19 +228,31 @@ def module_grad_weight_norm(module: Optional[nn.Module]) -> Tuple[float, float]:
     params = list(module.parameters(recurse=True))
     if not params:
         return float("nan"), float("nan")
-    total_grad_sq = 0.0
-    total_weight_sq = 0.0
-    for param in params:
-        total_weight_sq += param.detach().norm(2.0, dtype=torch.float32).item() ** 2
-        if param.grad is not None:
-            total_grad_sq += param.grad.detach().norm(2.0, dtype=torch.float32).item() ** 2
-    grad_norm = math.sqrt(total_grad_sq)
+    with torch.no_grad():
+        weight_tensors = [
+            param.detach().view(-1) for param in params if param.numel() > 0
+        ]
+        if weight_tensors:
+            all_weights = torch.cat(weight_tensors)
+            weight_norm = all_weights.norm(2.0, dtype=torch.float32).item()
+        else:
+            weight_norm = float("nan")
+
+        grads = [
+            param.grad.detach().view(-1)
+            for param in params
+            if param.grad is not None and param.grad.numel() > 0
+        ]
+        if grads:
+            all_grads = torch.cat(grads)
+            grad_norm = all_grads.norm(2.0, dtype=torch.float32).item()
+        else:
+            grad_norm = 0.0
     if math.isnan(grad_norm):
         print(
             f"WARNING: NaN detected in logging for module: {module.__class__.__name__}"
         )
         grad_norm = 0.0
-    weight_norm = math.sqrt(total_weight_sq)
     return grad_norm, weight_norm
 
 
