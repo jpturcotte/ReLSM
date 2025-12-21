@@ -1160,6 +1160,7 @@ def evaluate_condition(
                     "stop_reason": stop_reason,
                     "parse_ok": parse_ok,
                     "repeat_1gram_rate": repeat_metrics["repeat_1gram_rate"],
+                    "difficulty": difficulty,
                 }
                 if len(sampled_examples) < sample_target:
                     sampled_examples.append(sample_item)

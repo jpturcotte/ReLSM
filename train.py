@@ -342,6 +342,7 @@ def evaluate_algorithmic(
         "overall_mae": results.get("overall_mae"),
         "per_task_mae": results.get("per_task_mae", {}),
         "sampled_examples_by_task": results.get("sampled_examples_by_task", {}),
+        "diagnostics": results.get("diagnostics", {}),
     }
 
 
@@ -789,16 +790,43 @@ def evaluate_task_accuracy(
     pred_len_tokens: List[int] = []
     length_ratio: List[float] = []
     abs_len_error: List[float] = []
+    per_task_lengths: Dict[str, Dict[str, List[float]]] = defaultdict(
+        lambda: {
+            "target_len_tokens": [],
+            "pred_len_tokens": [],
+            "length_ratio": [],
+            "abs_len_error": [],
+        }
+    )
     stop_reason_counts = {"eos": 0, "max_new_tokens": 0, "other": 0}
+    stop_reason_counts_by_task: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {"eos": 0, "max_new_tokens": 0, "other": 0}
+    )
     eos_emitted = 0
+    eos_emitted_by_task: Dict[str, int] = defaultdict(int)
     repeat_1gram_rates: List[float] = []
     repeat_2gram_rates: List[float] = []
     unique_token_fractions: List[float] = []
     max_run_lengths: List[float] = []
+    repetition_by_task: Dict[str, Dict[str, List[float]]] = defaultdict(
+        lambda: {
+            "repeat_1gram_rate": [],
+            "repeat_2gram_rate": [],
+            "unique_token_fraction": [],
+            "max_run_length": [],
+        }
+    )
     parse_successes = 0
     parse_failure_counts = defaultdict(int)
+    parse_successes_by_task: Dict[str, int] = defaultdict(int)
+    parse_failure_counts_by_task: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
     numeric_abs_errors: List[float] = []
     numeric_rel_errors: List[float] = []
+    numeric_abs_errors_by_task: Dict[str, List[float]] = defaultdict(list)
+    numeric_rel_errors_by_task: Dict[str, List[float]] = defaultdict(list)
+    task_difficulty_sum: Dict[str, float] = defaultdict(float)
 
     for example in _iter_eval_examples(loader, max_samples):
         task = example.get("task")
@@ -825,6 +853,9 @@ def evaluate_task_accuracy(
         metrics = compute_metrics(task, pred_norm, target)
         metrics_by_task[task].append(metrics)
         total[task] += 1
+        difficulty = example.get("difficulty")
+        if difficulty is not None:
+            task_difficulty_sum[task] += float(difficulty)
         if metrics["exact_match"] == 1.0:
             correct[task] += 1
 
@@ -837,12 +868,25 @@ def evaluate_task_accuracy(
         abs_len_error.append(abs(pred_len - target_len))
         stop_reason = pred_bundle["stop_reason"]
         stop_reason_counts[stop_reason] = stop_reason_counts.get(stop_reason, 0) + 1
+        task_stop_counts = stop_reason_counts_by_task[task]
+        task_stop_counts[stop_reason] = task_stop_counts.get(stop_reason, 0) + 1
         eos_emitted += 1 if stop_reason == "eos" else 0
+        eos_emitted_by_task[task] += 1 if stop_reason == "eos" else 0
+        per_task_lengths[task]["target_len_tokens"].append(target_len)
+        per_task_lengths[task]["pred_len_tokens"].append(pred_len)
+        per_task_lengths[task]["length_ratio"].append(pred_len / max(target_len, 1))
+        per_task_lengths[task]["abs_len_error"].append(abs(pred_len - target_len))
         repetition = compute_repetition_metrics(pred_tokens)
         repeat_1gram_rates.append(repetition["repeat_1gram_rate"])
         repeat_2gram_rates.append(repetition["repeat_2gram_rate"])
         unique_token_fractions.append(repetition["unique_token_fraction"])
         max_run_lengths.append(repetition["max_run_length"])
+        repetition_by_task[task]["repeat_1gram_rate"].append(repetition["repeat_1gram_rate"])
+        repetition_by_task[task]["repeat_2gram_rate"].append(repetition["repeat_2gram_rate"])
+        repetition_by_task[task]["unique_token_fraction"].append(
+            repetition["unique_token_fraction"]
+        )
+        repetition_by_task[task]["max_run_length"].append(repetition["max_run_length"])
 
         parse_ok = None
         if task in numeric_tasks:
@@ -850,17 +894,26 @@ def evaluate_task_accuracy(
             parsed_tgt, tgt_failure = parse_numeric_prediction(target)
             parse_ok = failure_reason is None
             if not parse_ok:
-                parse_failure_counts[failure_reason] += 1
-            elif tgt_failure is None and task in MAE_TASKS:
+                if failure_reason is not None:
+                    parse_failure_counts[failure_reason] += 1
+                    parse_failure_counts_by_task[task][failure_reason] += 1
+            elif tgt_failure is not None:
+                parse_failure_counts[tgt_failure] += 1
+                parse_failure_counts_by_task[task][tgt_failure] += 1
+            else:
+                parse_successes += 1
+                parse_successes_by_task[task] += 1
+            if parse_ok and tgt_failure is None and task in MAE_TASKS:
                 abs_error = abs(parsed_pred - parsed_tgt)
                 rel_error = abs_error / max(abs(parsed_tgt), 1.0)
                 total_abs_error += abs_error
                 total_numeric += 1
                 per_task_abs_error[task] += abs_error
                 per_task_numeric[task] += 1
-                parse_successes += 1
                 numeric_abs_errors.append(abs_error)
                 numeric_rel_errors.append(rel_error)
+                numeric_abs_errors_by_task[task].append(abs_error)
+                numeric_rel_errors_by_task[task].append(rel_error)
         if sample_count_per_task > 0:
             rng = sample_rngs.get(task)
             if rng is None:
@@ -876,6 +929,7 @@ def evaluate_task_accuracy(
                 "stop_reason": stop_reason,
                 "parse_ok": parse_ok,
                 "repeat_1gram_rate": repetition["repeat_1gram_rate"],
+                "difficulty": difficulty,
             }
             seen = seen_samples_by_task[task]
             if len(sampled_examples_by_task[task]) < sample_count_per_task:
@@ -911,6 +965,124 @@ def evaluate_task_accuracy(
     overall_aggregated = aggregate("overall", total_metrics)
     overall_mae = total_abs_error / total_numeric if total_numeric else None
     total_numeric_samples = parse_successes + sum(parse_failure_counts.values())
+    assert sum(total.values()) == len(target_len_tokens) == len(pred_len_tokens)
+    task_counts = dict(total)
+    task_difficulty_mean = {
+        task: (
+            task_difficulty_sum[task] / task_counts[task]
+            if task_counts[task]
+            else 0.0
+        )
+        for task in task_counts
+    }
+    if task_counts and not task_difficulty_sum:
+        task_difficulty_mean = {task: 0.0 for task in task_counts}
+
+    def _mean(values: List[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
+
+    answer_length = {
+        "mean": {
+            "target_len_tokens": _mean(target_len_tokens),
+            "pred_len_tokens": _mean(pred_len_tokens),
+            "length_ratio": _mean(length_ratio),
+            "abs_len_error": _mean(abs_len_error),
+        },
+        "by_task": {
+            task: {
+                "target_len_tokens": _mean(payload["target_len_tokens"]),
+                "pred_len_tokens": _mean(payload["pred_len_tokens"]),
+                "length_ratio": _mean(payload["length_ratio"]),
+                "abs_len_error": _mean(payload["abs_len_error"]),
+            }
+            for task, payload in per_task_lengths.items()
+        },
+        "eos_emitted_rate": eos_emitted / sum(total.values()) if total else 0.0,
+        "eos_emitted_rate_by_task": {
+            task: (eos_emitted_by_task.get(task, 0) / task_counts.get(task, 1))
+            for task in task_counts
+        },
+        "stop_reason_counts": stop_reason_counts,
+        "stop_reason_counts_by_task": dict(stop_reason_counts_by_task),
+    }
+
+    repetition = {
+        "repeat_1gram_rate": {
+            "mean": _mean(repeat_1gram_rates),
+            "by_task": {
+                task: _mean(payload["repeat_1gram_rate"])
+                for task, payload in repetition_by_task.items()
+            },
+        },
+        "repeat_2gram_rate": {
+            "mean": _mean(repeat_2gram_rates),
+            "by_task": {
+                task: _mean(payload["repeat_2gram_rate"])
+                for task, payload in repetition_by_task.items()
+            },
+        },
+        "unique_token_fraction": {
+            "mean": _mean(unique_token_fractions),
+            "by_task": {
+                task: _mean(payload["unique_token_fraction"])
+                for task, payload in repetition_by_task.items()
+            },
+        },
+        "max_run_length": {
+            "mean": _mean(max_run_lengths),
+            "by_task": {
+                task: _mean(payload["max_run_length"])
+                for task, payload in repetition_by_task.items()
+            },
+        },
+    }
+
+    parse_metrics = {
+        "parse_success_rate": (
+            parse_successes / total_numeric_samples if total_numeric_samples else 0.0
+        ),
+        "non_numeric_rate": (
+            1.0 - (parse_successes / total_numeric_samples)
+            if total_numeric_samples
+            else 0.0
+        ),
+        "numeric_abs_error": _mean(numeric_abs_errors),
+        "numeric_rel_error": _mean(numeric_rel_errors),
+        "by_task": {
+            task: {
+                "parse_success_rate": (
+                    parse_successes_by_task.get(task, 0)
+                    / (
+                        parse_successes_by_task.get(task, 0)
+                        + sum(parse_failure_counts_by_task[task].values())
+                    )
+                    if (parse_successes_by_task.get(task, 0)
+                    + sum(parse_failure_counts_by_task[task].values()))
+                    else 0.0
+                ),
+                "non_numeric_rate": (
+                    1.0
+                    - (
+                        parse_successes_by_task.get(task, 0)
+                        / (
+                            parse_successes_by_task.get(task, 0)
+                            + sum(parse_failure_counts_by_task[task].values())
+                        )
+                    )
+                    if (parse_successes_by_task.get(task, 0)
+                    + sum(parse_failure_counts_by_task[task].values()))
+                    else 0.0
+                ),
+                "numeric_abs_error": _mean(numeric_abs_errors_by_task.get(task, [])),
+                "numeric_rel_error": _mean(numeric_rel_errors_by_task.get(task, [])),
+            }
+            for task in task_counts
+        },
+        "failure_counts": dict(parse_failure_counts),
+        "failure_counts_by_task": {
+            task: dict(counts) for task, counts in parse_failure_counts_by_task.items()
+        },
+    }
     return {
         "overall_accuracy": overall,
         "per_task_accuracy": per_task,
@@ -924,59 +1096,11 @@ def evaluate_task_accuracy(
         "per_task_mae": per_task_mae,
         "sampled_examples_by_task": dict(sampled_examples_by_task),
         "diagnostics": {
-            "answer_length": {
-                "mean": {
-                    "target_len_tokens": sum(target_len_tokens) / len(target_len_tokens)
-                    if target_len_tokens
-                    else 0.0,
-                    "pred_len_tokens": sum(pred_len_tokens) / len(pred_len_tokens)
-                    if pred_len_tokens
-                    else 0.0,
-                    "length_ratio": sum(length_ratio) / len(length_ratio) if length_ratio else 0.0,
-                    "abs_len_error": sum(abs_len_error) / len(abs_len_error)
-                    if abs_len_error
-                    else 0.0,
-                },
-                "eos_emitted_rate": eos_emitted / sum(total.values()) if total else 0.0,
-                "stop_reason_counts": stop_reason_counts,
-            },
-            "repetition": {
-                "repeat_1gram_rate": {
-                    "mean": sum(repeat_1gram_rates) / len(repeat_1gram_rates)
-                    if repeat_1gram_rates
-                    else 0.0,
-                },
-                "repeat_2gram_rate": {
-                    "mean": sum(repeat_2gram_rates) / len(repeat_2gram_rates)
-                    if repeat_2gram_rates
-                    else 0.0,
-                },
-                "unique_token_fraction": {
-                    "mean": sum(unique_token_fractions) / len(unique_token_fractions)
-                    if unique_token_fractions
-                    else 0.0,
-                },
-                "max_run_length": {
-                    "mean": sum(max_run_lengths) / len(max_run_lengths)
-                    if max_run_lengths
-                    else 0.0,
-                },
-            },
-            "parse": {
-                "parse_success_rate": parse_successes / total_numeric_samples
-                if total_numeric_samples
-                else 0.0,
-                "non_numeric_rate": 1.0 - (parse_successes / total_numeric_samples)
-                if total_numeric_samples
-                else 0.0,
-                "numeric_abs_error": sum(numeric_abs_errors) / len(numeric_abs_errors)
-                if numeric_abs_errors
-                else 0.0,
-                "numeric_rel_error": sum(numeric_rel_errors) / len(numeric_rel_errors)
-                if numeric_rel_errors
-                else 0.0,
-                "failure_counts": dict(parse_failure_counts),
-            },
+            "answer_length": answer_length,
+            "repetition": repetition,
+            "parse": parse_metrics,
+            "task_counts": dict(task_counts),
+            "difficulty_by_task": task_difficulty_mean,
         },
     }
 
@@ -997,13 +1121,15 @@ def _print_sampled_examples(label: str, samples_by_task: Dict[str, List[Dict[str
             stop_reason = sample.get("stop_reason")
             parse_ok = sample.get("parse_ok")
             repeat_1gram = sample.get("repeat_1gram_rate")
+            difficulty = sample.get("difficulty")
             print(
                 f"      {idx}. prompt={sample['prompt']!r} "
                 f"prediction={sample['prediction']!r} "
                 f"expected_output={expected_output!r} "
                 f"target_len={target_len} pred_len={pred_len} "
                 f"stop_reason={stop_reason} parse_ok={parse_ok} "
-                f"repeat_1gram_rate={repeat_1gram}"
+                f"repeat_1gram_rate={repeat_1gram} "
+                f"difficulty={difficulty}"
             )
 
 
@@ -1867,6 +1993,14 @@ def train(args):
                             alg_results.get("sampled_examples_by_task", {}),
                         )
 
+                    flat_eval_diagnostics = _flatten_eval_diagnostics(
+                        "eval", alg_results.get("diagnostics", {})
+                    )
+                    if not any(key.startswith("eval.") for key in flat_eval_diagnostics):
+                        print(
+                            "[warn] eval diagnostics are empty; check diagnostic wiring for eval."
+                        )
+
                     logger.log(
                         step=global_step,
                         phase="eval",
@@ -1883,7 +2017,7 @@ def train(args):
                         eval_difficulty=difficulty_logged,
                         algorithmic_samples=alg_results.get("sampled_examples_by_task", {}),
                         algorithmic_iid_samples=alg_results.get("sampled_examples_by_task", {}),
-                        **_flatten_eval_diagnostics("eval", alg_results.get("diagnostics", {})),
+                        **flat_eval_diagnostics,
                         **eval_task_metrics,
                     )
 

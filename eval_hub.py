@@ -484,6 +484,7 @@ def run_algorithmic_suite(
                     stop_reason = sample.get("stop_reason")
                     parse_ok = sample.get("parse_ok")
                     repeat_1gram = sample.get("repeat_1gram_rate")
+                    difficulty = sample.get("difficulty")
                     print(
                         "  "
                         f"{idx}. prompt={sample['prompt']!r} "
@@ -491,7 +492,8 @@ def run_algorithmic_suite(
                         f"expected_output={expected_output!r} "
                         f"target_len={target_len} pred_len={pred_len} "
                         f"stop_reason={stop_reason} parse_ok={parse_ok} "
-                        f"repeat_1gram_rate={repeat_1gram}"
+                        f"repeat_1gram_rate={repeat_1gram} "
+                        f"difficulty={difficulty}"
                     )
 
     payload = _algorithmic_results_to_dict(results)
