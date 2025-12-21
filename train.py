@@ -28,7 +28,8 @@ import random
 import argparse
 import re
 from collections import defaultdict
-from multiprocessing import Value
+from functools import partial
+from multiprocessing import Manager, Value
 from pathlib import Path
 from contextlib import nullcontext
 from typing import Optional, Dict, List, Sequence, Any, Tuple
@@ -42,6 +43,7 @@ import torch.nn as nn
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 
+from curriculum import TaskCurriculumState
 from data import get_task_weight
 from utils import (
     DEFAULT_TOKENIZER_NAME,
@@ -1208,7 +1210,12 @@ def train(args):
     
     log_print("\nLoading datasets...")
 
-    if not args.fixed_data and args.difficulty_schedule in {"linear", "phased", "fixed"}:
+    task_curriculum = None
+    difficulty_fn = None
+    eval_difficulty_fn = None
+    if args.use_task_curriculum:
+        difficulty_value = None
+    elif not args.fixed_data and args.difficulty_schedule in {"linear", "phased", "fixed"}:
         difficulty_value = Value("d", 0.0)
     else:
         difficulty_value = None
@@ -1222,6 +1229,19 @@ def train(args):
                 f"Invalid alg_tasks {invalid}; choose from {sorted(available_tasks)}"
             )
         log_print(f"Restricting algorithmic tasks to: {', '.join(alg_tasks)}")
+
+    if args.use_task_curriculum:
+        manager = Manager()
+        curriculum_tasks = alg_tasks or sorted(available_tasks)
+        task_curriculum = TaskCurriculumState(manager, tasks=curriculum_tasks)
+        difficulty_fn = partial(
+            task_curriculum.get_difficulty,
+            jitter_prob=args.curriculum_jitter,
+        )
+        eval_difficulty_fn = partial(
+            task_curriculum.get_difficulty,
+            jitter_prob=0.0,
+        )
 
     # Phase 1: Algorithmic
     if args.fixed_data:
@@ -1252,6 +1272,7 @@ def train(args):
             tasks=alg_tasks,
             seed=args.seed,
             difficulty_value=difficulty_value,
+            difficulty_fn=difficulty_fn,
             difficulty_schedule=args.difficulty_schedule,
             task_weighting=args.task_weighting,
             total_tokens=args.alg_tokens,
@@ -1319,6 +1340,7 @@ def train(args):
                 tasks=alg_tasks,
                 seed=args.seed + 123,
                 difficulty_value=None,
+                difficulty_fn=eval_difficulty_fn,
                 difficulty_schedule=args.difficulty_schedule,
                 task_weighting=args.task_weighting,
                 total_tokens=args.alg_tokens,
@@ -1418,6 +1440,14 @@ def train(args):
         f"  Train eval: {train_eval_mode}"
         + (f" ({args.train_eval_samples} samples)" if train_eval_mode != "none" else "")
     )
+    log_print(
+        f"  Task curriculum: {args.use_task_curriculum}"
+        + (
+            f" (cooldown={args.curriculum_cooldown}, jitter={args.curriculum_jitter})"
+            if args.use_task_curriculum
+            else ""
+        )
+    )
     
     global_step = 0
     tokens_seen = 0
@@ -1431,12 +1461,15 @@ def train(args):
             return None
         suffix = f"_{tag}" if tag else ""
         checkpoint_path = output_dir / f"checkpoint_step_{step}{suffix}.pt"
-        torch.save({
+        payload = {
             "model_state_dict": model.state_dict(),
             "config": config,
             "step": step,
             "tokens_seen": tokens_seen,
-        }, checkpoint_path)
+        }
+        if task_curriculum is not None:
+            payload["curriculum_state"] = task_curriculum.state_dict()
+        torch.save(payload, checkpoint_path)
         checkpoint_paths.append(checkpoint_path)
         while len(checkpoint_paths) > args.eval_checkpoints:
             old_checkpoint = checkpoint_paths.pop(0)
@@ -1497,6 +1530,16 @@ def train(args):
     task_window_counts = defaultdict(int)
     task_window_input_len = defaultdict(int)
     task_window_target_len = defaultdict(int)
+
+    def _current_difficulty() -> float:
+        if task_curriculum is not None:
+            active = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
+            return task_curriculum.get_mean_difficulty(active)
+        if difficulty_value is not None:
+            return float(difficulty_value.value)
+        return difficulty_schedule(
+            curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
+        )
     
     try:
         while curriculum.tokens_seen < args.total_tokens:
@@ -1636,13 +1679,7 @@ def train(args):
 
                 print(f"Loss: {avg_loss:.4f} | LR: {lr:.2e}")
 
-                difficulty_logged = (
-                    float(difficulty_value.value)
-                    if difficulty_value is not None
-                    else difficulty_schedule(
-                        curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
-                    )
-                )
+                difficulty_logged = _current_difficulty()
 
                 if args.extended_logging:
                     log_print(f"Step {global_step:>6} | "
@@ -1744,13 +1781,7 @@ def train(args):
             if global_step % args.eval_interval == 0:
                 if args.extended_logging:
                     log_print("\nRunning evaluation...")
-                difficulty_logged = (
-                    float(difficulty_value.value)
-                    if difficulty_value is not None
-                    else difficulty_schedule(
-                        curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
-                    )
-                )
+                difficulty_logged = _current_difficulty()
                 if args.extended_logging:
                     log_print(f"  Eval difficulty: {difficulty_logged:.3f}")
                     log_print(
@@ -2007,6 +2038,31 @@ def train(args):
                     )
                     overall_task_acc = task_eval.get("overall_accuracy", 0.0)
                     overall_task_mae = task_eval.get("overall_mae")
+                    curriculum_metrics: Dict[str, float] = {}
+                    curriculum_log_lines: List[str] = []
+                    if task_curriculum is not None:
+                        for task, acc in task_eval.get("per_task_accuracy", {}).items():
+                            loss_proxy = 1.0 - acc
+                            task_curriculum.update_metrics(task, acc, loss_proxy, global_step)
+                            task_curriculum.step_curriculum(
+                                task,
+                                global_step,
+                                args.curriculum_cooldown,
+                            )
+                            state = task_curriculum.get_task_state(task)
+                            curriculum_metrics[f"curriculum.difficulty.{task}"] = state[
+                                "difficulty"
+                            ]
+                            curriculum_metrics[f"curriculum.ema_acc.{task}"] = state[
+                                "ema_acc"
+                            ]
+                            curriculum_log_lines.append(
+                                f"{task}: d={state['difficulty']:.2f} "
+                                f"ema={state['ema_acc']:.2f}"
+                            )
+                        if curriculum_metrics:
+                            logger.log(step=global_step, phase="eval", **curriculum_metrics)
+                            log_print("  Curriculum: " + " | ".join(sorted(curriculum_log_lines)))
                     if args.extended_logging:
                         log_print(
                             f"  Training accuracy ({train_eval_label}): {train_acc*100:.2f}% | "
@@ -2169,6 +2225,23 @@ def main():
         default="adaptive",
         choices=["uniform", "adaptive"],
         help="Task sampling weights",
+    )
+    parser.add_argument(
+        "--use_task_curriculum",
+        action="store_true",
+        help="Enable per-task competence curriculum for algorithmic data",
+    )
+    parser.add_argument(
+        "--curriculum_cooldown",
+        type=int,
+        default=500,
+        help="Steps to wait between curriculum difficulty updates per task",
+    )
+    parser.add_argument(
+        "--curriculum_jitter",
+        type=float,
+        default=0.1,
+        help="Probability of replaying easier samples per task",
     )
     parser.add_argument("--mix_band_tokens", type=int, default=None,
                        help="Transition band (tokens) between algorithmic and language phases")

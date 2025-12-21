@@ -915,6 +915,7 @@ class AlgorithmicDataset(IterableDataset):
         tasks: Optional[List[str]] = None,
         seed: Optional[int] = None,
         difficulty_value=None,
+        difficulty_fn: Optional[Callable[[str], float]] = None,
         difficulty_schedule: str = "smooth",
         task_weighting: str = "uniform",
         total_tokens: Optional[int] = None,
@@ -927,6 +928,7 @@ class AlgorithmicDataset(IterableDataset):
         self.tasks = tasks
         self.seed = seed
         self.difficulty_value = difficulty_value
+        self.difficulty_fn = difficulty_fn
         self.difficulty_schedule = difficulty_schedule
         self.task_weighting = task_weighting
         self.easy_mix_frac = easy_mix_frac
@@ -976,16 +978,32 @@ class AlgorithmicDataset(IterableDataset):
 
         for _ in range(worker_id, self.num_examples, num_workers):
             progress = min(self.tokens_seen / max(self._worker_token_budget, 1), 1.0)
-            difficulty = self._sample_difficulty(rng, progress)
-            example = AlgorithmicGenerator.generate_example(
-                tasks=self.tasks,
-                rng=rng,
-                generators=generators,
-                difficulty=difficulty,
-                progress=progress,
-                difficulty_schedule=self.difficulty_schedule,
-                task_weighting=self.task_weighting,
-            )
+            if self.difficulty_fn is not None:
+                task = self._sample_task(rng, progress, generators)
+                difficulty = self.difficulty_fn(task)
+                effective_schedule = self.difficulty_schedule
+                if effective_schedule in {"phased", "fixed"}:
+                    effective_schedule = "linear"
+                example = AlgorithmicGenerator.generate_example(
+                    tasks=[task],
+                    rng=rng,
+                    generators=generators,
+                    difficulty=difficulty,
+                    progress=progress,
+                    difficulty_schedule=effective_schedule,
+                    task_weighting=self.task_weighting,
+                )
+            else:
+                difficulty = self._sample_difficulty(rng, progress)
+                example = AlgorithmicGenerator.generate_example(
+                    tasks=self.tasks,
+                    rng=rng,
+                    generators=generators,
+                    difficulty=difficulty,
+                    progress=progress,
+                    difficulty_schedule=self.difficulty_schedule,
+                    task_weighting=self.task_weighting,
+                )
             tokens = self._encode_text(example["text"])
 
             if len(tokens) > self.max_seq_len:
@@ -1016,6 +1034,18 @@ class AlgorithmicDataset(IterableDataset):
                 payload["input_len_tokens"] = self._encode_length(example["input"])
                 payload["target_len_tokens"] = self._encode_length(example["target"])
             yield payload
+
+    def _sample_task(
+        self,
+        rng: random.Random,
+        progress: float,
+        generators: Dict[str, Callable],
+    ) -> str:
+        tasks = self.tasks or list(generators.keys())
+        if self.task_weighting == "adaptive":
+            weights = [get_task_weight(task, progress) for task in tasks]
+            return rng.choices(tasks, weights=weights, k=1)[0]
+        return rng.choice(tasks)
 
     def _sample_difficulty(self, rng: random.Random, progress: float) -> float:
         """Sample difficulty based on schedule type."""
@@ -1148,6 +1178,7 @@ def create_algorithmic_dataset(
     tasks: Optional[List[str]] = None,
     seed: int = 42,
     difficulty_value=None,
+    difficulty_fn: Optional[Callable[[str], float]] = None,
     difficulty_schedule: str = "smooth",
     task_weighting: str = "uniform",
     total_tokens: Optional[int] = None,
@@ -1182,6 +1213,7 @@ def create_algorithmic_dataset(
         tasks=tasks,
         seed=seed,
         difficulty_value=difficulty_value,
+        difficulty_fn=difficulty_fn,
         difficulty_schedule=difficulty_schedule,
         task_weighting=task_weighting,
         total_tokens=total_tokens,
