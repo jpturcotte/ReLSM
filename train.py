@@ -1916,6 +1916,7 @@ def train(args):
                     **diagnostic_metrics,
                     **task_metrics,
                 )
+                logger.save()
                 if args.extended_logging and diagnostic_metrics:
                     log_print(f"  Diagnostics: {format_metrics_line(diagnostic_metrics)}")
 
