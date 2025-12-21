@@ -1035,6 +1035,8 @@ class AlgorithmicDataset(IterableDataset):
                     task_weighting=self.task_weighting,
                 )
             tokens = self._encode_text(example["text"])
+            if self.tokenizer.eos_token_id is not None:
+                tokens.append(self.tokenizer.eos_token_id)
 
             if len(tokens) > self.max_seq_len:
                 tokens = tokens[:self.max_seq_len]
@@ -1164,6 +1166,8 @@ class FixedAlgorithmicDataset(Dataset):
                 task_weighting=self.task_weighting,
             )
             tokens = self._encode_text(example["text"])
+            if self.tokenizer.eos_token_id is not None:
+                tokens.append(self.tokenizer.eos_token_id)
 
             if len(tokens) > self.max_seq_len:
                 tokens = tokens[: self.max_seq_len]
