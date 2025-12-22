@@ -20,7 +20,7 @@ Also includes:
 
 import random
 import math
-from typing import List, Dict, Optional, Tuple, Iterator, Callable, Iterable, Union
+from typing import List, Dict, Optional, Tuple, Iterator, Callable, Iterable, Union, Sequence
 from dataclasses import dataclass
 import torch
 from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
@@ -958,6 +958,7 @@ class AlgorithmicDataset(IterableDataset):
         difficulty_value=None,
         difficulty_fn: Optional[Callable[[str], float]] = None,
         weighting_fn: Optional[Callable[[str], float]] = None,
+        weighting_adjust_fn: Optional[Callable[[Sequence[str], List[float]], List[float]]] = None,
         difficulty_schedule: str = "smooth",
         task_weighting: str = "uniform",
         total_tokens: Optional[int] = None,
@@ -972,6 +973,7 @@ class AlgorithmicDataset(IterableDataset):
         self.difficulty_value = difficulty_value
         self.difficulty_fn = difficulty_fn
         self.weighting_fn = weighting_fn
+        self.weighting_adjust_fn = weighting_adjust_fn
         self.difficulty_schedule = difficulty_schedule
         self.task_weighting = task_weighting
         self.easy_mix_frac = easy_mix_frac
@@ -1089,6 +1091,8 @@ class AlgorithmicDataset(IterableDataset):
         tasks = self.tasks or list(generators.keys())
         if self.weighting_fn is not None:
             weights = [self.weighting_fn(task) for task in tasks]
+            if self.weighting_adjust_fn is not None:
+                weights = list(self.weighting_adjust_fn(tasks, weights))
             if sum(weights) <= 0:
                 weights = [1.0] * len(tasks)
             return rng.choices(tasks, weights=weights, k=1)[0]
@@ -1232,6 +1236,7 @@ def create_algorithmic_dataset(
     difficulty_value=None,
     difficulty_fn: Optional[Callable[[str], float]] = None,
     weighting_fn: Optional[Callable[[str], float]] = None,
+    weighting_adjust_fn: Optional[Callable[[Sequence[str], List[float]], List[float]]] = None,
     difficulty_schedule: str = "smooth",
     task_weighting: str = "uniform",
     total_tokens: Optional[int] = None,
@@ -1268,6 +1273,7 @@ def create_algorithmic_dataset(
         difficulty_value=difficulty_value,
         difficulty_fn=difficulty_fn,
         weighting_fn=weighting_fn,
+        weighting_adjust_fn=weighting_adjust_fn,
         difficulty_schedule=difficulty_schedule,
         task_weighting=task_weighting,
         total_tokens=total_tokens,

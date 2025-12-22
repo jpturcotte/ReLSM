@@ -619,6 +619,33 @@ def _compute_task_sampling(
     return weights, probs
 
 
+def _apply_minimum_probability(weights: Sequence[float], min_prob: float) -> List[float]:
+    if not weights:
+        return []
+    if min_prob <= 0.0:
+        return list(weights)
+    total = sum(weights)
+    if total <= 0.0:
+        return [1.0] * len(weights)
+    probs = [weight / total for weight in weights]
+    floor_total = min_prob * len(probs)
+    if floor_total >= 1.0:
+        return [1.0] * len(probs)
+    adjusted = [max(prob, min_prob) for prob in probs]
+    excess = sum(adjusted) - 1.0
+    if excess > 1e-12:
+        above = [max(prob - min_prob, 0.0) for prob in adjusted]
+        above_total = sum(above)
+        if above_total <= 0.0:
+            return [1.0] * len(probs)
+        scale = (1.0 - floor_total) / above_total
+        adjusted = [
+            min_prob + (prob - min_prob) * scale if prob > min_prob else min_prob
+            for prob in adjusted
+        ]
+    return adjusted
+
+
 def _flatten_eval_diagnostics(prefix: str, diagnostics: Dict[str, Any]) -> Dict[str, float]:
     flat: Dict[str, float] = {}
     if not diagnostics:
@@ -1402,6 +1429,7 @@ def train(args):
     difficulty_fn = None
     eval_difficulty_fn = None
     weighting_fn = None
+    weighting_adjust_fn = None
     if args.use_task_curriculum:
         difficulty_value = None
     elif not args.fixed_data and args.difficulty_schedule in {"linear", "phased", "fixed"}:
@@ -1459,8 +1487,20 @@ def train(args):
         def eval_difficulty_fn(task: str) -> float:
             return difficulty_snapshot.get(task, 0.2)
 
+        min_task_prob = 0.05
+
         def weighting_fn(task: str) -> float:
             return weights_snapshot.get(task, 1.0)
+
+        def weighting_adjust_fn(tasks: Sequence[str], weights: List[float]) -> List[float]:
+            if not tasks:
+                return weights
+            mean_difficulty = sum(
+                difficulty_snapshot.get(task, 0.2) for task in tasks
+            ) / len(tasks)
+            if mean_difficulty >= 0.2:
+                return weights
+            return _apply_minimum_probability(weights, min_task_prob)
 
     # Phase 1: Algorithmic
     if args.fixed_data:
@@ -1493,6 +1533,7 @@ def train(args):
             difficulty_value=difficulty_value,
             difficulty_fn=difficulty_fn,
             weighting_fn=weighting_fn,
+            weighting_adjust_fn=weighting_adjust_fn,
             difficulty_schedule=args.difficulty_schedule,
             task_weighting=args.task_weighting,
             total_tokens=args.alg_tokens,
