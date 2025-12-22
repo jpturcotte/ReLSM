@@ -215,7 +215,7 @@ class MetricsLogger:
 
         # Loss plot
         plt.figure()
-        train_steps, train_losses = self.series("train_loss", phase="train")
+        train_steps, train_losses = self.series("train_loss")
         if train_steps and train_losses:
             plt.plot(train_steps, train_losses, label="train")
 
@@ -233,6 +233,54 @@ class MetricsLogger:
         plt.tight_layout()
         plt.savefig(self.output_dir / "loss.png")
         plt.close()
+
+        # Update-scale proxies vs loss
+        update_steps, update_postclip = self.series("update_norm_est_postclip")
+        loss_steps, loss_values = self.series("train_loss")
+        if update_steps and update_postclip:
+            fig, ax1 = plt.subplots()
+            ax1.plot(update_steps, update_postclip, label="update_norm_est_postclip")
+            ax1.set_xlabel("Step")
+            ax1.set_ylabel("Update norm (postclip)")
+            ax1.grid(True)
+            ax2 = ax1.twinx()
+            if loss_steps and loss_values:
+                ax2.plot(loss_steps, loss_values, alpha=0.6, label="train_loss")
+                ax2.set_ylabel("Loss")
+                ax2.set_yscale("log")
+            lines, labels = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            if lines or lines2:
+                ax1.legend(lines + lines2, labels + labels2, loc="best")
+            fig.tight_layout()
+            fig.savefig(self.output_dir / "update_norm_postclip.png")
+            plt.close(fig)
+
+        update_weight_steps, update_weight_postclip = self.series(
+            "update_to_weight_postclip"
+        )
+        if update_weight_steps and update_weight_postclip:
+            fig, ax1 = plt.subplots()
+            ax1.plot(
+                update_weight_steps,
+                update_weight_postclip,
+                label="update_to_weight_postclip",
+            )
+            ax1.set_xlabel("Step")
+            ax1.set_ylabel("Update/weight (postclip)")
+            ax1.grid(True)
+            ax2 = ax1.twinx()
+            if loss_steps and loss_values:
+                ax2.plot(loss_steps, loss_values, alpha=0.6, label="train_loss")
+                ax2.set_ylabel("Loss")
+                ax2.set_yscale("log")
+            lines, labels = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            if lines or lines2:
+                ax1.legend(lines + lines2, labels + labels2, loc="best")
+            fig.tight_layout()
+            fig.savefig(self.output_dir / "update_to_weight_postclip.png")
+            plt.close(fig)
 
         # Accuracy plot
         plt.figure()
@@ -1686,6 +1734,7 @@ def train(args):
     last_token_accuracy = float("nan")
     last_pct_masked_tokens = float("nan")
     flush_diagnostic_metrics: Optional[Dict[str, float]] = None
+    lr_mismatch_warned = False
     task_window_counts = defaultdict(int)
     task_window_input_len = defaultdict(int)
     task_window_target_len = defaultdict(int)
@@ -1806,6 +1855,7 @@ def train(args):
                             continue
                         mod_grad_norm, mod_weight_norm = module_grad_weight_norm(module)
                         flush_diagnostic_metrics[f"grad_norm.{key}"] = mod_grad_norm
+                        flush_diagnostic_metrics[f"weight_norm.{key}"] = mod_weight_norm
                         if not math.isnan(mod_grad_norm) and not math.isnan(mod_weight_norm):
                             flush_diagnostic_metrics[f"grad_to_weight.{key}"] = (
                                 mod_grad_norm / (mod_weight_norm + 1e-12)
@@ -1843,9 +1893,47 @@ def train(args):
                         weight_norm = float("nan")
                 effective_wd_pressure = args.weight_decay * weight_norm
 
-                print(f"Loss: {avg_loss:.4f} | LR: {lr:.2e}")
-
                 difficulty_logged = _current_difficulty()
+
+                expected_lr = get_lr(
+                    tokens_seen,
+                    warmup_tokens,
+                    args.total_tokens,
+                    args.max_lr,
+                    args.min_lr,
+                    schedule=args.lr_schedule,
+                )
+                lr_actuals = [pg.get("lr", float("nan")) for pg in optimizer.param_groups]
+                lr_actuals_clean = [value for value in lr_actuals if not math.isnan(value)]
+                lr_actual = (
+                    sum(lr_actuals_clean) / len(lr_actuals_clean)
+                    if lr_actuals_clean
+                    else float("nan")
+                )
+                lr_actual_min = (
+                    min(lr_actuals_clean) if lr_actuals_clean else float("nan")
+                )
+                lr_actual_max = (
+                    max(lr_actuals_clean) if lr_actuals_clean else float("nan")
+                )
+                lr_for_print = lr_actual if not math.isnan(lr_actual) else expected_lr
+                print(
+                    f"Loss: {avg_loss:.4f} | LR: {lr_for_print:.2e} "
+                    f"(expected {expected_lr:.2e})"
+                )
+                if (
+                    not lr_mismatch_warned
+                    and not math.isnan(expected_lr)
+                    and not math.isnan(lr_actual)
+                    and abs(expected_lr - lr_actual)
+                    / max(abs(expected_lr), abs(lr_actual), 1e-12)
+                    > 1e-3
+                ):
+                    print(
+                        "[warn] expected LR differs from optimizer LR "
+                        f"(expected={expected_lr:.3e}, actual={lr_actual:.3e})."
+                    )
+                    lr_mismatch_warned = True
 
                 if args.extended_logging:
                     log_print(f"Step {global_step:>6} | "
@@ -1856,19 +1944,32 @@ def train(args):
                               (f" | K: {avg_K:.1f}" if avg_K > 0 else "") +
                               (f" | ponder: {avg_ponder:.3f}" if avg_ponder > 0 else ""))
                     log_print(f"  Difficulty: {difficulty_logged:.3f} (easy_mix: {args.easy_mix_frac})")
-                    expected_lr = get_lr(
-                        tokens_seen,
-                        warmup_tokens,
-                        args.total_tokens,
-                        args.max_lr,
-                        args.min_lr,
-                        schedule=args.lr_schedule,
-                    )
                     log_print(f"  LR: {expected_lr:.2e} (schedule: {args.lr_schedule})")
                     log_print(f"  Grad norm: {last_grad_norm:.1f}")
                     log_print(f"  Weight norm: {weight_norm:.1f}")
                     if args.weight_decay > 0.0:
                         log_print(f"  WD pressure: {effective_wd_pressure:.1f}")
+
+                # Update-scale proxies (cheap, no extra parameter copies).
+                # update_norm_est ~= ||lr * grad||, update_to_weight ~= ||lr * grad|| / ||w||.
+                if math.isnan(last_grad_norm) or math.isnan(weight_norm):
+                    update_norm_est_preclip = float("nan")
+                    update_norm_est_postclip = float("nan")
+                    update_to_weight_preclip = float("nan")
+                    update_to_weight_postclip = float("nan")
+                    grad_to_weight_global = float("nan")
+                    update_to_weight_global_postclip = float("nan")
+                else:
+                    update_norm_est_preclip = lr_actual * last_grad_norm
+                    update_norm_est_postclip = lr_actual * min(last_grad_norm, args.grad_clip)
+                    update_to_weight_preclip = update_norm_est_preclip / (weight_norm + 1e-12)
+                    update_to_weight_postclip = update_norm_est_postclip / (weight_norm + 1e-12)
+                    grad_to_weight_global = last_grad_norm / (weight_norm + 1e-12)
+                    update_to_weight_global_postclip = (
+                        lr_actual
+                        * min(last_grad_norm, args.grad_clip)
+                        / (weight_norm + 1e-12)
+                    )
 
                 # DIAGNOSTIC METRICS (cheap)
                 diagnostic_metrics: Dict[str, float] = {}
@@ -1881,10 +1982,26 @@ def train(args):
                             continue
                         mod_grad_norm, mod_weight_norm = module_grad_weight_norm(module)
                         diagnostic_metrics[f"grad_norm.{key}"] = mod_grad_norm
+                        diagnostic_metrics[f"weight_norm.{key}"] = mod_weight_norm
                         if not math.isnan(mod_grad_norm) and not math.isnan(mod_weight_norm):
                             diagnostic_metrics[f"grad_to_weight.{key}"] = (
                                 mod_grad_norm / (mod_weight_norm + 1e-12)
                             )
+
+                # Per-module update proxies for diagnostic modules.
+                for key, mod_grad_norm in list(diagnostic_metrics.items()):
+                    if not key.startswith("grad_norm."):
+                        continue
+                    if math.isnan(mod_grad_norm):
+                        continue
+                    module_key = key.split("grad_norm.", 1)[1]
+                    mod_weight_norm = diagnostic_metrics.get(f"weight_norm.{module_key}")
+                    if mod_weight_norm is None or math.isnan(mod_weight_norm):
+                        continue
+                    diagnostic_metrics[f"update_norm_est.{module_key}"] = lr_actual * mod_grad_norm
+                    diagnostic_metrics[f"update_to_weight.{module_key}"] = (
+                        lr_actual * mod_grad_norm / (mod_weight_norm + 1e-12)
+                    )
 
                 if math.isnan(last_grad_norm):
                     diagnostic_metrics["grad_clipped"] = float("nan")
@@ -1895,6 +2012,11 @@ def train(args):
                     diagnostic_metrics["grad_clip_ratio"] = (
                         args.grad_clip / (last_grad_norm + 1e-12) if grad_clipped else 1.0
                     )
+
+                lr_actual_metrics: Dict[str, float] = {}
+                if not math.isnan(lr_actual_min) and not math.isnan(lr_actual_max):
+                    lr_actual_metrics["lr_actual_min"] = lr_actual_min
+                    lr_actual_metrics["lr_actual_max"] = lr_actual_max
 
                 task_metrics: Dict[str, float] = {}
                 active_tasks = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
@@ -1930,7 +2052,16 @@ def train(args):
                     pct_masked_tokens=last_pct_masked_tokens,
                     grad_norm=last_grad_norm,
                     weight_norm=weight_norm,
+                    lr_expected=expected_lr,
+                    lr_actual=lr_actual,
+                    update_norm_est_preclip=update_norm_est_preclip,
+                    update_norm_est_postclip=update_norm_est_postclip,
+                    update_to_weight_preclip=update_to_weight_preclip,
+                    update_to_weight_postclip=update_to_weight_postclip,
+                    grad_to_weight_global=grad_to_weight_global,
+                    update_to_weight_global_postclip=update_to_weight_global_postclip,
                     **diagnostic_metrics,
+                    **lr_actual_metrics,
                     **task_metrics,
                 )
                 logger.save()
