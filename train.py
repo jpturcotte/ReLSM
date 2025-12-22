@@ -1434,6 +1434,7 @@ def train(args):
             manager,
             tasks=curriculum_tasks,
             ema_decay=ema_decay,
+            min_task_evals=args.curriculum_min_task_evals,
         )
 
         difficulty_snapshot: Dict[str, float] = {}
@@ -1682,7 +1683,7 @@ def train(args):
             "init_difficulty": float(task_curriculum.init_difficulty),
             "ema_decay": float(task_curriculum.ema_decay),
             "step_size": float(task_curriculum.step_size),
-            "warmup_evals": float(task_curriculum.warmup_evals),
+            "min_task_evals": float(task_curriculum.min_task_evals),
         }
 
     def _curriculum_config() -> Dict[str, float]:
@@ -1744,8 +1745,10 @@ def train(args):
             task_curriculum.ema_decay = float(config_payload["ema_decay"])
         if "step_size" in config_payload:
             task_curriculum.step_size = float(config_payload["step_size"])
-        if "warmup_evals" in config_payload:
-            task_curriculum.warmup_evals = int(config_payload["warmup_evals"])
+        if "min_task_evals" in config_payload:
+            task_curriculum.min_task_evals = int(config_payload["min_task_evals"])
+        elif "warmup_evals" in config_payload:
+            task_curriculum.min_task_evals = int(config_payload["warmup_evals"])
 
     def load_checkpoint_state(checkpoint_path: str) -> Tuple[int, int, float]:
         checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -2685,6 +2688,12 @@ def main():
         type=int,
         default=500,
         help="Steps to wait between curriculum difficulty updates per task",
+    )
+    parser.add_argument(
+        "--curriculum_min_task_evals",
+        type=int,
+        default=5,
+        help="Minimum evals per task before curriculum difficulty can adjust",
     )
     parser.add_argument(
         "--curriculum_jitter",

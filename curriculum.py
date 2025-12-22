@@ -18,14 +18,14 @@ class TaskCurriculumState:
         init_difficulty: float = 0.2,
         ema_decay: float = 0.98,
         step_size: float = 0.05,
-        warmup_evals: int = 5,
+        min_task_evals: int = 5,
     ) -> None:
         self._manager = manager
         self._state = manager.dict() if manager is not None else {}
         self.init_difficulty = init_difficulty
         self.ema_decay = ema_decay
         self.step_size = step_size
-        self.warmup_evals = warmup_evals
+        self.min_task_evals = min_task_evals
         if tasks is not None:
             for task in tasks:
                 self._ensure_task(task)
@@ -115,7 +115,7 @@ class TaskCurriculumState:
     ) -> float:
         self._ensure_task(task)
         task_state = self._state[task]
-        if int(task_state.get("step_count", 0)) < self.warmup_evals:
+        if int(task_state.get("step_count", 0)) < self.min_task_evals:
             return float(task_state.get("difficulty", self.init_difficulty))
         last_update_step = int(task_state.get("last_update_step", 0))
         if step - last_update_step < cooldown:
