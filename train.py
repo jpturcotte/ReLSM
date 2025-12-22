@@ -1682,6 +1682,7 @@ def train(args):
             "init_difficulty": float(task_curriculum.init_difficulty),
             "ema_decay": float(task_curriculum.ema_decay),
             "step_size": float(task_curriculum.step_size),
+            "warmup_evals": float(task_curriculum.warmup_evals),
         }
 
     def _curriculum_config() -> Dict[str, float]:
@@ -1743,6 +1744,8 @@ def train(args):
             task_curriculum.ema_decay = float(config_payload["ema_decay"])
         if "step_size" in config_payload:
             task_curriculum.step_size = float(config_payload["step_size"])
+        if "warmup_evals" in config_payload:
+            task_curriculum.warmup_evals = int(config_payload["warmup_evals"])
 
     def load_checkpoint_state(checkpoint_path: str) -> Tuple[int, int, float]:
         checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -2330,7 +2333,8 @@ def train(args):
                     per_task_prefix_accuracy = (
                         alg_results.get("per_task_prefix_accuracy", {}) or {}
                     )
-                    for task, acc in alg_results.get("per_task_accuracy", {}).items():
+                    per_task_accuracy = alg_results.get("per_task_accuracy", {}) or {}
+                    for task, acc in per_task_accuracy.items():
                         task_mae = per_task_mae.get(task)
                         logger.log_task_accuracy(
                             task,
@@ -2355,6 +2359,20 @@ def train(args):
                             if task_mae is not None:
                                 line += f" | MAE: {task_mae:.3f}"
                             log_print(line)
+
+                    if task_curriculum is not None and per_task_accuracy:
+                        did_sync = False
+                        for task, acc in per_task_accuracy.items():
+                            state = task_curriculum.get_task_state(task)
+                            if acc > 0.85 and state["difficulty"] < 0.40:
+                                log_print(
+                                    f"  Syncing curriculum for {task}: Boosting difficulty to 0.5"
+                                )
+                                task_curriculum.override_difficulty(task, 0.5)
+                                task_curriculum.update_metrics(task, acc, None, global_step)
+                                did_sync = True
+                        if did_sync:
+                            refresh_curriculum_snapshots()
 
                     # Track best
                     if overall_acc > best_alg_acc:

@@ -18,12 +18,14 @@ class TaskCurriculumState:
         init_difficulty: float = 0.2,
         ema_decay: float = 0.98,
         step_size: float = 0.05,
+        warmup_evals: int = 5,
     ) -> None:
         self._manager = manager
         self._state = manager.dict() if manager is not None else {}
         self.init_difficulty = init_difficulty
         self.ema_decay = ema_decay
         self.step_size = step_size
+        self.warmup_evals = warmup_evals
         if tasks is not None:
             for task in tasks:
                 self._ensure_task(task)
@@ -65,7 +67,11 @@ class TaskCurriculumState:
         decay = self.ema_decay
 
         ema_acc = float(task_state.get("ema_acc", 0.0))
-        ema_acc = decay * ema_acc + (1.0 - decay) * float(accuracy)
+        step_count = int(task_state.get("step_count", 0))
+        if step_count == 0 or ema_acc == 0.0:
+            ema_acc = float(accuracy)
+        else:
+            ema_acc = decay * ema_acc + (1.0 - decay) * float(accuracy)
         task_state["ema_acc"] = ema_acc
 
         if loss is not None:
@@ -76,12 +82,19 @@ class TaskCurriculumState:
             if ema_loss < best_ema_loss:
                 task_state["best_ema_loss"] = ema_loss
 
-        task_state["step_count"] = int(task_state.get("step_count", 0)) + 1
+        task_state["step_count"] = step_count + 1
         task_state["last_seen_step"] = int(step)
         return {
             "ema_acc": ema_acc,
             "ema_loss": float(task_state.get("ema_loss", 0.0)),
         }
+
+    def override_difficulty(self, task: str, new_difficulty: float) -> None:
+        """Force a difficulty update and reset EMA to a safe passing value."""
+        self._ensure_task(task)
+        task_state = self._state[task]
+        task_state["difficulty"] = float(new_difficulty)
+        task_state["ema_acc"] = 0.85
 
     def state_dict(self) -> Dict[str, Dict[str, float]]:
         return {task: dict(values) for task, values in self._state.items()}
@@ -102,6 +115,8 @@ class TaskCurriculumState:
     ) -> float:
         self._ensure_task(task)
         task_state = self._state[task]
+        if int(task_state.get("step_count", 0)) < self.warmup_evals:
+            return float(task_state.get("difficulty", self.init_difficulty))
         last_update_step = int(task_state.get("last_update_step", 0))
         if step - last_update_step < cooldown:
             return float(task_state.get("difficulty", self.init_difficulty))
