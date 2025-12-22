@@ -1841,6 +1841,28 @@ def train(args):
         return difficulty_schedule(
             curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
         )
+
+    def _difficulty_by_task() -> Dict[str, float]:
+        active = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
+        if task_curriculum is not None:
+            return {
+                task: task_curriculum.get_task_state(task)["difficulty"] for task in active
+            }
+        if difficulty_value is not None:
+            difficulty = float(difficulty_value.value)
+        else:
+            difficulty = difficulty_schedule(
+                curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
+            )
+        return {task: difficulty for task in active}
+
+    def _format_difficulty_by_task(difficulty_by_task: Dict[str, float]) -> str:
+        if not difficulty_by_task:
+            return "n/a"
+        return ", ".join(
+            f"{task}={value:.3f}"
+            for task, value in sorted(difficulty_by_task.items())
+        )
     
     try:
         while curriculum.tokens_seen < args.total_tokens:
@@ -2036,7 +2058,12 @@ def train(args):
                               f"VRAM: {peak_vram:.1f}GB" +
                               (f" | K: {avg_K:.1f}" if avg_K > 0 else "") +
                               (f" | ponder: {avg_ponder:.3f}" if avg_ponder > 0 else ""))
-                    log_print(f"  Difficulty: {difficulty_logged:.3f} (easy_mix: {args.easy_mix_frac})")
+                    difficulty_by_task = _difficulty_by_task()
+                    log_print(
+                        "  Difficulty by task: "
+                        f"{_format_difficulty_by_task(difficulty_by_task)} "
+                        f"(easy_mix: {args.easy_mix_frac})"
+                    )
                     log_print(f"  LR: {expected_lr:.2e} (schedule: {args.lr_schedule})")
                     log_print(f"  Grad norm: {last_grad_norm:.1f}")
                     log_print(f"  Weight norm: {weight_norm:.1f}")
@@ -2174,7 +2201,11 @@ def train(args):
                     log_print("\nRunning evaluation...")
                 difficulty_logged = _current_difficulty()
                 if args.extended_logging:
-                    log_print(f"  Eval difficulty: {difficulty_logged:.3f}")
+                    difficulty_by_task = _difficulty_by_task()
+                    log_print(
+                        "  Eval difficulty by task: "
+                        f"{_format_difficulty_by_task(difficulty_by_task)}"
+                    )
                     log_print(
                         f"  Train token acc: {last_token_accuracy:.3f} | "
                         f"pct masked: {last_pct_masked_tokens:.3f}"
