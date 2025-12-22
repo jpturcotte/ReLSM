@@ -1422,7 +1422,19 @@ def train(args):
     if args.use_task_curriculum:
         manager = None if args.num_workers == 0 else Manager()
         curriculum_tasks = alg_tasks or sorted(available_tasks)
-        task_curriculum = TaskCurriculumState(manager, tasks=curriculum_tasks)
+        target_reaction_steps = 2000.0
+        update_interval = float(args.eval_interval)
+        calculated_decay = 1.0 - (update_interval / target_reaction_steps)
+        ema_decay = min(max(calculated_decay, 0.0), 0.99)
+        log_print(
+            "Auto-tuned Curriculum | Update Interval: %.1f | Target Reaction: %.1f | Calculated Decay: %.4f"
+            % (update_interval, target_reaction_steps, ema_decay)
+        )
+        task_curriculum = TaskCurriculumState(
+            manager,
+            tasks=curriculum_tasks,
+            ema_decay=ema_decay,
+        )
 
         difficulty_snapshot: Dict[str, float] = {}
         weights_snapshot: Dict[str, float] = {}
