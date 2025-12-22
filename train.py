@@ -1448,6 +1448,9 @@ def train(args):
         refresh_curriculum_snapshots()
 
         def difficulty_fn(task: str) -> float:
+            if args.easy_mix_frac > 0.0 and random.random() < args.easy_mix_frac:
+                return random.uniform(0.0, 0.3)
+
             difficulty = difficulty_snapshot.get(task, 0.2)
             if args.curriculum_jitter > 0.0 and random.random() < args.curriculum_jitter:
                 return random.uniform(0.0, difficulty)
