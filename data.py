@@ -34,9 +34,10 @@ TASK_DIFFICULTY_CONFIG = {
     "addition": {
         "phases": [
             (0.00, 0.15, {"digit_range": (1, 2)}),
-            (0.15, 0.35, {"digit_range": (1, 3)}),
-            (0.35, 0.60, {"digit_range": (1, 4)}),
-            (0.60, 1.00, {"digit_range": (1, 5)}),
+            (0.15, 0.40, {"digit_range": (1, 3)}),
+            (0.40, 0.70, {"digit_range": (1, 4)}),
+            (0.70, 0.90, {"digit_range": (1, 5)}),
+            (0.90, 1.00, {"digit_range": (3, 6)}),
         ],
         "train_max": 5,
         "ood_start": 6,
@@ -45,7 +46,8 @@ TASK_DIFFICULTY_CONFIG = {
         "phases": [
             (0.00, 0.20, {"digit_range": (1, 2)}),
             (0.20, 0.50, {"digit_range": (1, 2)}),
-            (0.50, 1.00, {"digit_range": (1, 3)}),
+            (0.50, 0.80, {"digit_range": (1, 3)}),
+            (0.80, 1.00, {"digit_range": (2, 3)}),
         ],
         "train_max": 3,
         "ood_start": 4,
@@ -53,9 +55,10 @@ TASK_DIFFICULTY_CONFIG = {
     "successor": {
         "phases": [
             (0.00, 0.15, {"digit_range": (1, 2)}),
-            (0.15, 0.35, {"digit_range": (1, 3)}),
-            (0.35, 0.60, {"digit_range": (1, 4)}),
-            (0.60, 1.00, {"digit_range": (1, 5)}),
+            (0.15, 0.40, {"digit_range": (1, 3)}),
+            (0.40, 0.70, {"digit_range": (1, 4)}),
+            (0.70, 0.90, {"digit_range": (1, 5)}),
+            (0.90, 1.00, {"digit_range": (3, 6)}),
         ],
         "train_max": 5,
         "ood_start": 6,
@@ -64,7 +67,8 @@ TASK_DIFFICULTY_CONFIG = {
         "phases": [
             (0.00, 0.10, {"length_range": (4, 6)}),
             (0.10, 0.30, {"length_range": (4, 9)}),
-            (0.30, 1.00, {"length_range": (4, 12)}),
+            (0.30, 0.70, {"length_range": (4, 12)}),
+            (0.70, 1.00, {"length_range": (8, 12)}),
         ],
         "train_max": 12,
         "ood_start": 16,
@@ -73,7 +77,8 @@ TASK_DIFFICULTY_CONFIG = {
         "phases": [
             (0.00, 0.15, {"length_range": (4, 6)}),
             (0.15, 0.40, {"length_range": (4, 8)}),
-            (0.40, 1.00, {"length_range": (4, 12)}),
+            (0.40, 0.70, {"length_range": (4, 12)}),
+            (0.70, 1.00, {"length_range": (8, 12)}),
         ],
         "train_max": 12,
         "ood_start": 16,
@@ -82,40 +87,48 @@ TASK_DIFFICULTY_CONFIG = {
         "phases": [
             (0.00, 0.10, {"length_range": (4, 6)}),
             (0.10, 0.30, {"length_range": (4, 9)}),
-            (0.30, 1.00, {"length_range": (4, 12)}),
+            (0.30, 0.70, {"length_range": (4, 12)}),
+            (0.70, 1.00, {"length_range": (8, 12)}),
         ],
         "train_max": 12,
         "ood_start": 16,
     },
     "dyck": {
         "phases": [
-            (0.00, 0.10, {"depth_range": (2, 2)}),
-            (0.10, 0.30, {"depth_range": (2, 3)}),
-            (0.30, 1.00, {"depth_range": (2, 4)}),
+            (0.00, 0.10, {"depth_range": (1, 2)}),
+            (0.10, 0.40, {"depth_range": (2, 3)}),
+            (0.40, 0.80, {"depth_range": (2, 4)}),
+            (0.80, 1.00, {"depth_range": (3, 4)}),
         ],
         "train_max": 4,
         "ood_start": 5,
     },
     "mod_add": {
         "phases": [
-            (0.00, 0.20, {"mod_range": (17, 97)}),
-            (0.20, 1.00, {"mod_range": (97, 997)}),
+            (0.00, 0.20, {"mod_range": (17, 50)}),
+            (0.20, 0.50, {"mod_range": (50, 200)}),
+            (0.50, 0.80, {"mod_range": (100, 997)}),
+            (0.80, 1.00, {"mod_range": (500, 997)}),
         ],
         "train_max": 997,
         "ood_start": 2003,
     },
     "chain": {
         "phases": [
-            (0.00, 0.15, {"length_range": (2, 3)}),
-            (0.15, 1.00, {"length_range": (2, 5)}),
+            (0.00, 0.20, {"length_range": (2, 3)}),
+            (0.20, 0.60, {"length_range": (2, 4)}),
+            (0.60, 0.90, {"length_range": (2, 5)}),
+            (0.90, 1.00, {"length_range": (4, 5)}),
         ],
         "train_max": 5,
         "ood_start": 6,
     },
     "compare": {
         "phases": [
-            (0.00, 0.10, {"digit_range": (1, 2)}),
-            (0.10, 1.00, {"digit_range": (1, 4)}),
+            (0.00, 0.20, {"digit_range": (1, 2)}),
+            (0.20, 0.60, {"digit_range": (1, 3)}),
+            (0.60, 0.90, {"digit_range": (1, 4)}),
+            (0.90, 1.00, {"digit_range": (3, 4)}),
         ],
         "train_max": 4,
         "ood_start": 5,
@@ -888,12 +901,12 @@ class AlgorithmicGenerator:
         if difficulty_schedule == "phased" and progress is not None:
             params = get_difficulty_params(task, progress)
             difficulty_value = progress
-        elif difficulty_schedule == "fixed":
-            params = {}
-            difficulty_value = 0.5
         else:
-            params = {}
-            difficulty_value = difficulty
+            params = get_difficulty_params(task, difficulty)
+            if difficulty_schedule == "fixed":
+                difficulty_value = 0.5
+            else:
+                difficulty_value = difficulty
 
         kwargs: Dict[str, int | Tuple[int, int]] = {}
         if "digit_range" in params:

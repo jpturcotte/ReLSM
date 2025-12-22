@@ -283,6 +283,13 @@ This codebase synthesizes and tests ideas from:
 - ❌ Entropy patching (adds another model)
 - ❌ Multiplicative gains (not empirically supported)
 
+## Training Flags (Curriculum)
+
+- `--use_task_curriculum`: Enable per-task competence tracking.
+- `--curriculum_cooldown`: Steps to wait between curriculum difficulty updates per task.
+- `--curriculum_min_task_evals`: Minimum evals per task before the curriculum can adjust difficulty.
+- `--curriculum_jitter`: Probability of replaying easier samples per task.
+
 ## Expected Results (Hypotheses)
 
 | Metric | Baseline | Shared Loop | Latent | ACT |
