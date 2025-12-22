@@ -1675,19 +1675,55 @@ def train(args):
     last_grad_norm = 0.0
     checkpoint_paths: List[Path] = []
 
+    def _task_curriculum_config() -> Optional[Dict[str, float]]:
+        if task_curriculum is None:
+            return None
+        return {
+            "init_difficulty": float(task_curriculum.init_difficulty),
+            "ema_decay": float(task_curriculum.ema_decay),
+            "step_size": float(task_curriculum.step_size),
+        }
+
+    def _curriculum_config() -> Dict[str, float]:
+        return {
+            "alg_tokens": int(args.alg_tokens),
+            "total_tokens": int(args.total_tokens),
+            "mix_band_tokens": int(args.mix_band_tokens),
+            "persistent_alg_frac": float(args.persistent_alg_frac),
+            "lexical_frac_phase1": float(args.lexical_frac_phase1),
+            "difficulty_schedule": str(args.difficulty_schedule),
+            "use_task_curriculum": bool(args.use_task_curriculum),
+            "curriculum_cooldown": int(args.curriculum_cooldown),
+            "curriculum_jitter": float(args.curriculum_jitter),
+        }
+
+    def build_checkpoint_payload(step: int, tokens_seen: int) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model_state_dict": model.state_dict(),
+            "config": config,
+            "step": step,
+            "tokens_seen": tokens_seen,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+            "best_alg_acc": best_alg_acc,
+            "curriculum_tokens_seen": int(curriculum.tokens_seen),
+            "curriculum_rng_state": curriculum.rng.getstate(),
+            "difficulty_value": (
+                float(difficulty_value.value) if difficulty_value is not None else None
+            ),
+            "curriculum_config": _curriculum_config(),
+            "task_curriculum_config": _task_curriculum_config(),
+        }
+        if task_curriculum is not None:
+            payload["curriculum_state"] = task_curriculum.state_dict()
+        return payload
+
     def save_rotating_checkpoint(step: int, tokens_seen: int, tag: Optional[str] = None) -> Optional[Path]:
         if args.eval_checkpoints <= 0:
             return None
         suffix = f"_{tag}" if tag else ""
         checkpoint_path = output_dir / f"checkpoint_step_{step}{suffix}.pt"
-        payload = {
-            "model_state_dict": model.state_dict(),
-            "config": config,
-            "step": step,
-            "tokens_seen": tokens_seen,
-        }
-        if task_curriculum is not None:
-            payload["curriculum_state"] = task_curriculum.state_dict()
+        payload = build_checkpoint_payload(step, tokens_seen)
         torch.save(payload, checkpoint_path)
         checkpoint_paths.append(checkpoint_path)
         while len(checkpoint_paths) > args.eval_checkpoints:
@@ -1697,6 +1733,51 @@ def train(args):
             except FileNotFoundError:
                 pass
         return checkpoint_path
+
+    def _apply_task_curriculum_config(config_payload: Dict[str, float]) -> None:
+        if task_curriculum is None or not config_payload:
+            return
+        if "init_difficulty" in config_payload:
+            task_curriculum.init_difficulty = float(config_payload["init_difficulty"])
+        if "ema_decay" in config_payload:
+            task_curriculum.ema_decay = float(config_payload["ema_decay"])
+        if "step_size" in config_payload:
+            task_curriculum.step_size = float(config_payload["step_size"])
+
+    def load_checkpoint_state(checkpoint_path: str) -> Tuple[int, int, float]:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer_state = checkpoint.get("optimizer_state_dict")
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+        scaler_state = checkpoint.get("scaler_state_dict")
+        if scaler is not None and scaler_state is not None:
+            scaler.load_state_dict(scaler_state)
+        if task_curriculum is not None and checkpoint.get("curriculum_state"):
+            task_curriculum.load_state_dict(checkpoint["curriculum_state"])
+        if checkpoint.get("task_curriculum_config"):
+            _apply_task_curriculum_config(checkpoint["task_curriculum_config"])
+        if checkpoint.get("curriculum_rng_state") is not None:
+            curriculum.rng.setstate(checkpoint["curriculum_rng_state"])
+        resume_tokens = int(checkpoint.get("tokens_seen", 0))
+        curriculum_tokens = int(checkpoint.get("curriculum_tokens_seen", resume_tokens))
+        curriculum.tokens_seen = curriculum_tokens
+        if difficulty_value is not None and checkpoint.get("difficulty_value") is not None:
+            difficulty_value.value = float(checkpoint["difficulty_value"])
+        resume_step = int(checkpoint.get("step", 0))
+        resume_best_alg = float(checkpoint.get("best_alg_acc", 0.0))
+        return resume_step, curriculum_tokens, resume_best_alg
+
+    if args.resume_from:
+        resume_step, resume_tokens, resume_best_alg = load_checkpoint_state(args.resume_from)
+        global_step = resume_step
+        tokens_seen = resume_tokens
+        best_alg_acc = resume_best_alg
+        log_print(
+            f"Resumed from checkpoint: {args.resume_from} "
+            f"(step={global_step}, tokens_seen={tokens_seen}, "
+            f"best_alg_acc={best_alg_acc:.4f})"
+        )
     
     # Estimate steps with hybrid calculation for sparse algorithmic and dense language data
     algo_steps = args.alg_tokens // (args.alg_batch_size * 40)
@@ -2247,12 +2328,9 @@ def train(args):
                     # Track best
                     if overall_acc > best_alg_acc:
                         best_alg_acc = overall_acc
-                        torch.save({
-                            "model_state_dict": model.state_dict(),
-                            "config": config,
-                            "step": global_step,
-                            "alg_accuracy": best_alg_acc,
-                        }, output_dir / "best_model.pt")
+                        best_payload = build_checkpoint_payload(global_step, tokens_seen)
+                        best_payload["alg_accuracy"] = best_alg_acc
+                        torch.save(best_payload, output_dir / "best_model.pt")
                         if args.extended_logging:
                             log_print(f"  New best! Saved checkpoint.")
 
@@ -2480,12 +2558,8 @@ def train(args):
     total_time = time.time() - start_time
     
     # Final save
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "config": config,
-        "step": global_step,
-        "tokens_seen": tokens_seen,
-    }, output_dir / "final_model.pt")
+    final_payload = build_checkpoint_payload(global_step, tokens_seen)
+    torch.save(final_payload, output_dir / "final_model.pt")
     
     # Save metrics
     logger.save()
@@ -2701,6 +2775,12 @@ def main():
         type=int,
         default=2,
         help="Number of most recent evaluation checkpoints to keep",
+    )
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Path to a training checkpoint to resume from",
     )
     parser.add_argument(
         "--eval_algorithmic",
