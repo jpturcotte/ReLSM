@@ -52,6 +52,7 @@ from utils import (
     compute_attention_probs,
     compute_weight_entropy,
     compute_metrics,
+    extract_prediction_from_generate,
     get_transformer_blocks,
     module_grad_weight_norm,
     normalize_prediction,
@@ -577,18 +578,6 @@ def run_eval_diagnostics(
 NUMERIC_TASKS = {"mod_add", "addition", "multiplication", "chain", "successor", "parity"}
 MAE_TASKS = {"mod_add", "addition", "multiplication", "chain", "successor"}
 SEQUENCE_TASKS = {"copy", "reverse"}
-TASK_SEPARATORS = {
-    "copy": ["->", "=>", "=", ":"],
-    "reverse": ["->", "=>", "=", ":"],
-    "parity": ["=", "?"],
-    "dyck": ["?"],
-    "addition": ["="],
-    "multiplication": ["="],
-    "mod_add": ["=", "?"],
-    "chain": ["="],
-    "compare": ["->", "?"],
-    "successor": ["=", "=>"],
-}
 
 
 def _normalize_text(text: str) -> str:
@@ -730,26 +719,14 @@ def _decode_example_text(example: Dict[str, torch.Tensor], tokenizer) -> Optiona
     return tokenizer.decode(full_tokens, skip_special_tokens=True)
 
 
-def _extract_prompt_target(full_text: str, task: str) -> Optional[Dict[str, str]]:
-    separators = TASK_SEPARATORS.get(task, ["=", "->", "=>"])
-
-    sep_index = -1
-    chosen_sep = None
-    for sep in separators:
-        idx = full_text.rfind(sep)
-        if idx > sep_index:
-            sep_index = idx
-            chosen_sep = sep
-
-    if sep_index == -1 or chosen_sep is None:
-        if " " not in full_text:
-            return None
-        prompt, target = full_text.rsplit(" ", 1)
-        return {"prompt": prompt.rstrip() + " ", "target": target.strip()}
-
-    prompt = full_text[: sep_index + len(chosen_sep)].rstrip() + " "
-    target = full_text[sep_index + len(chosen_sep) :].strip()
-    if not prompt or not target:
+def _extract_prompt_target(full_text: str) -> Optional[Dict[str, str]]:
+    marker = "Answer: "
+    idx = full_text.rfind(marker)
+    if idx == -1:
+        return None
+    prompt = full_text[: idx + len(marker)]
+    target = full_text[idx + len(marker) :].strip()
+    if not prompt or target == "":
         return None
     return {"prompt": prompt, "target": target}
 
@@ -825,26 +802,21 @@ def _predict_with_tokens(
         temperature=0.0,
         eos_token_id=eos_token_id,
     )
-    prompt_len = input_ids.shape[1]
-    gen_tokens = output[0, prompt_len:]
-    stop_reason = "other"
-    if eos_token_id is not None:
-        eos_positions = (gen_tokens == eos_token_id).nonzero(as_tuple=False)
-        if eos_positions.numel() > 0:
-            gen_tokens = gen_tokens[: eos_positions[0].item() + 1]
-            stop_reason = "eos"
-        elif gen_tokens.size(0) >= max_new_tokens:
-            stop_reason = "max_new_tokens"
-    elif gen_tokens.size(0) >= max_new_tokens:
-        stop_reason = "max_new_tokens"
-
-    pred_raw = tokenizer.decode(gen_tokens, skip_special_tokens=True)
-    pred_norm = normalize_prediction(task, pred_raw) if task in NUMERIC_TASKS else _normalize_text(pred_raw)
+    pred_raw, gen_tokens, stop_reason, first_token_is_eos = extract_prediction_from_generate(
+        input_ids[0],
+        output[0],
+        eos_token_id,
+        tokenizer,
+    )
+    pred_norm = (
+        normalize_prediction(task, pred_raw) if task in NUMERIC_TASKS else _normalize_text(pred_raw)
+    )
     return {
         "pred_norm": pred_norm,
         "pred_raw": pred_raw,
-        "pred_tokens": gen_tokens.tolist(),
+        "pred_tokens": gen_tokens,
         "stop_reason": stop_reason,
+        "first_token_is_eos": first_token_is_eos,
     }
 
 
@@ -924,7 +896,7 @@ def evaluate_task_accuracy(
         full_text = _decode_example_text(example, tokenizer)
         if not full_text:
             continue
-        parsed = _extract_prompt_target(full_text, task)
+        parsed = _extract_prompt_target(full_text)
         if not parsed:
             continue
         prompt = parsed["prompt"]
@@ -939,7 +911,7 @@ def evaluate_task_accuracy(
             continue
         pred_norm = pred_bundle["pred_norm"]
 
-        metrics = compute_metrics(task, pred_norm, target)
+        metrics = compute_metrics(task, pred_norm, target, tokenizer)
         metrics_by_task[task].append(metrics)
         total[task] += 1
         difficulty = example.get("difficulty")
@@ -956,6 +928,7 @@ def evaluate_task_accuracy(
         length_ratio.append(pred_len / max(target_len, 1))
         abs_len_error.append(abs(pred_len - target_len))
         stop_reason = pred_bundle["stop_reason"]
+        first_token_is_eos = pred_bundle["first_token_is_eos"]
         stop_reason_counts[stop_reason] = stop_reason_counts.get(stop_reason, 0) + 1
         task_stop_counts = stop_reason_counts_by_task[task]
         task_stop_counts[stop_reason] = task_stop_counts.get(stop_reason, 0) + 1
@@ -1016,6 +989,7 @@ def evaluate_task_accuracy(
                 "target_len_tokens": target_len,
                 "pred_len_tokens": pred_len,
                 "stop_reason": stop_reason,
+                "first_token_is_eos": first_token_is_eos,
                 "parse_ok": parse_ok,
                 "repeat_1gram_rate": repetition["repeat_1gram_rate"],
                 "difficulty": difficulty,

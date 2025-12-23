@@ -720,8 +720,30 @@ def normalize_target(task: str, text: str) -> str:
     return text
 
 
-def compute_metrics(task: str, pred: str, target: str) -> Dict[str, float]:
+def compute_metrics(task: str, pred: str, target: str, tokenizer: Any) -> Dict[str, float]:
     """Compute universal metrics for algorithmic and fixed training tasks."""
+    pred = _metrics_normalize(task, pred)
+    target = _metrics_normalize(task, target)
+
+    exact_match = float(pred == target)
+
+    pred_ids = _encode_for_metrics(tokenizer, pred)
+    target_ids = _encode_for_metrics(tokenizer, target)
+    token_accuracy, prefix_accuracy = _token_accuracy(pred_ids, target_ids)
+
+    if _is_numeric_task(task):
+        normalized_distance = _numeric_distance(pred, target)
+    elif _is_classification_task(task):
+        normalized_distance = 1.0 - exact_match
+    else:
+        normalized_distance = _sequence_distance(pred_ids, target_ids)
+
+    return {
+        "exact_match": exact_match,
+        "token_accuracy": token_accuracy,
+        "normalized_distance": normalized_distance,
+        "prefix_accuracy": prefix_accuracy,
+    }
     pred = _metrics_normalize(task, pred)
     target = _metrics_normalize(task, target)
 
@@ -753,86 +775,58 @@ def _is_classification_task(task: str) -> bool:
     return task in {"parity", "dyck", "compare"}
 
 
-def _normalize_numeric_str(value: str) -> str:
-    if value.startswith("-"):
-        rest = value[1:].lstrip("0") or "0"
-        return f"-{rest}"
-    return value.lstrip("0") or "0"
+def _encode_for_metrics(tokenizer: Any, text: str) -> List[int]:
+    try:
+        return tokenizer.encode(text, add_special_tokens=False)
+    except Exception:
+        encoded = tokenizer(text, return_tensors="pt", truncation=True, add_special_tokens=False)
+        if isinstance(encoded, dict):
+            return encoded["input_ids"][0].tolist()
+        return encoded[0].tolist()
 
 
-def _numeric_metrics(pred: str, target: str, exact_match: float) -> Dict[str, float]:
+def _token_accuracy(pred_ids: List[int], target_ids: List[int]) -> Tuple[float, float]:
+    if not target_ids:
+        token_accuracy = 1.0 if not pred_ids else 0.0
+        prefix_accuracy = 1.0 if not pred_ids else 0.0
+        return token_accuracy, prefix_accuracy
+
+    max_len = max(len(pred_ids), len(target_ids))
+    matches = sum(p == t for p, t in zip(pred_ids, target_ids))
+    token_accuracy = matches / max_len
+
+    prefix_len = 0
+    for p, t in zip(pred_ids, target_ids):
+        if p == t:
+            prefix_len += 1
+        else:
+            break
+    prefix_accuracy = prefix_len / max(len(target_ids), 1)
+    return token_accuracy, prefix_accuracy
+
+
+def _numeric_distance(pred: str, target: str) -> float:
     pred_num = safe_parse_number(pred)
     target_num = safe_parse_number(target)
     parseable = not (math.isnan(pred_num) or math.isnan(target_num))
 
-    pred_clean = re.sub(r"[^\d\-]", "", pred) or "0"
-    target_clean = re.sub(r"[^\d\-]", "", target) or "0"
-
-    pred_clean = _normalize_numeric_str(pred_clean)
-    target_clean = _normalize_numeric_str(target_clean)
-
-    max_len = max(len(pred_clean), len(target_clean))
-    pred_padded = pred_clean.rjust(max_len)
-    target_padded = target_clean.rjust(max_len)
-    token_accuracy = sum(p == t for p, t in zip(pred_padded, target_padded)) / max_len
-
     if parseable:
         abs_error = abs(pred_num - target_num)
-        normalized_distance = min(
+        return min(
             1.0,
             math.log1p(abs_error)
             / math.log1p(abs(target_num) + 1000),
         )
     else:
-        normalized_distance = 1.0
-
-    prefix_len = 0
-    for p, t in zip(pred_padded, target_padded):
-        if p == t:
-            prefix_len += 1
-        else:
-            break
-    prefix_accuracy = prefix_len / max_len
-
-    return {
-        "exact_match": exact_match,
-        "token_accuracy": token_accuracy,
-        "normalized_distance": normalized_distance,
-        "prefix_accuracy": prefix_accuracy,
-    }
+        return 1.0
 
 
-def _sequence_metrics(pred: str, target: str, exact_match: float) -> Dict[str, float]:
-    pred_tokens = pred.split()
-    target_tokens = target.split()
-
-    if not target_tokens:
-        return {
-            "exact_match": exact_match,
-            "token_accuracy": 1.0 if not pred_tokens else 0.0,
-            "normalized_distance": 0.0 if not pred_tokens else 1.0,
-            "prefix_accuracy": 1.0 if not pred_tokens else 0.0,
-        }
-
-    max_len = max(len(pred_tokens), len(target_tokens))
-    matches = sum(p == t for p, t in zip(pred_tokens, target_tokens))
-    token_accuracy = matches / max_len
-    normalized_distance = _edit_distance(pred_tokens, target_tokens) / max_len
-
-    prefix_len = 0
-    for p, t in zip(pred_tokens, target_tokens):
-        if p == t:
-            prefix_len += 1
-        else:
-            break
-    prefix_accuracy = prefix_len / len(target_tokens)
-
-    return {
-        "exact_match": exact_match,
-        "token_accuracy": token_accuracy,
-        "normalized_distance": min(1.0, normalized_distance),
-        "prefix_accuracy": prefix_accuracy,
-    }
+def _sequence_distance(pred_ids: List[int], target_ids: List[int]) -> float:
+    if not target_ids:
+        return 0.0 if not pred_ids else 1.0
+    max_len = max(len(pred_ids), len(target_ids))
+    normalized_distance = _edit_distance(pred_ids, target_ids) / max_len
+    return min(1.0, normalized_distance)
 
 
 def _edit_distance(a: List[str], b: List[str]) -> int:
@@ -851,28 +845,6 @@ def _edit_distance(a: List[str], b: List[str]) -> int:
     return dp[n]
 
 
-def _classification_metrics(pred: str, target: str, exact_match: float) -> Dict[str, float]:
-    token_accuracy = exact_match
-    normalized_distance = 1.0 - exact_match
-
-    if pred and target:
-        max_len = max(len(pred), len(target))
-        prefix_len = 0
-        for p, t in zip(pred, target):
-            if p == t:
-                prefix_len += 1
-            else:
-                break
-        prefix_accuracy = prefix_len / max_len
-    else:
-        prefix_accuracy = exact_match
-
-    return {
-        "exact_match": exact_match,
-        "token_accuracy": token_accuracy,
-        "normalized_distance": normalized_distance,
-        "prefix_accuracy": prefix_accuracy,
-    }
 
 
 @dataclass
@@ -942,6 +914,37 @@ def _token_length(tokenizer: Any, text: str) -> int:
         return int(encoded["input_ids"].shape[1])
 
 
+def extract_prediction_from_generate(
+    prompt_input_ids: Sequence[int] | torch.Tensor,
+    generated_ids: Sequence[int] | torch.Tensor,
+    eos_token_id: Optional[int],
+    tokenizer: Any,
+) -> Tuple[str, List[int], str, bool]:
+    if isinstance(prompt_input_ids, torch.Tensor):
+        prompt_list = prompt_input_ids.tolist()
+    else:
+        prompt_list = list(prompt_input_ids)
+    if isinstance(generated_ids, torch.Tensor):
+        generated_list = generated_ids.tolist()
+    else:
+        generated_list = list(generated_ids)
+
+    prompt_len = len(prompt_list)
+    continuation_ids = generated_list[prompt_len:]
+    first_token_is_eos = bool(
+        continuation_ids and eos_token_id is not None and continuation_ids[0] == eos_token_id
+    )
+    stop_reason = "max_new_tokens"
+    if eos_token_id is not None:
+        for idx, token_id in enumerate(continuation_ids):
+            if token_id == eos_token_id:
+                continuation_ids = continuation_ids[:idx]
+                stop_reason = "eos"
+                break
+    prediction = tokenizer.decode(continuation_ids, skip_special_tokens=True).strip()
+    return prediction, continuation_ids, stop_reason, first_token_is_eos
+
+
 def generate_batch(
     model,
     tokenizer,
@@ -980,8 +983,9 @@ def generate_batch(
     preds: List[str] = [""] * len(prompts_list)
     raw_preds: List[str] = [""] * len(prompts_list)
     generation_lengths: List[int] = [0] * len(prompts_list)
-    stop_reasons: List[str] = ["other"] * len(prompts_list)
+    stop_reasons: List[str] = ["max_new_tokens"] * len(prompts_list)
     eos_emitted: List[bool] = [False] * len(prompts_list)
+    first_token_is_eos: List[bool] = [False] * len(prompts_list)
     pred_token_ids: List[List[int]] = [[] for _ in prompts_list]
     eos_token_id = gen_kwargs.get("eos_token_id")
 
@@ -999,28 +1003,21 @@ def generate_batch(
                     outputs = model.generate(input_ids=batch_ids, **gen_kwargs)
 
                 for i, (orig_idx, _) in enumerate(microbatch):
-                    gen_tokens = outputs[i, prompt_len:]
-                    if eos_token_id is not None:
-                        eos_positions = (gen_tokens == eos_token_id).nonzero(as_tuple=False)
-                    if eos_positions.numel() > 0:
-                        eos_at = eos_positions[0].item()
-                        gen_tokens = gen_tokens[: eos_at + 1]
-                        stop_reasons[orig_idx] = "eos"
-                        eos_emitted[orig_idx] = True
-                    else:
-                        if gen_tokens.size(0) >= max_new_tokens:
-                            stop_reasons[orig_idx] = "max_new_tokens"
-                        else:
-                            stop_reasons[orig_idx] = "other"
-                else:
-                    if gen_tokens.size(0) >= max_new_tokens:
-                        stop_reasons[orig_idx] = "max_new_tokens"
-
-                generation_lengths[orig_idx] = int(gen_tokens.size(0))
-                pred_token_ids[orig_idx] = gen_tokens.tolist()
-                decoded = tokenizer.decode(gen_tokens, skip_special_tokens=True)
-                raw_preds[orig_idx] = decoded
-                preds[orig_idx] = normalize_prediction(task, decoded)
+                    prediction, continuation_ids, stop_reason, first_is_eos = (
+                        extract_prediction_from_generate(
+                            batch_ids[i],
+                            outputs[i],
+                            eos_token_id,
+                            tokenizer,
+                        )
+                    )
+                    generation_lengths[orig_idx] = len(continuation_ids)
+                    pred_token_ids[orig_idx] = continuation_ids
+                    raw_preds[orig_idx] = prediction
+                    preds[orig_idx] = normalize_prediction(task, prediction)
+                    stop_reasons[orig_idx] = stop_reason
+                    eos_emitted[orig_idx] = stop_reason == "eos"
+                    first_token_is_eos[orig_idx] = first_is_eos
 
     elapsed = max(1e-6, time.time() - start)
     return preds, generation_lengths, elapsed, {
@@ -1028,6 +1025,7 @@ def generate_batch(
         "pred_token_ids": pred_token_ids,
         "stop_reasons": stop_reasons,
         "eos_emitted": eos_emitted,
+        "first_token_is_eos": first_token_is_eos,
     }
 
 
@@ -1104,9 +1102,10 @@ def evaluate_condition(
         pred_token_ids = gen_info["pred_token_ids"]
         stop_reasons = gen_info["stop_reasons"]
         eos_emitted = gen_info["eos_emitted"]
+        first_token_is_eos = gen_info["first_token_is_eos"]
         for idx, (pred, tgt, ex) in enumerate(zip(preds, targets, batch)):
             norm_tgt = normalize_target(task, tgt)
-            metrics = compute_metrics(task, pred, tgt)
+            metrics = compute_metrics(task, pred, tgt, tokenizer)
             metrics_samples.append(metrics)
             target_len_tokens = _token_length(tokenizer, norm_tgt)
             pred_tokens = pred_token_ids[idx]
@@ -1116,6 +1115,7 @@ def evaluate_condition(
             repeat_metrics = compute_repetition_metrics(pred_tokens)
             stop_reason = stop_reasons[idx]
             eos_hit = eos_emitted[idx]
+            first_is_eos = first_token_is_eos[idx]
             if stop_reason not in stop_reason_counts:
                 stop_reason = "other"
             stop_reason_counts[stop_reason] += 1
@@ -1173,6 +1173,7 @@ def evaluate_condition(
                     "target_len_tokens": target_len_tokens,
                     "pred_len_tokens": pred_len_tokens,
                     "stop_reason": stop_reason,
+                    "first_token_is_eos": first_is_eos,
                     "parse_ok": parse_ok,
                     "repeat_1gram_rate": repeat_metrics["repeat_1gram_rate"],
                     "difficulty": difficulty,

@@ -12,7 +12,6 @@ import argparse
 import random
 import hashlib
 import json
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -26,6 +25,7 @@ from utils import (
     NeedleInHaystackGenerator,
     area_under_depth_curve,
     evaluate_condition,
+    extract_prediction_from_generate,
     gather_metadata,
     get_eval_generation_kwargs,
     load_model_and_tokenizer,
@@ -69,34 +69,6 @@ def _prepare_model(model, device: torch.device, dtype: Optional[str], compile_mo
         except Exception:
             pass
     return model
-
-
-def _parse_answer_from_continuation(decoded: str) -> str:
-    """Extract the first token of the answer from a decoded continuation."""
-
-    if "Answer:" in decoded:
-        tail = decoded.split("Answer:")[-1].strip()
-    else:
-        tail = decoded.strip()
-
-    number_match = re.search(r"\b\d+\b", tail)
-    if number_match:
-        return number_match.group(0)
-
-    words = tail.split()
-    return words[0] if words else ""
-
-
-def _prediction_from_output_ids(
-    tokenizer: Any, output_ids: Sequence[int] | torch.Tensor, prompt_len: int
-) -> str:
-    """Decode and parse only the continuation portion of a generation."""
-
-    continuation_ids = output_ids[prompt_len:]
-    if isinstance(continuation_ids, torch.Tensor):
-        continuation_ids = continuation_ids.tolist()
-    continuation = tokenizer.decode(continuation_ids, skip_special_tokens=True)
-    return _parse_answer_from_continuation(continuation)
 
 
 def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
@@ -537,9 +509,11 @@ def run_longctx_suite(
                 example = generator.generate(needle_depth=depth)
                 input_ids = example["input_ids"].to(device).unsqueeze(0)
                 outputs = model.generate(input_ids=input_ids, **gen_kwargs)
-                prompt_len = input_ids.shape[1]
-                predicted = _prediction_from_output_ids(
-                    tokenizer, outputs[0], prompt_len
+                predicted, _, _, _ = extract_prediction_from_generate(
+                    input_ids[0],
+                    outputs[0],
+                    gen_kwargs.get("eos_token_id"),
+                    tokenizer,
                 )
                 if predicted == example["answer"]:
                     depth_correct += 1

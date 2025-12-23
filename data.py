@@ -327,7 +327,7 @@ class AlgorithmicGenerator:
     @staticmethod
     def _choose_prompt(rng: random.Random, templates: List[str], **kwargs) -> str:
         template = rng.choice(templates)
-        return template.format(**kwargs).strip()
+        return template.format(**kwargs)
     
     @staticmethod
     def modular_arithmetic(
@@ -357,10 +357,10 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "Compute ({a} + {b}) mod {mod} =",
-                "What is ({a} + {b}) modulo {mod}?",
-                "Add {a} and {b}, then take mod {mod}. Result:",
-                "({a} plus {b}) % {mod} equals",
+                "Compute ({a} + {b}) mod {mod}. Answer: ",
+                "What is ({a} + {b}) modulo {mod}? Answer: ",
+                "Add {a} and {b}, then take mod {mod}. Answer: ",
+                "({a} plus {b}) % {mod} equals. Answer: ",
             ],
             a=a,
             b=b,
@@ -368,7 +368,7 @@ class AlgorithmicGenerator:
         )
 
         return {
-            "text": f"{prompt} {result}",
+            "text": f"{prompt}{result}",
             "input": prompt,
             "target": str(result),
             "task": "mod_add",
@@ -397,16 +397,16 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "parity({bits}) =",
-                "Is the number of ones in {bits} even (0) or odd (1)?",
-                "Compute the parity bit for {bits}:",
-                "Parity of {bits}?",
+                "parity({bits}). Answer: ",
+                "Is the number of ones in {bits} even (0) or odd (1)? Answer: ",
+                "Compute the parity bit for {bits}. Answer: ",
+                "Parity of {bits}? Answer: ",
             ],
             bits=bit_str,
         )
 
         return {
-            "text": f"{prompt} {parity}",
+            "text": f"{prompt}{parity}",
             "input": prompt,
             "target": str(parity),
             "task": "parity",
@@ -455,18 +455,18 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "Compute: {a} + {b} =",
-                "What is {a} plus {b}?",
-                "Add {a} and {b}. Answer:",
-                "Sum {a} with {b} =",
-                "{a} + {b} equals",
+                "Compute: {a} + {b}. Answer: ",
+                "What is {a} plus {b}? Answer: ",
+                "Add {a} and {b}. Answer: ",
+                "Sum {a} with {b}. Answer: ",
+                "{a} + {b} equals. Answer: ",
             ],
             a=a,
             b=b,
         )
 
         return {
-            "text": f"{prompt} {result}",
+            "text": f"{prompt}{result}",
             "input": prompt,
             "target": str(result),
             "task": "addition",
@@ -499,17 +499,17 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "Multiply: {a} * {b} =",
-                "What is {a} times {b}?",
-                "Product of {a} and {b}:",
-                "Compute {a} multiplied by {b} =",
+                "Multiply: {a} * {b}. Answer: ",
+                "What is {a} times {b}? Answer: ",
+                "Product of {a} and {b}. Answer: ",
+                "Compute {a} multiplied by {b}. Answer: ",
             ],
             a=a,
             b=b,
         )
 
         return {
-            "text": f"{prompt} {result}",
+            "text": f"{prompt}{result}",
             "input": prompt,
             "target": str(result),
             "task": "multiplication",
@@ -538,16 +538,16 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "copy: {seq} ->",
-                "Repeat the sequence {seq}:",
-                "Copy this list exactly: {seq} =>",
-                "Write the same numbers again: {seq} =",
+                "Copy the sequence {seq}. Answer: ",
+                "Repeat the sequence {seq}. Answer: ",
+                "Copy this list exactly: {seq}. Answer: ",
+                "Write the same numbers again: {seq}. Answer: ",
             ],
             seq=seq_str,
         )
 
         return {
-            "text": f"{prompt} {seq_str}",
+            "text": f"{prompt}{seq_str}",
             "input": prompt,
             "target": seq_str,
             "task": "copy",
@@ -577,16 +577,16 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "reverse: {seq} ->",
-                "Write {seq} backwards:",
-                "Reverse the order of {seq}:",
-                "Flip the sequence {seq} =",
+                "Reverse: {seq}. Answer: ",
+                "Write {seq} backwards. Answer: ",
+                "Reverse the order of {seq}. Answer: ",
+                "Flip the sequence {seq}. Answer: ",
             ],
             seq=seq_str,
         )
 
         return {
-            "text": f"{prompt} {rev_str}",
+            "text": f"{prompt}{rev_str}",
             "input": prompt,
             "target": rev_str,
             "task": "reverse",
@@ -685,16 +685,16 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "Is '{seq}' balanced? Answer yes or no.",
-                "Does {seq} form a correct parentheses string?",
-                "dyck: {seq} -> valid?",
-                "Check Dyck validity for: {seq}",
+                "Is '{seq}' balanced? Answer: ",
+                "Does {seq} form a correct parentheses string? Answer: ",
+                "Dyck check for {seq}. Answer: ",
+                "Check Dyck validity for: {seq}. Answer: ",
             ],
             seq=seq_str,
         )
 
         return {
-            "text": f"{prompt} {'yes' if is_valid else 'no'}",
+            "text": f"{prompt}{'yes' if is_valid else 'no'}",
             "input": prompt,
             "target": "yes" if is_valid else "no",
             "task": "dyck",
@@ -753,16 +753,16 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "calc: {expr} =",
-                "Evaluate {expr}.",
-                "Compute the result of {expr}:",
-                "What does {expr} simplify to?",
+                "Calculate {expr}. Answer: ",
+                "Evaluate {expr}. Answer: ",
+                "Compute the result of {expr}. Answer: ",
+                "What does {expr} simplify to? Answer: ",
             ],
             expr=expr,
         )
 
         return {
-            "text": f"{prompt} {val}",
+            "text": f"{prompt}{val}",
             "input": prompt,
             "target": str(val),
             "task": "chain",
@@ -795,17 +795,17 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "compare: {a} ? {b} ->",
-                "Which is larger, {a} or {b}?",
-                "Compare {a} to {b} (>, <, or =):",
-                "Between {a} and {b}, choose the relation:",
+                "Compare {a} and {b}. Answer: ",
+                "Which relation holds between {a} and {b} (>, <, or =)? Answer: ",
+                "Compare {a} to {b} (>, <, or =). Answer: ",
+                "Between {a} and {b}, choose the relation. Answer: ",
             ],
             a=a,
             b=b,
         )
 
         return {
-            "text": f"{prompt} {result}",
+            "text": f"{prompt}{result}",
             "input": prompt,
             "target": result,
             "task": "compare",
@@ -833,15 +833,15 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "succ({n}) =",
-                "What is the successor of {n}:",
-                "Next integer after {n} is",
-                "Increment {n} by one =>",
+                "succ({n}). Answer: ",
+                "What is the successor of {n}? Answer: ",
+                "Next integer after {n} is. Answer: ",
+                "Increment {n} by one. Answer: ",
             ],
             n=n,
         )
         return {
-            "text": f"{prompt} {n + 1}",
+            "text": f"{prompt}{n + 1}",
             "input": prompt,
             "target": str(n + 1),
             "task": "successor",
@@ -1436,30 +1436,45 @@ class LanguageDataset(IterableDataset):
         config_items = list(self.configs.items())
         rng.shuffle(config_items)
 
-        active_streams: List[Tuple[LanguageDataConfig, Iterator[Dict[str, str]]]] = []
+        def _build_streams() -> List[Tuple[LanguageDataConfig, Iterator[Dict[str, str]]]]:
+            streams: List[Tuple[LanguageDataConfig, Iterator[Dict[str, str]]]] = []
+            for _, config in config_items:
+                if config.max_samples is not None and num_workers > 1:
+                    base = config.max_samples // num_workers
+                    remainder = config.max_samples % num_workers
+                    worker_max_samples = base + (1 if worker_id < remainder else 0)
+                    if worker_max_samples == 0:
+                        continue
+                else:
+                    worker_max_samples = config.max_samples
 
-        for _, config in config_items:
-            if config.max_samples is not None and num_workers > 1:
-                base = config.max_samples // num_workers
-                remainder = config.max_samples % num_workers
-                worker_max_samples = base + (1 if worker_id < remainder else 0)
-                if worker_max_samples == 0:
-                    continue
-            else:
-                worker_max_samples = config.max_samples
+                stream = load_language_dataset(
+                    config,
+                    self.tokenizer,
+                    self.max_seq_len,
+                    log=(worker_id == 0),
+                    num_shards=num_workers,
+                    shard_index=worker_id,
+                    max_samples_override=worker_max_samples,
+                )
+                streams.append((config, iter(stream)))
+            return streams
 
-            stream = load_language_dataset(
-                config,
-                self.tokenizer,
-                self.max_seq_len,
-                log=(worker_id == 0),
-                num_shards=num_workers,
-                shard_index=worker_id,
-                max_samples_override=worker_max_samples,
-            )
-            active_streams.append((config, iter(stream)))
+        active_streams = _build_streams()
+        rebuild_count = 0
 
-        while active_streams:
+        while True:
+            if not active_streams:
+                rebuild_count += 1
+                print(
+                    "Warning: language streams exhausted; rebuilding streams "
+                    f"(count={rebuild_count})."
+                )
+                active_streams = _build_streams()
+                if not active_streams:
+                    print("Warning: language stream rebuild produced no streams; stopping.")
+                    return
+
             weights = [config.weight for config, _ in active_streams]
             total_weight = sum(weights)
             pick = rng.uniform(0, total_weight)
@@ -1655,9 +1670,13 @@ class OODLengthGenerator:
         """Addition with more digits than training."""
         a = random.randint(10**(n_digits-1), 10**n_digits - 1)
         b = random.randint(10**(n_digits-1), 10**n_digits - 1)
+        prompt = f"{a} + {b}. Answer: "
+        target = str(a + b)
         return {
-            "input": f"{a} + {b} =",
-            "answer": str(a + b),
+            "input": prompt,
+            "target": target,
+            "text": f"{prompt}{target}",
+            "answer": target,
             "length": n_digits,
             "task": "addition_ood",
         }
@@ -1667,9 +1686,13 @@ class OODLengthGenerator:
         """Parity with longer sequences than training."""
         bits = [random.randint(0, 1) for _ in range(length)]
         parity = sum(bits) % 2
+        prompt = f"parity({''.join(map(str, bits))}). Answer: "
+        target = str(parity)
         return {
-            "input": f"parity({''.join(map(str, bits))}) =",
-            "answer": str(parity),
+            "input": prompt,
+            "target": target,
+            "text": f"{prompt}{target}",
+            "answer": target,
             "length": length,
             "task": "parity_ood",
         }
@@ -1679,9 +1702,13 @@ class OODLengthGenerator:
         """Copy with longer sequences than training."""
         seq = [random.randint(0, 9) for _ in range(length)]
         seq_str = " ".join(map(str, seq))
+        prompt = f"Copy the sequence {seq_str}. Answer: "
+        target = seq_str
         return {
-            "input": f"copy: {seq_str} ->",
-            "answer": seq_str,
+            "input": prompt,
+            "target": target,
+            "text": f"{prompt}{target}",
+            "answer": target,
             "length": length,
             "task": "copy_ood",
         }
