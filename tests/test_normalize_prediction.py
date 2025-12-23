@@ -76,5 +76,5 @@ def test_task_type_consistency():
     assert "parity" in LABEL_TASKS
 
 
-# Summary: normalize_prediction now scans for first integer/label tokens, parity is classification,
-# and redundant unique_token_ratio metrics were removed to avoid confusion.
+# Summary: normalize_prediction honors Answer/separator precedence before falling back to the last
+# integer, parity is classification, and redundant unique_token_ratio metrics were removed.
