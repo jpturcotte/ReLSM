@@ -384,7 +384,8 @@ def load_model_and_tokenizer(
     tokenizer : PreTrainedTokenizer
         Tokenizer ready for generation with a defined pad token.
     """
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    torch.serialization.add_safe_globals([TransformerConfig])
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     if "config" not in checkpoint or "model_state_dict" not in checkpoint:
         raise ValueError(f"Invalid checkpoint format: {checkpoint_path}")
     config = checkpoint["config"]
