@@ -16,13 +16,16 @@ class TaskCurriculumState:
         tasks: Optional[Iterable[str]] = None,
         *,
         init_difficulty: float = 0.2,
+        min_difficulty: float = 0.0,
         ema_decay: float = 0.98,
         step_size: float = 0.05,
         min_task_evals: int = 5,
     ) -> None:
         self._manager = manager
         self._state = manager.dict() if manager is not None else {}
-        self.init_difficulty = init_difficulty
+        # Keep all difficulty values at or above the configured floor.
+        self.min_difficulty = min_difficulty
+        self.init_difficulty = max(init_difficulty, min_difficulty)
         self.ema_decay = ema_decay
         self.step_size = step_size
         self.min_task_evals = min_task_evals
@@ -93,7 +96,7 @@ class TaskCurriculumState:
         """Force a difficulty update and reset EMA to a safe passing value."""
         self._ensure_task(task)
         task_state = self._state[task]
-        task_state["difficulty"] = float(new_difficulty)
+        task_state["difficulty"] = float(max(new_difficulty, self.min_difficulty))
         task_state["ema_acc"] = 0.85
 
     def state_dict(self) -> Dict[str, Dict[str, float]]:
@@ -130,7 +133,7 @@ class TaskCurriculumState:
         else:
             return difficulty
 
-        difficulty = min(max(difficulty, 0.0), 1.0)
+        difficulty = min(max(difficulty, self.min_difficulty), 1.0)
         task_state["difficulty"] = difficulty
         task_state["last_update_step"] = int(step)
         return difficulty
@@ -168,7 +171,9 @@ class TaskCurriculumState:
         self._ensure_task(task)
         task_state = self._state[task]
         return {
-            "difficulty": float(task_state.get("difficulty", self.init_difficulty)),
+            "difficulty": float(
+                max(task_state.get("difficulty", self.init_difficulty), self.min_difficulty)
+            ),
             "ema_acc": float(task_state.get("ema_acc", 0.0)),
             "ema_loss": float(task_state.get("ema_loss", 0.0)),
             "best_ema_loss": float(task_state.get("best_ema_loss", math.inf)),

@@ -854,6 +854,7 @@ class AlgorithmicGenerator:
         tasks: Optional[List[str]] = None,
         rng: Optional[random.Random] = None,
         difficulty: Optional[float] = None,
+        min_difficulty: float = 0.0,
     ) -> List[Dict]:
         """Generate mixed batch of algorithmic tasks."""
         rng = rng or random
@@ -867,7 +868,11 @@ class AlgorithmicGenerator:
 
         return [
             cls.generate_example(
-                tasks=tasks, rng=rng, generators=generators, difficulty=difficulty
+                tasks=tasks,
+                rng=rng,
+                generators=generators,
+                difficulty=difficulty,
+                min_difficulty=min_difficulty,
             )
             for _ in range(n)
         ]
@@ -879,10 +884,12 @@ class AlgorithmicGenerator:
         rng: Optional[random.Random] = None,
         generators: Optional[Dict[str, Callable]] = None,
         difficulty: Optional[float] = None,
+        min_difficulty: float = 0.0,
         progress: Optional[float] = None,
         difficulty_schedule: str = "linear",
         task_weighting: str = "uniform",
     ) -> Dict:
+        """Generate a single example honoring the difficulty schedule."""
         rng = rng or random
         if difficulty is None:
             difficulty = 0.5
@@ -907,6 +914,7 @@ class AlgorithmicGenerator:
                 difficulty_value = 0.5
             else:
                 difficulty_value = difficulty
+        difficulty_value = min(max(difficulty_value, min_difficulty), 1.0)
 
         kwargs: Dict[str, int | Tuple[int, int]] = {}
         if "digit_range" in params:
@@ -963,6 +971,7 @@ class AlgorithmicDataset(IterableDataset):
         task_weighting: str = "uniform",
         total_tokens: Optional[int] = None,
         easy_mix_frac: float = 0.2,
+        min_difficulty: float = 0.0,
         include_lengths: bool = False,
     ):
         self.tokenizer = tokenizer
@@ -977,6 +986,8 @@ class AlgorithmicDataset(IterableDataset):
         self.difficulty_schedule = difficulty_schedule
         self.task_weighting = task_weighting
         self.easy_mix_frac = easy_mix_frac
+        # Enforce a minimum difficulty floor across schedules/samplers.
+        self.min_difficulty = min_difficulty
         self.include_lengths = include_lengths
         self.tokens_seen = 0
         self._token_budget = max(
@@ -1025,7 +1036,7 @@ class AlgorithmicDataset(IterableDataset):
             progress = min(self.tokens_seen / max(self._worker_token_budget, 1), 1.0)
             if self.difficulty_fn is not None:
                 task = self._sample_task(rng, progress, generators)
-                difficulty = self.difficulty_fn(task)
+                difficulty = max(self.difficulty_fn(task), self.min_difficulty)
                 effective_schedule = self.difficulty_schedule
                 if effective_schedule in {"phased", "fixed"}:
                     effective_schedule = "linear"
@@ -1034,6 +1045,7 @@ class AlgorithmicDataset(IterableDataset):
                     rng=rng,
                     generators=generators,
                     difficulty=difficulty,
+                    min_difficulty=self.min_difficulty,
                     progress=progress,
                     difficulty_schedule=effective_schedule,
                     task_weighting=self.task_weighting,
@@ -1045,6 +1057,7 @@ class AlgorithmicDataset(IterableDataset):
                     rng=rng,
                     generators=generators,
                     difficulty=difficulty,
+                    min_difficulty=self.min_difficulty,
                     progress=progress,
                     difficulty_schedule=self.difficulty_schedule,
                     task_weighting=self.task_weighting,
@@ -1109,35 +1122,42 @@ class AlgorithmicDataset(IterableDataset):
                     value = float(self.difficulty_value.value)
             except Exception:
                 value = 0.0
-            return min(max(value, 0.0), 1.0)
+            return min(max(value, self.min_difficulty), 1.0)
 
         if self.difficulty_schedule == "fixed":
-            return 0.5
+            return max(0.5, self.min_difficulty)
 
         if self.difficulty_schedule == "linear":
             upper = min(1.0, 0.5 + 0.5 * progress)
-            return rng.uniform(0.0, upper)
+            upper = max(upper, self.min_difficulty)
+            return rng.uniform(self.min_difficulty, upper)
 
         if self.difficulty_schedule == "phased":
-            return min(max(progress, 0.0), 1.0)
+            return min(max(progress, self.min_difficulty), 1.0)
 
         if self.difficulty_schedule == "smooth":
-            return sample_difficulty_smooth(
-                progress,
-                easy_mix_frac=self.easy_mix_frac,
-                rng=rng,
+            return max(
+                sample_difficulty_smooth(
+                    progress,
+                    easy_mix_frac=self.easy_mix_frac,
+                    rng=rng,
+                ),
+                self.min_difficulty,
             )
 
         if self.difficulty_schedule == "warmup_ramp":
-            return sample_difficulty_warmup_ramp(
-                progress,
-                warmup_frac=0.1,
-                hold_frac=0.2,
-                easy_mix_frac=self.easy_mix_frac,
-                rng=rng,
+            return max(
+                sample_difficulty_warmup_ramp(
+                    progress,
+                    warmup_frac=0.1,
+                    hold_frac=0.2,
+                    easy_mix_frac=self.easy_mix_frac,
+                    rng=rng,
+                ),
+                self.min_difficulty,
             )
 
-        return sample_difficulty_smooth(progress, rng=rng)
+        return max(sample_difficulty_smooth(progress, rng=rng), self.min_difficulty)
 
 
 class FixedAlgorithmicDataset(Dataset):
@@ -1154,6 +1174,7 @@ class FixedAlgorithmicDataset(Dataset):
         difficulty_schedule: str = "linear",
         task_weighting: str = "uniform",
         easy_mix_frac: float = 0.2,
+        min_difficulty: float = 0.0,
         include_lengths: bool = False,
     ):
         self.tokenizer = tokenizer
@@ -1161,7 +1182,8 @@ class FixedAlgorithmicDataset(Dataset):
         self.max_seq_len = max_seq_len
         self.tasks = tasks
         self.seed = seed
-        self.difficulty = difficulty
+        self.min_difficulty = min_difficulty
+        self.difficulty = max(difficulty, min_difficulty)
         self.difficulty_schedule = difficulty_schedule
         self.task_weighting = task_weighting
         self.easy_mix_frac = easy_mix_frac
@@ -1178,6 +1200,7 @@ class FixedAlgorithmicDataset(Dataset):
                 rng=rng,
                 generators=generators,
                 difficulty=self.difficulty,
+                min_difficulty=self.min_difficulty,
                 progress=1.0,
                 difficulty_schedule=self.difficulty_schedule,
                 task_weighting=self.task_weighting,
@@ -1241,6 +1264,7 @@ def create_algorithmic_dataset(
     task_weighting: str = "uniform",
     total_tokens: Optional[int] = None,
     easy_mix_frac: float = 0.2,
+    min_difficulty: float = 0.0,
 ) -> Union[AlgorithmicDataset, FixedAlgorithmicDataset]:
     """Factory that returns fixed or infinite dataset based on flag."""
 
@@ -1262,6 +1286,7 @@ def create_algorithmic_dataset(
             difficulty_schedule=difficulty_schedule,
             task_weighting=task_weighting,
             easy_mix_frac=easy_mix_frac,
+            min_difficulty=min_difficulty,
         )
 
     return AlgorithmicDataset(
@@ -1278,6 +1303,7 @@ def create_algorithmic_dataset(
         task_weighting=task_weighting,
         total_tokens=total_tokens,
         easy_mix_frac=easy_mix_frac,
+        min_difficulty=min_difficulty,
     )
 
 
