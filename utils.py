@@ -59,6 +59,8 @@ def select_device(device: Optional[Union[str, int]] = None) -> torch.device:
 SPACE_PATTERN = re.compile(r"\s+")
 _INT_RE = re.compile(r"^-?(?:\d+\.?\d*|\d*\.?\d+)(?:[eE][+-]?\d+)?$")
 _INTEGER_RE = re.compile(r"^[+-]?\d+$")
+PROMPT_FORMAT_KEYS = ("colon", "answer", "arrow", "fatarrow", "equals")
+LABEL_TASKS = {"dyck", "parity", "compare"}
 
 
 def safe_parse_number(
@@ -90,8 +92,9 @@ def parse_numeric_prediction(text: str) -> Tuple[float, Optional[str]]:
     cleaned = text.strip()
     if not cleaned:
         return float("nan"), "empty_output"
-
-    candidate = cleaned.split()[0]
+    candidate = extract_integer_token(cleaned, prefer_separator=True)
+    if candidate is None:
+        return float("nan"), "contains_non_digit"
     if candidate in {"+", "-"}:
         return float("nan"), "wrong_sign_or_format"
     if not _INTEGER_RE.match(candidate):
@@ -100,6 +103,85 @@ def parse_numeric_prediction(text: str) -> Tuple[float, Optional[str]]:
         return float(int(candidate)), None
     except ValueError:
         return float("nan"), "wrong_sign_or_format"
+
+
+def extract_integer_token(text: str, *, prefer_separator: bool = True) -> Optional[str]:
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+
+    if prefer_separator:
+        answer_matches = list(re.finditer(r"answer:", cleaned, flags=re.IGNORECASE))
+        if answer_matches:
+            cleaned = cleaned[answer_matches[-1].end() :]
+        else:
+            separator_positions = []
+            for sep in ("=>", "->", "="):
+                idx = cleaned.rfind(sep)
+                if idx >= 0:
+                    separator_positions.append((idx, sep))
+            if separator_positions:
+                idx, sep = max(separator_positions, key=lambda item: item[0])
+                cleaned = cleaned[idx + len(sep) :]
+
+    matches = list(re.finditer(r"[+-]?\d+", cleaned))
+    if not matches:
+        return None
+    return matches[-1].group(0)
+
+
+def extract_numeric_answer(task: str, text: str) -> Optional[str]:
+    """Extract numeric answers using task-aware precedence rules."""
+    numeric_tasks = {"mod_add", "addition", "multiplication", "chain", "successor"}
+    if task not in numeric_tasks:
+        return None
+    return extract_integer_token(text, prefer_separator=True)
+
+
+def digit_length_from_token(token: Optional[str]) -> Optional[int]:
+    if token is None:
+        return None
+    return len(token.lstrip("+-"))
+
+
+def get_prompt_format_flags(prompt: str) -> Dict[str, bool]:
+    stripped = prompt.rstrip()
+    has_fatarrow = "=>" in prompt
+    return {
+        "colon": stripped.endswith(":"),
+        "answer": "Answer:" in prompt,
+        "arrow": "->" in prompt,
+        "fatarrow": has_fatarrow,
+        "equals": "=" in prompt and not has_fatarrow,
+    }
+
+
+def normalize_label_prediction(task: str, text: str) -> Optional[str]:
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+
+    if task == "compare":
+        for token in cleaned.split():
+            stripped = token.strip().strip(".,!?\"'`()[]{}")
+            if stripped in {">", "<", "="}:
+                return stripped
+        return None
+
+    if task == "dyck":
+        for token in re.findall(r"[A-Za-z]+", cleaned):
+            lowered = token.lower()
+            if lowered == "yes":
+                return "yes"
+            if lowered == "no":
+                return "no"
+        return None
+
+    if task == "parity":
+        match = re.search(r"\b[01]\b", cleaned)
+        return match.group(0) if match else None
+
+    return None
 
 
 def compute_repetition_metrics(token_ids: Sequence[int]) -> Dict[str, float]:
@@ -680,6 +762,13 @@ class EvalResult:
     parse_failure_counts: Dict[str, int]
     numeric_abs_errors: List[float]
     numeric_rel_errors: List[float]
+    empty_predictions: int
+    first_token_is_eos_count: int
+    invalid_label_count: int
+    label_confusion_counts: Dict[str, int]
+    format_stats: Dict[str, Dict[str, int]]
+    numeric_length_mismatch_count: int
+    numeric_length_total: int
 
 
 def _base_normalize(text: str) -> str:
@@ -695,19 +784,14 @@ def normalize_prediction(task: str, text: str) -> str:
 
     text = _base_normalize(text)
 
-    if task == "dyck":
-        lowered = text.lower()
-        if lowered.startswith("yes"):
-            return "yes"
-        if lowered.startswith("no"):
-            return "no"
-        return lowered
+    if task in LABEL_TASKS:
+        label = normalize_label_prediction(task, text)
+        return label if label is not None else ""
 
-    numeric_tasks = {"mod_add", "parity", "addition", "multiplication", "chain", "successor"}
+    numeric_tasks = {"mod_add", "addition", "multiplication", "chain", "successor"}
     if task in numeric_tasks:
-        matches = re.findall(r"[+-]?(?:\d+\.?\d*|\d*\.?\d+)(?:[eE][+-]?\d+)?", text)
-        if matches:
-            return matches[-1]
+        token = extract_numeric_answer(task, text)
+        return token if token is not None else ""
 
     return text
 
@@ -745,25 +829,20 @@ def compute_metrics(task: str, pred: str, target: str, tokenizer: Any) -> Dict[s
         "normalized_distance": normalized_distance,
         "prefix_accuracy": prefix_accuracy,
     }
-    pred = _metrics_normalize(task, pred)
-    target = _metrics_normalize(task, target)
-
-    exact_match = float(pred == target)
-
-    if _is_numeric_task(task):
-        return _numeric_metrics(pred, target, exact_match)
-    if _is_classification_task(task):
-        return _classification_metrics(pred, target, exact_match)
-    return _sequence_metrics(pred, target, exact_match)
 
 
 def _metrics_normalize(task: str, text: str) -> str:
-    text = text.split("\n")[0].strip().lower()
+    text = text.split("\n")[0].strip()
     text = SPACE_PATTERN.sub(" ", text)
 
-    if task in {"dyck", "parity", "compare"}:
-        text = text.split()[0] if text else ""
-        text = text.strip(".,!?\"'-")
+    if task in LABEL_TASKS:
+        label = normalize_label_prediction(task, text)
+        return label if label is not None else ""
+
+    text = text.lower()
+    if task in {"mod_add", "addition", "multiplication", "chain", "successor"}:
+        token = extract_numeric_answer(task, text)
+        return token if token is not None else ""
 
     return text
 
@@ -773,7 +852,7 @@ def _is_numeric_task(task: str) -> bool:
 
 
 def _is_classification_task(task: str) -> bool:
-    return task in {"parity", "dyck", "compare"}
+    return task in LABEL_TASKS
 
 
 def _encode_for_metrics(tokenizer: Any, text: str) -> List[int]:
@@ -1076,6 +1155,16 @@ def evaluate_condition(
     parse_failure_counts: Dict[str, int] = {}
     numeric_abs_errors: List[float] = []
     numeric_rel_errors: List[float] = []
+    empty_prediction_count = 0
+    first_token_is_eos_count = 0
+    invalid_label_count = 0
+    label_confusion_counts: Dict[str, int] = {}
+    format_stats = {
+        key: {"count": 0, "correct": 0, "empty": 0, "eos_first": 0}
+        for key in PROMPT_FORMAT_KEYS
+    }
+    numeric_length_mismatch_count = 0
+    numeric_length_total = 0
     sample_seen = 0
     sample_target = max(sample_count, 0)
     sample_rng = random.Random(seed + 17)
@@ -1111,6 +1200,8 @@ def evaluate_condition(
             target_len_tokens = _token_length(tokenizer, norm_tgt)
             pred_tokens = pred_token_ids[idx]
             pred_len_tokens = len(pred_tokens)
+            raw_pred = raw_preds[idx]
+            empty_prediction = raw_pred.strip() == ""
             length_ratio = pred_len_tokens / max(target_len_tokens, 1)
             abs_len_error = abs(pred_len_tokens - target_len_tokens)
             repeat_metrics = compute_repetition_metrics(pred_tokens)
@@ -1121,6 +1212,28 @@ def evaluate_condition(
                 stop_reason = "other"
             stop_reason_counts[stop_reason] += 1
             eos_emitted_count += 1 if eos_hit else 0
+            empty_prediction_count += 1 if empty_prediction else 0
+            first_token_is_eos_count += 1 if first_is_eos else 0
+
+            prompt_flags = get_prompt_format_flags(ex["input"])
+            for key, enabled in prompt_flags.items():
+                if not enabled:
+                    continue
+                format_stats[key]["count"] += 1
+                format_stats[key]["correct"] += 1 if metrics["exact_match"] == 1.0 else 0
+                format_stats[key]["empty"] += 1 if empty_prediction else 0
+                format_stats[key]["eos_first"] += 1 if first_is_eos else 0
+
+            valid_label = None
+            if _is_classification_task(task):
+                pred_label = normalize_label_prediction(task, raw_pred)
+                target_label = normalize_label_prediction(task, norm_tgt)
+                valid_label = pred_label is not None
+                if not valid_label:
+                    invalid_label_count += 1
+                elif target_label is not None:
+                    key = f"pred_{pred_label}_when_{target_label}"
+                    label_confusion_counts[key] = label_confusion_counts.get(key, 0) + 1
 
             if metrics["exact_match"] == 1.0:
                 total_correct += 1
@@ -1145,6 +1258,8 @@ def evaluate_condition(
             max_run_length_list.append(repeat_metrics["max_run_length"])
 
             parse_ok = None
+            digit_length_pred = None
+            digit_length_target = None
             if _is_numeric_task(task):
                 parsed_pred, failure_reason = parse_numeric_prediction(raw_preds[idx])
                 parsed_tgt, tgt_failure = parse_numeric_prediction(norm_tgt)
@@ -1165,6 +1280,15 @@ def evaluate_condition(
                 else:
                     total_parse_failures += 1
 
+                pred_token = extract_integer_token(raw_preds[idx])
+                tgt_token = extract_integer_token(norm_tgt)
+                digit_length_pred = digit_length_from_token(pred_token)
+                digit_length_target = digit_length_from_token(tgt_token)
+                if digit_length_pred is not None and digit_length_target is not None:
+                    numeric_length_total += 1
+                    if digit_length_pred != digit_length_target:
+                        numeric_length_mismatch_count += 1
+
             if sample_target:
                 sample_item = {
                     "prompt": ex["input"],
@@ -1175,6 +1299,10 @@ def evaluate_condition(
                     "pred_len_tokens": pred_len_tokens,
                     "stop_reason": stop_reason,
                     "first_token_is_eos": first_is_eos,
+                    "empty_prediction": empty_prediction,
+                    "valid_label": valid_label,
+                    "digit_length_target": digit_length_target,
+                    "digit_length_pred": digit_length_pred,
                     "parse_ok": parse_ok,
                     "repeat_1gram_rate": repeat_metrics["repeat_1gram_rate"],
                     "difficulty": difficulty,
@@ -1227,6 +1355,13 @@ def evaluate_condition(
         parse_failure_counts=parse_failure_counts,
         numeric_abs_errors=numeric_abs_errors,
         numeric_rel_errors=numeric_rel_errors,
+        empty_predictions=empty_prediction_count,
+        first_token_is_eos_count=first_token_is_eos_count,
+        invalid_label_count=invalid_label_count,
+        label_confusion_counts=label_confusion_counts,
+        format_stats=format_stats,
+        numeric_length_mismatch_count=numeric_length_mismatch_count,
+        numeric_length_total=numeric_length_total,
     )
 
 
