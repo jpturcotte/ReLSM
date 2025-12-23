@@ -1291,6 +1291,10 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log_print = print if args.extended_logging else (lambda *args, **kwargs: None)
 
+    def clamp_difficulty(value: float) -> float:
+        """Clamp difficulty to the configured minimum and valid range."""
+        return min(max(value, args.min_difficulty), 1.0)
+
     def format_metric_value(value: Any) -> str:
         if isinstance(value, (float, int)):
             if math.isnan(value):
@@ -1435,6 +1439,7 @@ def train(args):
         task_curriculum = TaskCurriculumState(
             manager,
             tasks=curriculum_tasks,
+            min_difficulty=args.min_difficulty,
             ema_decay=ema_decay,
             min_task_evals=args.curriculum_min_task_evals,
         )
@@ -1459,7 +1464,7 @@ def train(args):
             return difficulty
 
         def eval_difficulty_fn(task: str) -> float:
-            return difficulty_snapshot.get(task, 0.2)
+            return max(difficulty_snapshot.get(task, 0.2), args.min_difficulty)
 
         min_task_prob = 0.05
 
@@ -1488,6 +1493,7 @@ def train(args):
             difficulty_schedule=args.difficulty_schedule,
             task_weighting=args.task_weighting,
             easy_mix_frac=args.easy_mix_frac,
+            min_difficulty=args.min_difficulty,
             include_lengths=True,
         )
         alg_loader = DataLoader(
@@ -1512,6 +1518,7 @@ def train(args):
             task_weighting=args.task_weighting,
             total_tokens=args.alg_tokens,
             easy_mix_frac=args.easy_mix_frac,
+            min_difficulty=args.min_difficulty,
             include_lengths=True,
         )
         alg_loader = DataLoader(
@@ -1565,6 +1572,7 @@ def train(args):
                 difficulty_schedule=args.difficulty_schedule,
                 task_weighting=args.task_weighting,
                 easy_mix_frac=args.easy_mix_frac,
+                min_difficulty=args.min_difficulty,
                 include_lengths=True,
             )
             if args.train_eval_samples is not None:
@@ -1583,6 +1591,7 @@ def train(args):
                 task_weighting=args.task_weighting,
                 total_tokens=args.alg_tokens,
                 easy_mix_frac=args.easy_mix_frac,
+                min_difficulty=args.min_difficulty,
                 include_lengths=True,
             )
 
@@ -1607,6 +1616,7 @@ def train(args):
         difficulty_schedule=args.difficulty_schedule,
         task_weighting=args.task_weighting,
         easy_mix_frac=args.easy_mix_frac,
+        min_difficulty=args.min_difficulty,
         include_lengths=True,
     )
     probe_loader = DataLoader(
@@ -1699,6 +1709,7 @@ def train(args):
             return None
         return {
             "init_difficulty": float(task_curriculum.init_difficulty),
+            "min_difficulty": float(task_curriculum.min_difficulty),
             "ema_decay": float(task_curriculum.ema_decay),
             "step_size": float(task_curriculum.step_size),
             "min_task_evals": float(task_curriculum.min_task_evals),
@@ -1712,6 +1723,7 @@ def train(args):
             "persistent_alg_frac": float(args.persistent_alg_frac),
             "lexical_frac_phase1": float(args.lexical_frac_phase1),
             "difficulty_schedule": str(args.difficulty_schedule),
+            "min_difficulty": float(args.min_difficulty),
             "use_task_curriculum": bool(args.use_task_curriculum),
             "curriculum_cooldown": int(args.curriculum_cooldown),
             "curriculum_jitter": float(args.curriculum_jitter),
@@ -1759,6 +1771,8 @@ def train(args):
             return
         if "init_difficulty" in config_payload:
             task_curriculum.init_difficulty = float(config_payload["init_difficulty"])
+        if "min_difficulty" in config_payload:
+            task_curriculum.min_difficulty = float(config_payload["min_difficulty"])
         if "ema_decay" in config_payload:
             task_curriculum.ema_decay = float(config_payload["ema_decay"])
         if "step_size" in config_payload:
@@ -1767,6 +1781,9 @@ def train(args):
             task_curriculum.min_task_evals = int(config_payload["min_task_evals"])
         elif "warmup_evals" in config_payload:
             task_curriculum.min_task_evals = int(config_payload["warmup_evals"])
+        task_curriculum.init_difficulty = max(
+            task_curriculum.init_difficulty, task_curriculum.min_difficulty
+        )
 
     def load_checkpoint_state(checkpoint_path: str) -> Tuple[int, int, float]:
         checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -1859,24 +1876,29 @@ def train(args):
     def _current_difficulty() -> float:
         if task_curriculum is not None:
             active = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
-            return task_curriculum.get_mean_difficulty(active)
+            return clamp_difficulty(task_curriculum.get_mean_difficulty(active))
         if difficulty_value is not None:
-            return float(difficulty_value.value)
-        return difficulty_schedule(
-            curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
+            return clamp_difficulty(float(difficulty_value.value))
+        return clamp_difficulty(
+            difficulty_schedule(
+                curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
+            )
         )
 
     def _difficulty_by_task() -> Dict[str, float]:
         active = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
         if task_curriculum is not None:
             return {
-                task: task_curriculum.get_task_state(task)["difficulty"] for task in active
+                task: clamp_difficulty(task_curriculum.get_task_state(task)["difficulty"])
+                for task in active
             }
         if difficulty_value is not None:
-            difficulty = float(difficulty_value.value)
+            difficulty = clamp_difficulty(float(difficulty_value.value))
         else:
-            difficulty = difficulty_schedule(
-                curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
+            difficulty = clamp_difficulty(
+                difficulty_schedule(
+                    curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
+                )
             )
         return {task: difficulty for task in active}
 
@@ -1892,11 +1914,15 @@ def train(args):
         while curriculum.tokens_seen < args.total_tokens:
             if difficulty_value is not None:
                 if curriculum.tokens_seen < args.alg_tokens:
-                    difficulty_value.value = difficulty_schedule(
-                        curriculum.tokens_seen, args.alg_tokens, args.difficulty_schedule
+                    difficulty_value.value = clamp_difficulty(
+                        difficulty_schedule(
+                            curriculum.tokens_seen,
+                            args.alg_tokens,
+                            args.difficulty_schedule,
+                        )
                     )
                 else:
-                    difficulty_value.value = 1.0
+                    difficulty_value.value = clamp_difficulty(1.0)
             batch = curriculum.next_batch()
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
@@ -2688,6 +2714,12 @@ def main():
         type=float,
         default=0.2,
         help="Fraction of training samples that should always be easy (0.0-0.3 difficulty)",
+    )
+    parser.add_argument(
+        "--min_difficulty",
+        type=float,
+        default=0.0,
+        help="Minimum difficulty floor applied to schedules and per-task curricula",
     )
     parser.add_argument(
         "--task_weighting",
