@@ -43,7 +43,7 @@ def test_normalize_prediction_extracts_numeric_token():
 
 def test_normalize_prediction_uses_last_number():
     assert normalize_prediction("addition", "3+4=7") == "7"
-    assert normalize_prediction("addition", "I think 3 + 4 = 7") == "3"
+    assert normalize_prediction("addition", "I think 3 + 4 = 7") == "7"
 
 
 def test_normalize_prediction_and_target_share_base_normalization():

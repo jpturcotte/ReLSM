@@ -109,23 +109,24 @@ def extract_integer_token(text: str) -> Optional[str]:
     cleaned = text.strip()
     if not cleaned:
         return None
-    tokens = cleaned.split()
-    for raw_token in tokens:
-        token = raw_token.strip().strip(".,!?\"'`()[]{}")
-        lowered = token.lower()
-        if lowered.startswith("answer"):
-            token = token[len("answer") :].lstrip(":")
-        if lowered.startswith("output"):
-            token = token[len("output") :].lstrip(":")
-        if token in {":", "=", "=>", "->"}:
-            continue
-        for sep in ("=>", "->", "=", ":"):
-            if sep in token:
-                token = token.split(sep)[-1].strip()
-        if _INTEGER_RE.match(token):
-            return token
-    match = re.search(r"[+-]?\d+", cleaned)
-    return match.group(0) if match else None
+
+    answer_matches = list(re.finditer(r"answer:", cleaned, flags=re.IGNORECASE))
+    if answer_matches:
+        cleaned = cleaned[answer_matches[-1].end() :]
+    else:
+        separator_positions = []
+        for sep in ("=>", "->", "="):
+            idx = cleaned.rfind(sep)
+            if idx >= 0:
+                separator_positions.append((idx, sep))
+        if separator_positions:
+            idx, sep = max(separator_positions, key=lambda item: item[0])
+            cleaned = cleaned[idx + len(sep) :]
+
+    matches = list(re.finditer(r"[+-]?\d+", cleaned))
+    if not matches:
+        return None
+    return matches[-1].group(0)
 
 
 def digit_length_from_token(token: Optional[str]) -> Optional[int]:
