@@ -829,16 +829,6 @@ def compute_metrics(task: str, pred: str, target: str, tokenizer: Any) -> Dict[s
         "normalized_distance": normalized_distance,
         "prefix_accuracy": prefix_accuracy,
     }
-    pred = _metrics_normalize(task, pred)
-    target = _metrics_normalize(task, target)
-
-    exact_match = float(pred == target)
-
-    if _is_numeric_task(task):
-        return _numeric_metrics(pred, target, exact_match)
-    if _is_classification_task(task):
-        return _classification_metrics(pred, target, exact_match)
-    return _sequence_metrics(pred, target, exact_match)
 
 
 def _metrics_normalize(task: str, text: str) -> str:
