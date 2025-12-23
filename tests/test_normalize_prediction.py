@@ -38,6 +38,7 @@ def test_normalize_prediction_extracts_numeric_token():
     assert normalize_prediction("addition", "7.") == "7"
     assert normalize_prediction("addition", "  7  ") == "7"
     assert normalize_prediction("addition", "The answer is 7") == "7"
+    assert normalize_prediction("addition", "Answer: 3 and 4 = 7") == "7"
     assert normalize_prediction("chain", "Result: -3 apples") == "-3"
 
 

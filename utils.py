@@ -92,7 +92,7 @@ def parse_numeric_prediction(text: str) -> Tuple[float, Optional[str]]:
     cleaned = text.strip()
     if not cleaned:
         return float("nan"), "empty_output"
-    candidate = extract_integer_token(cleaned)
+    candidate = extract_integer_token(cleaned, prefer_separator=True)
     if candidate is None:
         return float("nan"), "contains_non_digit"
     if candidate in {"+", "-"}:
@@ -105,28 +105,37 @@ def parse_numeric_prediction(text: str) -> Tuple[float, Optional[str]]:
         return float("nan"), "wrong_sign_or_format"
 
 
-def extract_integer_token(text: str) -> Optional[str]:
+def extract_integer_token(text: str, *, prefer_separator: bool = True) -> Optional[str]:
     cleaned = text.strip()
     if not cleaned:
         return None
 
-    answer_matches = list(re.finditer(r"answer:", cleaned, flags=re.IGNORECASE))
-    if answer_matches:
-        cleaned = cleaned[answer_matches[-1].end() :]
-    else:
-        separator_positions = []
-        for sep in ("=>", "->", "="):
-            idx = cleaned.rfind(sep)
-            if idx >= 0:
-                separator_positions.append((idx, sep))
-        if separator_positions:
-            idx, sep = max(separator_positions, key=lambda item: item[0])
-            cleaned = cleaned[idx + len(sep) :]
+    if prefer_separator:
+        answer_matches = list(re.finditer(r"answer:", cleaned, flags=re.IGNORECASE))
+        if answer_matches:
+            cleaned = cleaned[answer_matches[-1].end() :]
+        else:
+            separator_positions = []
+            for sep in ("=>", "->", "="):
+                idx = cleaned.rfind(sep)
+                if idx >= 0:
+                    separator_positions.append((idx, sep))
+            if separator_positions:
+                idx, sep = max(separator_positions, key=lambda item: item[0])
+                cleaned = cleaned[idx + len(sep) :]
 
     matches = list(re.finditer(r"[+-]?\d+", cleaned))
     if not matches:
         return None
     return matches[-1].group(0)
+
+
+def extract_numeric_answer(task: str, text: str) -> Optional[str]:
+    """Extract numeric answers using task-aware precedence rules."""
+    numeric_tasks = {"mod_add", "addition", "multiplication", "chain", "successor"}
+    if task not in numeric_tasks:
+        return None
+    return extract_integer_token(text, prefer_separator=True)
 
 
 def digit_length_from_token(token: Optional[str]) -> Optional[int]:
@@ -780,7 +789,7 @@ def normalize_prediction(task: str, text: str) -> str:
 
     numeric_tasks = {"mod_add", "addition", "multiplication", "chain", "successor"}
     if task in numeric_tasks:
-        token = extract_integer_token(text)
+        token = extract_numeric_answer(task, text)
         return token if token is not None else ""
 
     return text
@@ -841,7 +850,7 @@ def _metrics_normalize(task: str, text: str) -> str:
 
     text = text.lower()
     if task in {"mod_add", "addition", "multiplication", "chain", "successor"}:
-        token = extract_integer_token(text)
+        token = extract_numeric_answer(task, text)
         return token if token is not None else ""
 
     return text
