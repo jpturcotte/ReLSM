@@ -146,12 +146,13 @@ def digit_length_from_token(token: Optional[str]) -> Optional[int]:
 
 def get_prompt_format_flags(prompt: str) -> Dict[str, bool]:
     stripped = prompt.rstrip()
+    has_fatarrow = "=>" in prompt
     return {
         "colon": stripped.endswith(":"),
         "answer": "Answer:" in prompt,
         "arrow": "->" in prompt,
-        "fatarrow": "=>" in prompt,
-        "equals": "=" in prompt,
+        "fatarrow": has_fatarrow,
+        "equals": "=" in prompt and not has_fatarrow,
     }
 
 
