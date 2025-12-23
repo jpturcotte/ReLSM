@@ -52,12 +52,17 @@ from utils import (
     compute_attention_probs,
     compute_weight_entropy,
     compute_metrics,
+    digit_length_from_token,
     extract_prediction_from_generate,
+    extract_integer_token,
     get_transformer_blocks,
+    get_prompt_format_flags,
     module_grad_weight_norm,
     normalize_prediction,
+    normalize_label_prediction,
     normalize_target,
     parse_numeric_prediction,
+    PROMPT_FORMAT_KEYS,
     resolve_diagnostic_modules,
     safe_parse_number,
 )
@@ -575,9 +580,13 @@ def run_eval_diagnostics(
     return metrics
 
 
-NUMERIC_TASKS = {"mod_add", "addition", "multiplication", "chain", "successor", "parity"}
+NUMERIC_TASKS = {"mod_add", "addition", "multiplication", "chain", "successor"}
 MAE_TASKS = {"mod_add", "addition", "multiplication", "chain", "successor"}
 SEQUENCE_TASKS = {"copy", "reverse"}
+CLASSIFICATION_TASKS = {"compare", "dyck", "parity"}
+NUMERIC_OUTPUT_TASKS = {"mod_add", "addition", "multiplication", "chain", "successor"}
+assert NUMERIC_TASKS.isdisjoint(CLASSIFICATION_TASKS)
+assert MAE_TASKS.issubset(NUMERIC_TASKS)
 
 
 def _normalize_text(text: str) -> str:
@@ -647,6 +656,8 @@ def _flatten_eval_diagnostics(prefix: str, diagnostics: Dict[str, Any]) -> Dict[
             "pred_len_tokens": "pred_len",
             "length_ratio": "length_ratio",
             "abs_len_error": "len_error",
+            "pred_len_tokens_p50": "pred_len_p50",
+            "pred_len_tokens_p90": "pred_len_p90",
         }.get(key, key)
         flat[f"{prefix}.{metric}.mean"] = float(value)
     for task, payload in answer_len.get("by_task", {}).items():
@@ -656,11 +667,24 @@ def _flatten_eval_diagnostics(prefix: str, diagnostics: Dict[str, Any]) -> Dict[
                 "pred_len_tokens": "pred_len",
                 "length_ratio": "length_ratio",
                 "abs_len_error": "len_error",
+                "pred_len_tokens_p50": "pred_len_p50",
+                "pred_len_tokens_p90": "pred_len_p90",
             }.get(key, key)
             flat[f"{prefix}.{metric}.by_task.{task}"] = float(value)
     flat[f"{prefix}.eos_emitted_rate"] = float(answer_len.get("eos_emitted_rate", 0.0))
+    flat[f"{prefix}.eos_first_rate"] = float(answer_len.get("eos_first_rate", 0.0))
+    flat[f"{prefix}.empty_rate"] = float(answer_len.get("empty_rate", 0.0))
+    flat[f"{prefix}.max_new_tokens_rate"] = float(
+        answer_len.get("max_new_tokens_rate", 0.0)
+    )
     for task, rate in answer_len.get("eos_emitted_rate_by_task", {}).items():
         flat[f"{prefix}.eos_emitted_rate.by_task.{task}"] = float(rate)
+    for task, rate in answer_len.get("eos_first_rate_by_task", {}).items():
+        flat[f"{prefix}.eos_first_rate.by_task.{task}"] = float(rate)
+    for task, rate in answer_len.get("empty_rate_by_task", {}).items():
+        flat[f"{prefix}.empty_rate.by_task.{task}"] = float(rate)
+    for task, rate in answer_len.get("max_new_tokens_rate_by_task", {}).items():
+        flat[f"{prefix}.max_new_tokens_rate.by_task.{task}"] = float(rate)
     for reason, count in answer_len.get("stop_reason_counts", {}).items():
         flat[f"{prefix}.stop_reason.{reason}"] = float(count)
     for task, reasons in answer_len.get("stop_reason_counts_by_task", {}).items():
@@ -681,7 +705,16 @@ def _flatten_eval_diagnostics(prefix: str, diagnostics: Dict[str, Any]) -> Dict[
     flat[f"{prefix}.parse_success_rate"] = float(parse.get("parse_success_rate", 0.0))
     flat[f"{prefix}.non_numeric_rate"] = float(parse.get("non_numeric_rate", 0.0))
     flat[f"{prefix}.numeric_abs_error.mean"] = float(parse.get("numeric_abs_error", 0.0))
+    flat[f"{prefix}.numeric_abs_error.median"] = float(
+        parse.get("numeric_abs_error_median", 0.0)
+    )
     flat[f"{prefix}.numeric_rel_error.mean"] = float(parse.get("numeric_rel_error", 0.0))
+    flat[f"{prefix}.numeric_parse_fail_rate"] = float(
+        parse.get("numeric_parse_fail_rate", 0.0)
+    )
+    flat[f"{prefix}.numeric_length_mismatch_rate"] = float(
+        parse.get("length_mismatch_rate", 0.0)
+    )
     for task, payload in parse.get("by_task", {}).items():
         flat[f"{prefix}.parse_success_rate.by_task.{task}"] = float(
             payload.get("parse_success_rate", 0.0)
@@ -692,14 +725,67 @@ def _flatten_eval_diagnostics(prefix: str, diagnostics: Dict[str, Any]) -> Dict[
         flat[f"{prefix}.numeric_abs_error.by_task.{task}"] = float(
             payload.get("numeric_abs_error", 0.0)
         )
+        flat[f"{prefix}.numeric_abs_error.median.by_task.{task}"] = float(
+            payload.get("numeric_abs_error_median", 0.0)
+        )
         flat[f"{prefix}.numeric_rel_error.by_task.{task}"] = float(
             payload.get("numeric_rel_error", 0.0)
+        )
+        flat[f"{prefix}.numeric_parse_fail_rate.by_task.{task}"] = float(
+            payload.get("numeric_parse_fail_rate", 0.0)
+        )
+        flat[f"{prefix}.numeric_length_mismatch_rate.by_task.{task}"] = float(
+            payload.get("length_mismatch_rate", 0.0)
         )
     for reason, count in parse.get("failure_counts", {}).items():
         flat[f"{prefix}.parse_failure.{reason}"] = float(count)
     for task, reasons in parse.get("failure_counts_by_task", {}).items():
         for reason, count in reasons.items():
             flat[f"{prefix}.parse_failure.by_task.{task}.{reason}"] = float(count)
+
+    labels = diagnostics.get("labels", {})
+    flat[f"{prefix}.invalid_label_rate"] = float(labels.get("invalid_label_rate", 0.0))
+    for task, rate in labels.get("invalid_label_rate_by_task", {}).items():
+        flat[f"{prefix}.invalid_label_rate.by_task.{task}"] = float(rate)
+    for key, count in labels.get("confusion_counts", {}).items():
+        flat[f"{prefix}.label_confusion.{key}"] = float(count)
+    for task, counts in labels.get("confusion_counts_by_task", {}).items():
+        for key, count in counts.items():
+            flat[f"{prefix}.label_confusion.by_task.{task}.{key}"] = float(count)
+
+    prompt_format = diagnostics.get("prompt_format", {})
+    for key, payload in prompt_format.get("overall", {}).items():
+        flat[f"{prefix}.prompt_format.{key}.count"] = float(payload.get("count", 0.0))
+        flat[f"{prefix}.prompt_format.{key}.accuracy"] = float(
+            payload.get("accuracy", 0.0)
+        )
+        flat[f"{prefix}.prompt_format.{key}.empty_rate"] = float(
+            payload.get("empty_rate", 0.0)
+        )
+        flat[f"{prefix}.prompt_format.{key}.eos_first_rate"] = float(
+            payload.get("eos_first_rate", 0.0)
+        )
+    for task, stats in prompt_format.get("by_task", {}).items():
+        for key, payload in stats.items():
+            flat[f"{prefix}.prompt_format.by_task.{task}.{key}.count"] = float(
+                payload.get("count", 0.0)
+            )
+            flat[f"{prefix}.prompt_format.by_task.{task}.{key}.accuracy"] = float(
+                payload.get("accuracy", 0.0)
+            )
+            flat[f"{prefix}.prompt_format.by_task.{task}.{key}.empty_rate"] = float(
+                payload.get("empty_rate", 0.0)
+            )
+            flat[f"{prefix}.prompt_format.by_task.{task}.{key}.eos_first_rate"] = float(
+                payload.get("eos_first_rate", 0.0)
+            )
+
+    soft_hard_gap = diagnostics.get("soft_hard_gap", {})
+    for metric in ("token", "prefix"):
+        gap = soft_hard_gap.get(metric, {})
+        flat[f"{prefix}.soft_hard_gap.{metric}.overall"] = float(gap.get("overall", 0.0))
+        for task, value in gap.get("by_task", {}).items():
+            flat[f"{prefix}.soft_hard_gap.{metric}.by_task.{task}"] = float(value)
 
     for task, count in diagnostics.get("task_counts", {}).items():
         flat[f"{prefix}.task_count.{task}"] = float(count)
@@ -809,7 +895,9 @@ def _predict_with_tokens(
         tokenizer,
     )
     pred_norm = (
-        normalize_prediction(task, pred_raw) if task in NUMERIC_TASKS else _normalize_text(pred_raw)
+        normalize_prediction(task, pred_raw)
+        if task in NUMERIC_TASKS or task in CLASSIFICATION_TASKS
+        else _normalize_text(pred_raw)
     )
     return {
         "pred_norm": pred_norm,
@@ -888,6 +976,28 @@ def evaluate_task_accuracy(
     numeric_abs_errors_by_task: Dict[str, List[float]] = defaultdict(list)
     numeric_rel_errors_by_task: Dict[str, List[float]] = defaultdict(list)
     task_difficulty_sum: Dict[str, float] = defaultdict(float)
+    empty_prediction_count = 0
+    first_token_is_eos_count = 0
+    empty_predictions_by_task: Dict[str, int] = defaultdict(int)
+    first_token_is_eos_by_task: Dict[str, int] = defaultdict(int)
+    invalid_label_count = 0
+    invalid_label_by_task: Dict[str, int] = defaultdict(int)
+    label_confusion_counts: Dict[str, int] = defaultdict(int)
+    label_confusion_by_task: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    format_stats = {
+        key: {"count": 0, "correct": 0, "empty": 0, "eos_first": 0}
+        for key in PROMPT_FORMAT_KEYS
+    }
+    format_stats_by_task: Dict[str, Dict[str, Dict[str, int]]] = defaultdict(
+        lambda: {
+            key: {"count": 0, "correct": 0, "empty": 0, "eos_first": 0}
+            for key in PROMPT_FORMAT_KEYS
+        }
+    )
+    numeric_length_mismatch_count = 0
+    numeric_length_total = 0
+    numeric_length_mismatch_by_task: Dict[str, int] = defaultdict(int)
+    numeric_length_total_by_task: Dict[str, int] = defaultdict(int)
 
     for example in _iter_eval_examples(loader, max_samples):
         task = example.get("task")
@@ -910,6 +1020,8 @@ def evaluate_task_accuracy(
         if pred_bundle is None:
             continue
         pred_norm = pred_bundle["pred_norm"]
+        pred_raw = pred_bundle["pred_raw"]
+        empty_prediction = pred_raw.strip() == ""
 
         metrics = compute_metrics(task, pred_norm, target, tokenizer)
         metrics_by_task[task].append(metrics)
@@ -934,6 +1046,10 @@ def evaluate_task_accuracy(
         task_stop_counts[stop_reason] = task_stop_counts.get(stop_reason, 0) + 1
         eos_emitted += 1 if stop_reason == "eos" else 0
         eos_emitted_by_task[task] += 1 if stop_reason == "eos" else 0
+        empty_prediction_count += 1 if empty_prediction else 0
+        first_token_is_eos_count += 1 if first_token_is_eos else 0
+        empty_predictions_by_task[task] += 1 if empty_prediction else 0
+        first_token_is_eos_by_task[task] += 1 if first_token_is_eos else 0
         per_task_lengths[task]["target_len_tokens"].append(target_len)
         per_task_lengths[task]["pred_len_tokens"].append(pred_len)
         per_task_lengths[task]["length_ratio"].append(pred_len / max(target_len, 1))
@@ -950,7 +1066,39 @@ def evaluate_task_accuracy(
         )
         repetition_by_task[task]["max_run_length"].append(repetition["max_run_length"])
 
+        prompt_flags = get_prompt_format_flags(prompt)
+        for key, enabled in prompt_flags.items():
+            if not enabled:
+                continue
+            format_stats[key]["count"] += 1
+            format_stats[key]["correct"] += 1 if metrics["exact_match"] == 1.0 else 0
+            format_stats[key]["empty"] += 1 if empty_prediction else 0
+            format_stats[key]["eos_first"] += 1 if first_token_is_eos else 0
+            format_stats_by_task[task][key]["count"] += 1
+            format_stats_by_task[task][key]["correct"] += (
+                1 if metrics["exact_match"] == 1.0 else 0
+            )
+            format_stats_by_task[task][key]["empty"] += 1 if empty_prediction else 0
+            format_stats_by_task[task][key]["eos_first"] += (
+                1 if first_token_is_eos else 0
+            )
+
+        valid_label = None
+        if task in {"compare", "dyck", "parity"}:
+            pred_label = normalize_label_prediction(task, pred_raw)
+            target_label = normalize_label_prediction(task, target)
+            valid_label = pred_label is not None
+            if not valid_label:
+                invalid_label_count += 1
+                invalid_label_by_task[task] += 1
+            elif target_label is not None:
+                key = f"pred_{pred_label}_when_{target_label}"
+                label_confusion_counts[key] += 1
+                label_confusion_by_task[task][key] += 1
+
         parse_ok = None
+        digit_length_pred = None
+        digit_length_target = None
         if task in numeric_tasks:
             parsed_pred, failure_reason = parse_numeric_prediction(pred_bundle["pred_raw"])
             parsed_tgt, tgt_failure = parse_numeric_prediction(target)
@@ -976,6 +1124,16 @@ def evaluate_task_accuracy(
                 numeric_rel_errors.append(rel_error)
                 numeric_abs_errors_by_task[task].append(abs_error)
                 numeric_rel_errors_by_task[task].append(rel_error)
+            pred_token = extract_integer_token(pred_bundle["pred_raw"])
+            tgt_token = extract_integer_token(target)
+            digit_length_pred = digit_length_from_token(pred_token)
+            digit_length_target = digit_length_from_token(tgt_token)
+            if digit_length_pred is not None and digit_length_target is not None:
+                numeric_length_total += 1
+                numeric_length_total_by_task[task] += 1
+                if digit_length_pred != digit_length_target:
+                    numeric_length_mismatch_count += 1
+                    numeric_length_mismatch_by_task[task] += 1
         if sample_count_per_task > 0:
             rng = sample_rngs.get(task)
             if rng is None:
@@ -990,6 +1148,10 @@ def evaluate_task_accuracy(
                 "pred_len_tokens": pred_len,
                 "stop_reason": stop_reason,
                 "first_token_is_eos": first_token_is_eos,
+                "empty_prediction": empty_prediction,
+                "valid_label": valid_label,
+                "digit_length_target": digit_length_target,
+                "digit_length_pred": digit_length_pred,
                 "parse_ok": parse_ok,
                 "repeat_1gram_rate": repetition["repeat_1gram_rate"],
                 "difficulty": difficulty,
@@ -1044,12 +1206,30 @@ def evaluate_task_accuracy(
     def _mean(values: List[float]) -> float:
         return sum(values) / len(values) if values else 0.0
 
+    def _median(values: List[float]) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        if len(ordered) % 2 == 1:
+            return float(ordered[mid])
+        return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+    def _percentile(values: List[float], pct: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        idx = int(round((len(ordered) - 1) * pct))
+        return float(ordered[max(0, min(idx, len(ordered) - 1))])
+
     answer_length = {
         "mean": {
             "target_len_tokens": _mean(target_len_tokens),
             "pred_len_tokens": _mean(pred_len_tokens),
             "length_ratio": _mean(length_ratio),
             "abs_len_error": _mean(abs_len_error),
+            "pred_len_tokens_p50": _percentile(pred_len_tokens, 0.5),
+            "pred_len_tokens_p90": _percentile(pred_len_tokens, 0.9),
         },
         "by_task": {
             task: {
@@ -1057,12 +1237,38 @@ def evaluate_task_accuracy(
                 "pred_len_tokens": _mean(payload["pred_len_tokens"]),
                 "length_ratio": _mean(payload["length_ratio"]),
                 "abs_len_error": _mean(payload["abs_len_error"]),
+                "pred_len_tokens_p50": _percentile(payload["pred_len_tokens"], 0.5),
+                "pred_len_tokens_p90": _percentile(payload["pred_len_tokens"], 0.9),
             }
             for task, payload in per_task_lengths.items()
         },
         "eos_emitted_rate": eos_emitted / sum(total.values()) if total else 0.0,
         "eos_emitted_rate_by_task": {
             task: (eos_emitted_by_task.get(task, 0) / task_counts.get(task, 1))
+            for task in task_counts
+        },
+        "eos_first_rate": (
+            first_token_is_eos_count / sum(total.values()) if total else 0.0
+        ),
+        "eos_first_rate_by_task": {
+            task: (first_token_is_eos_by_task.get(task, 0) / task_counts.get(task, 1))
+            for task in task_counts
+        },
+        "empty_rate": empty_prediction_count / sum(total.values()) if total else 0.0,
+        "empty_rate_by_task": {
+            task: (empty_predictions_by_task.get(task, 0) / task_counts.get(task, 1))
+            for task in task_counts
+        },
+        "max_new_tokens_rate": (
+            stop_reason_counts.get("max_new_tokens", 0) / sum(total.values())
+            if total
+            else 0.0
+        ),
+        "max_new_tokens_rate_by_task": {
+            task: (
+                stop_reason_counts_by_task.get(task, {}).get("max_new_tokens", 0)
+                / task_counts.get(task, 1)
+            )
             for task in task_counts
         },
         "stop_reason_counts": stop_reason_counts,
@@ -1110,7 +1316,18 @@ def evaluate_task_accuracy(
             else 0.0
         ),
         "numeric_abs_error": _mean(numeric_abs_errors),
+        "numeric_abs_error_median": _median(numeric_abs_errors),
         "numeric_rel_error": _mean(numeric_rel_errors),
+        "numeric_parse_fail_rate": (
+            sum(parse_failure_counts.values()) / total_numeric_samples
+            if total_numeric_samples
+            else 0.0
+        ),
+        "length_mismatch_rate": (
+            numeric_length_mismatch_count / numeric_length_total
+            if numeric_length_total
+            else 0.0
+        ),
         "by_task": {
             task: {
                 "parse_success_rate": (
@@ -1137,13 +1354,82 @@ def evaluate_task_accuracy(
                     else 0.0
                 ),
                 "numeric_abs_error": _mean(numeric_abs_errors_by_task.get(task, [])),
+                "numeric_abs_error_median": _median(numeric_abs_errors_by_task.get(task, [])),
                 "numeric_rel_error": _mean(numeric_rel_errors_by_task.get(task, [])),
+                "numeric_parse_fail_rate": (
+                    sum(parse_failure_counts_by_task[task].values())
+                    / (
+                        parse_successes_by_task.get(task, 0)
+                        + sum(parse_failure_counts_by_task[task].values())
+                    )
+                    if (
+                        parse_successes_by_task.get(task, 0)
+                        + sum(parse_failure_counts_by_task[task].values())
+                    )
+                    else 0.0
+                ),
+                "length_mismatch_rate": (
+                    numeric_length_mismatch_by_task.get(task, 0)
+                    / numeric_length_total_by_task.get(task, 0)
+                    if numeric_length_total_by_task.get(task, 0)
+                    else 0.0
+                ),
             }
             for task in task_counts
         },
         "failure_counts": dict(parse_failure_counts),
         "failure_counts_by_task": {
             task: dict(counts) for task, counts in parse_failure_counts_by_task.items()
+        },
+    }
+
+    label_metrics = {
+        "invalid_label_rate": (
+            invalid_label_count / sum(total.values()) if total else 0.0
+        ),
+        "invalid_label_rate_by_task": {
+            task: (invalid_label_by_task.get(task, 0) / task_counts.get(task, 1))
+            for task in task_counts
+        },
+        "confusion_counts": dict(label_confusion_counts),
+        "confusion_counts_by_task": {
+            task: dict(counts) for task, counts in label_confusion_by_task.items()
+        },
+    }
+
+    def _format_rates(stats: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, float]]:
+        result: Dict[str, Dict[str, float]] = {}
+        for key, values in stats.items():
+            count = values.get("count", 0)
+            result[key] = {
+                "count": float(count),
+                "accuracy": (values.get("correct", 0) / count if count else 0.0),
+                "empty_rate": (values.get("empty", 0) / count if count else 0.0),
+                "eos_first_rate": (values.get("eos_first", 0) / count if count else 0.0),
+            }
+        return result
+
+    prompt_format = {
+        "overall": _format_rates(format_stats),
+        "by_task": {
+            task: _format_rates(stats) for task, stats in format_stats_by_task.items()
+        },
+    }
+
+    soft_hard_gap = {
+        "token": {
+            "overall": overall_aggregated.mean_token_accuracy - overall,
+            "by_task": {
+                task: (per_task_token_accuracy[task] - per_task[task])
+                for task in per_task
+            },
+        },
+        "prefix": {
+            "overall": overall_aggregated.mean_prefix_accuracy - overall,
+            "by_task": {
+                task: (per_task_prefix_accuracy[task] - per_task[task])
+                for task in per_task
+            },
         },
     }
     return {
@@ -1162,6 +1448,9 @@ def evaluate_task_accuracy(
             "answer_length": answer_length,
             "repetition": repetition,
             "parse": parse_metrics,
+            "labels": label_metrics,
+            "prompt_format": prompt_format,
+            "soft_hard_gap": soft_hard_gap,
             "task_counts": dict(task_counts),
             "difficulty_by_task": task_difficulty_mean,
         },
@@ -1194,6 +1483,42 @@ def _print_sampled_examples(label: str, samples_by_task: Dict[str, List[Dict[str
                 f"repeat_1gram_rate={repeat_1gram} "
                 f"difficulty={difficulty}"
             )
+
+
+def _print_prompt_format_stats(label: str, prompt_format: Dict[str, Any]) -> None:
+    if not prompt_format:
+        return
+    overall = prompt_format.get("overall", {})
+    if overall:
+        print(f"  {label} prompt format (overall):")
+        for key in PROMPT_FORMAT_KEYS:
+            stats = overall.get(key)
+            if not stats:
+                continue
+            print(
+                f"    {key}: n={int(stats.get('count', 0))} "
+                f"acc={stats.get('accuracy', 0.0):.3f} "
+                f"empty={stats.get('empty_rate', 0.0):.3f} "
+                f"eos_first={stats.get('eos_first_rate', 0.0):.3f}"
+            )
+    by_task = prompt_format.get("by_task", {})
+    if by_task:
+        print(f"  {label} prompt format (by task):")
+        for task in sorted(by_task):
+            task_stats = by_task[task]
+            if not task_stats:
+                continue
+            print(f"    {task}:")
+            for key in PROMPT_FORMAT_KEYS:
+                stats = task_stats.get(key)
+                if not stats:
+                    continue
+                print(
+                    f"      {key}: n={int(stats.get('count', 0))} "
+                    f"acc={stats.get('accuracy', 0.0):.3f} "
+                    f"empty={stats.get('empty_rate', 0.0):.3f} "
+                    f"eos_first={stats.get('eos_first_rate', 0.0):.3f}"
+                )
 
 
 def build_optimizer(
@@ -1310,6 +1635,25 @@ def train(args):
         return " | ".join(
             f"{key}={format_metric_value(metrics[key])}" for key in sorted(metrics)
         )
+
+    def warn_on_format_crash(
+        label: str,
+        prev_acc: Dict[str, float],
+        prev_token_acc: Dict[str, float],
+        current_acc: Dict[str, float],
+        current_token_acc: Dict[str, float],
+    ) -> None:
+        for task, acc in current_acc.items():
+            if task not in prev_acc:
+                continue
+            drop = prev_acc[task] - acc
+            token_delta = abs(current_token_acc.get(task, 0.0) - prev_token_acc.get(task, 0.0))
+            if drop >= crash_drop_threshold and token_delta <= crash_token_stability_threshold:
+                log_print(
+                    f"[warn] {label} {task} exact-match dropped by {drop:.3f} "
+                    f"with token accuracy stable (Δ={token_delta:.3f}). "
+                    "Possible format/strictness issue."
+                )
     log_print(f"Device: {device}")
 
     random.seed(args.seed)
@@ -1703,6 +2047,14 @@ def train(args):
     best_alg_acc = 0.0
     last_grad_norm = 0.0
     checkpoint_paths: List[Path] = []
+    prev_eval_task_acc: Dict[str, float] = {}
+    prev_eval_task_token_acc: Dict[str, float] = {}
+    prev_eval_ood_task_acc: Dict[str, float] = {}
+    prev_eval_ood_task_token_acc: Dict[str, float] = {}
+    prev_train_eval_task_acc: Dict[str, float] = {}
+    prev_train_eval_task_token_acc: Dict[str, float] = {}
+    crash_drop_threshold = 0.2
+    crash_token_stability_threshold = 0.05
 
     def _task_curriculum_config() -> Optional[Dict[str, float]]:
         if task_curriculum is None:
@@ -2338,6 +2690,17 @@ def train(args):
                             f"dist={overall_distance:.3f} | "
                             f"prefix={overall_prefix_accuracy:.3f}"
                         )
+                        diagnostics = alg_results.get("diagnostics", {})
+                        answer_diag = diagnostics.get("answer_length", {})
+                        labels_diag = diagnostics.get("labels", {})
+                        parse_diag = diagnostics.get("parse", {})
+                        log_print(
+                            "  Algorithmic IID diagnostics: "
+                            f"empty={answer_diag.get('empty_rate', 0.0):.3f} | "
+                            f"eos_first={answer_diag.get('eos_first_rate', 0.0):.3f} | "
+                            f"invalid_label={labels_diag.get('invalid_label_rate', 0.0):.3f} | "
+                            f"numeric_parse_fail={parse_diag.get('numeric_parse_fail_rate', 0.0):.3f}"
+                        )
                         if overall_mae is not None:
                             log_print(f"  Algorithmic MAE (numeric tasks): {overall_mae:.3f}")
 
@@ -2345,6 +2708,11 @@ def train(args):
                             "Algorithmic IID eval",
                             alg_results.get("sampled_examples_by_task", {}),
                         )
+                        if args.debug_eval_format_stats:
+                            _print_prompt_format_stats(
+                                "Algorithmic IID eval",
+                                diagnostics.get("prompt_format", {}),
+                            )
 
                     flat_eval_diagnostics = _flatten_eval_diagnostics(
                         "eval", alg_results.get("diagnostics", {})
@@ -2381,6 +2749,16 @@ def train(args):
                         alg_results.get("per_task_prefix_accuracy", {}) or {}
                     )
                     per_task_accuracy = alg_results.get("per_task_accuracy", {}) or {}
+                    if per_task_accuracy:
+                        warn_on_format_crash(
+                            "Algorithmic IID",
+                            prev_eval_task_acc,
+                            prev_eval_task_token_acc,
+                            per_task_accuracy,
+                            per_task_token_accuracy,
+                        )
+                        prev_eval_task_acc = dict(per_task_accuracy)
+                        prev_eval_task_token_acc = dict(per_task_token_accuracy)
                     for task, acc in per_task_accuracy.items():
                         task_mae = per_task_mae.get(task)
                         logger.log_task_accuracy(
@@ -2403,6 +2781,34 @@ def train(args):
                                 f" | dist={distance:.3f}"
                                 f" | prefix={prefix_acc:.3f}"
                             )
+                            answer_diag = alg_results.get("diagnostics", {}).get(
+                                "answer_length", {}
+                            )
+                            labels_diag = alg_results.get("diagnostics", {}).get("labels", {})
+                            parse_diag = alg_results.get("diagnostics", {}).get("parse", {})
+                            empty_rate = answer_diag.get("empty_rate_by_task", {}).get(task)
+                            eos_first_rate = answer_diag.get("eos_first_rate_by_task", {}).get(task)
+                            max_new_tokens_rate = answer_diag.get(
+                                "max_new_tokens_rate_by_task", {}
+                            ).get(task)
+                            if empty_rate is not None:
+                                line += f" | empty={empty_rate:.3f}"
+                            if eos_first_rate is not None:
+                                line += f" | eos_first={eos_first_rate:.3f}"
+                            if max_new_tokens_rate is not None:
+                                line += f" | max_new={max_new_tokens_rate:.3f}"
+                            if task in CLASSIFICATION_TASKS:
+                                invalid_rate = labels_diag.get(
+                                    "invalid_label_rate_by_task", {}
+                                ).get(task)
+                                if invalid_rate is not None:
+                                    line += f" | invalid_label={invalid_rate:.3f}"
+                            elif task in NUMERIC_OUTPUT_TASKS:
+                                parse_fail_rate = parse_diag.get(
+                                    "by_task", {}
+                                ).get(task, {}).get("numeric_parse_fail_rate")
+                                if parse_fail_rate is not None:
+                                    line += f" | parse_fail={parse_fail_rate:.3f}"
                             if task_mae is not None:
                                 line += f" | MAE: {task_mae:.3f}"
                             log_print(line)
@@ -2456,6 +2862,17 @@ def train(args):
                             f"dist={overall_distance:.3f} | "
                             f"prefix={overall_prefix_accuracy:.3f}"
                         )
+                        diagnostics = ood_results.get("diagnostics", {})
+                        answer_diag = diagnostics.get("answer_length", {})
+                        labels_diag = diagnostics.get("labels", {})
+                        parse_diag = diagnostics.get("parse", {})
+                        log_print(
+                            "  Algorithmic OOD diagnostics: "
+                            f"empty={answer_diag.get('empty_rate', 0.0):.3f} | "
+                            f"eos_first={answer_diag.get('eos_first_rate', 0.0):.3f} | "
+                            f"invalid_label={labels_diag.get('invalid_label_rate', 0.0):.3f} | "
+                            f"numeric_parse_fail={parse_diag.get('numeric_parse_fail_rate', 0.0):.3f}"
+                        )
                         if overall_mae is not None:
                             log_print(f"  Algorithmic OOD MAE (numeric tasks): {overall_mae:.3f}")
 
@@ -2463,6 +2880,11 @@ def train(args):
                             "Algorithmic OOD eval",
                             ood_results.get("sampled_examples_by_task", {}),
                         )
+                        if args.debug_eval_format_stats:
+                            _print_prompt_format_stats(
+                                "Algorithmic OOD eval",
+                                diagnostics.get("prompt_format", {}),
+                            )
 
                     logger.log(
                         step=global_step,
@@ -2486,7 +2908,18 @@ def train(args):
                     per_task_prefix_accuracy = (
                         ood_results.get("per_task_prefix_accuracy", {}) or {}
                     )
-                    for task, acc in ood_results.get("per_task_accuracy", {}).items():
+                    per_task_accuracy = ood_results.get("per_task_accuracy", {}) or {}
+                    if per_task_accuracy:
+                        warn_on_format_crash(
+                            "Algorithmic OOD",
+                            prev_eval_ood_task_acc,
+                            prev_eval_ood_task_token_acc,
+                            per_task_accuracy,
+                            per_task_token_accuracy,
+                        )
+                        prev_eval_ood_task_acc = dict(per_task_accuracy)
+                        prev_eval_ood_task_token_acc = dict(per_task_token_accuracy)
+                    for task, acc in per_task_accuracy.items():
                         task_mae = per_task_mae.get(task)
                         logger.log_task_accuracy(
                             task,
@@ -2508,6 +2941,34 @@ def train(args):
                                 f" | dist={distance:.3f}"
                                 f" | prefix={prefix_acc:.3f}"
                             )
+                            answer_diag = ood_results.get("diagnostics", {}).get(
+                                "answer_length", {}
+                            )
+                            labels_diag = ood_results.get("diagnostics", {}).get("labels", {})
+                            parse_diag = ood_results.get("diagnostics", {}).get("parse", {})
+                            empty_rate = answer_diag.get("empty_rate_by_task", {}).get(task)
+                            eos_first_rate = answer_diag.get("eos_first_rate_by_task", {}).get(task)
+                            max_new_tokens_rate = answer_diag.get(
+                                "max_new_tokens_rate_by_task", {}
+                            ).get(task)
+                            if empty_rate is not None:
+                                line += f" | empty={empty_rate:.3f}"
+                            if eos_first_rate is not None:
+                                line += f" | eos_first={eos_first_rate:.3f}"
+                            if max_new_tokens_rate is not None:
+                                line += f" | max_new={max_new_tokens_rate:.3f}"
+                            if task in CLASSIFICATION_TASKS:
+                                invalid_rate = labels_diag.get(
+                                    "invalid_label_rate_by_task", {}
+                                ).get(task)
+                                if invalid_rate is not None:
+                                    line += f" | invalid_label={invalid_rate:.3f}"
+                            elif task in NUMERIC_OUTPUT_TASKS:
+                                parse_fail_rate = parse_diag.get(
+                                    "by_task", {}
+                                ).get(task, {}).get("numeric_parse_fail_rate")
+                                if parse_fail_rate is not None:
+                                    line += f" | parse_fail={parse_fail_rate:.3f}"
                             if task_mae is not None:
                                 line += f" | MAE: {task_mae:.3f}"
                             log_print(line)
@@ -2569,6 +3030,17 @@ def train(args):
                             f"Loss: {train_loss_eval:.4f}"
                         )
                         log_print(f"  Training task accuracy: {overall_task_acc*100:.1f}%")
+                        diagnostics = task_eval.get("diagnostics", {})
+                        answer_diag = diagnostics.get("answer_length", {})
+                        labels_diag = diagnostics.get("labels", {})
+                        parse_diag = diagnostics.get("parse", {})
+                        log_print(
+                            "  Training eval diagnostics: "
+                            f"empty={answer_diag.get('empty_rate', 0.0):.3f} | "
+                            f"eos_first={answer_diag.get('eos_first_rate', 0.0):.3f} | "
+                            f"invalid_label={labels_diag.get('invalid_label_rate', 0.0):.3f} | "
+                            f"numeric_parse_fail={parse_diag.get('numeric_parse_fail_rate', 0.0):.3f}"
+                        )
                         if overall_task_mae is not None:
                             log_print(f"  Training task MAE (numeric tasks): {overall_task_mae:.3f}")
 
@@ -2576,6 +3048,11 @@ def train(args):
                             "Training eval",
                             task_eval.get("sampled_examples_by_task", {}),
                         )
+                        if args.debug_eval_format_stats:
+                            _print_prompt_format_stats(
+                                "Training eval",
+                                diagnostics.get("prompt_format", {}),
+                            )
 
                     logger.log(
                         step=global_step,
@@ -2600,7 +3077,18 @@ def train(args):
                     per_task_prefix_accuracy = (
                         task_eval.get("per_task_prefix_accuracy", {}) or {}
                     )
-                    for task, acc in task_eval.get("per_task_accuracy", {}).items():
+                    per_task_accuracy = task_eval.get("per_task_accuracy", {}) or {}
+                    if per_task_accuracy:
+                        warn_on_format_crash(
+                            f"Training eval ({train_eval_label})",
+                            prev_train_eval_task_acc,
+                            prev_train_eval_task_token_acc,
+                            per_task_accuracy,
+                            per_task_token_accuracy,
+                        )
+                        prev_train_eval_task_acc = dict(per_task_accuracy)
+                        prev_train_eval_task_token_acc = dict(per_task_token_accuracy)
+                    for task, acc in per_task_accuracy.items():
                         task_mae = per_task_mae.get(task)
                         logger.log_task_accuracy(
                             task,
@@ -2614,6 +3102,34 @@ def train(args):
                         )
                         if args.extended_logging:
                             line = f"    {task}: {acc*100:.1f}%"
+                            answer_diag = task_eval.get("diagnostics", {}).get(
+                                "answer_length", {}
+                            )
+                            labels_diag = task_eval.get("diagnostics", {}).get("labels", {})
+                            parse_diag = task_eval.get("diagnostics", {}).get("parse", {})
+                            empty_rate = answer_diag.get("empty_rate_by_task", {}).get(task)
+                            eos_first_rate = answer_diag.get("eos_first_rate_by_task", {}).get(task)
+                            max_new_tokens_rate = answer_diag.get(
+                                "max_new_tokens_rate_by_task", {}
+                            ).get(task)
+                            if empty_rate is not None:
+                                line += f" | empty={empty_rate:.3f}"
+                            if eos_first_rate is not None:
+                                line += f" | eos_first={eos_first_rate:.3f}"
+                            if max_new_tokens_rate is not None:
+                                line += f" | max_new={max_new_tokens_rate:.3f}"
+                            if task in CLASSIFICATION_TASKS:
+                                invalid_rate = labels_diag.get(
+                                    "invalid_label_rate_by_task", {}
+                                ).get(task)
+                                if invalid_rate is not None:
+                                    line += f" | invalid_label={invalid_rate:.3f}"
+                            elif task in NUMERIC_OUTPUT_TASKS:
+                                parse_fail_rate = parse_diag.get(
+                                    "by_task", {}
+                                ).get(task, {}).get("numeric_parse_fail_rate")
+                                if parse_fail_rate is not None:
+                                    line += f" | parse_fail={parse_fail_rate:.3f}"
                             if task_mae is not None:
                                 line += f" | MAE: {task_mae:.3f}"
                             log_print(line)
@@ -2919,6 +3435,11 @@ def main():
         type=int,
         default=5,
         help="Number of sampled eval prompts to log per task",
+    )
+    parser.add_argument(
+        "--debug_eval_format_stats",
+        action="store_true",
+        help="Print prompt-format cohort tables during eval logging",
     )
     parser.add_argument(
         "--extended_logging",

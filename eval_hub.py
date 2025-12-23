@@ -82,6 +82,11 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
     total_abs_error = 0.0
     total_numeric = 0
     total_parse_failures = 0
+    total_empty_predictions = 0
+    total_first_token_eos = 0
+    total_invalid_labels = 0
+    total_numeric_length_mismatch = 0
+    total_numeric_length = 0
     diagnostics_overall = {
         "target_len_tokens": [],
         "pred_len_tokens": [],
@@ -99,10 +104,22 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
     stop_reason_by_task: Dict[str, Dict[str, int]] = {}
     eos_emitted = 0
     eos_emitted_by_task: Dict[str, int] = {}
+    empty_predictions_by_task: Dict[str, int] = {}
+    first_token_eos_by_task: Dict[str, int] = {}
     parse_successes = 0
     parse_successes_by_task: Dict[str, int] = {}
     parse_failure_counts = {"empty_output": 0, "contains_non_digit": 0, "wrong_sign_or_format": 0}
     parse_failure_by_task: Dict[str, Dict[str, int]] = {}
+    invalid_label_by_task: Dict[str, int] = {}
+    label_confusion_overall: Dict[str, int] = {}
+    label_confusion_by_task: Dict[str, Dict[str, int]] = {}
+    format_stats_overall = {
+        key: {"count": 0, "correct": 0, "empty": 0, "eos_first": 0}
+        for key in ("colon", "answer", "arrow", "fatarrow", "equals")
+    }
+    format_stats_by_task: Dict[str, Dict[str, Dict[str, int]]] = {}
+    numeric_length_mismatch_by_task: Dict[str, int] = {}
+    numeric_length_total_by_task: Dict[str, int] = {}
     task_counts: Dict[str, int] = {}
     task_difficulty_sum: Dict[str, float] = {}
 
@@ -164,6 +181,26 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
         total_parse_failures += res.parse_failures
         task_counts[res.task] = task_counts.get(res.task, 0) + res.n
         task_difficulty_sum[res.task] = task_difficulty_sum.get(res.task, 0.0) + res.difficulty * res.n
+        total_empty_predictions += res.empty_predictions
+        empty_predictions_by_task[res.task] = (
+            empty_predictions_by_task.get(res.task, 0) + res.empty_predictions
+        )
+        total_first_token_eos += res.first_token_is_eos_count
+        first_token_eos_by_task[res.task] = (
+            first_token_eos_by_task.get(res.task, 0) + res.first_token_is_eos_count
+        )
+        total_invalid_labels += res.invalid_label_count
+        invalid_label_by_task[res.task] = (
+            invalid_label_by_task.get(res.task, 0) + res.invalid_label_count
+        )
+        total_numeric_length_mismatch += res.numeric_length_mismatch_count
+        total_numeric_length += res.numeric_length_total
+        numeric_length_mismatch_by_task[res.task] = (
+            numeric_length_mismatch_by_task.get(res.task, 0) + res.numeric_length_mismatch_count
+        )
+        numeric_length_total_by_task[res.task] = (
+            numeric_length_total_by_task.get(res.task, 0) + res.numeric_length_total
+        )
 
         task_diag = diagnostics_by_task.setdefault(
             res.task,
@@ -183,6 +220,25 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
 
         eos_emitted += res.eos_emitted
         eos_emitted_by_task[res.task] = eos_emitted_by_task.get(res.task, 0) + res.eos_emitted
+
+        if res.label_confusion_counts:
+            label_confusion_task = label_confusion_by_task.setdefault(res.task, {})
+            for key, count in res.label_confusion_counts.items():
+                label_confusion_overall[key] = label_confusion_overall.get(key, 0) + count
+                label_confusion_task[key] = label_confusion_task.get(key, 0) + count
+
+        if res.format_stats:
+            task_format = format_stats_by_task.setdefault(
+                res.task,
+                {
+                    key: {"count": 0, "correct": 0, "empty": 0, "eos_first": 0}
+                    for key in format_stats_overall
+                },
+            )
+            for key, stats in res.format_stats.items():
+                for stat_key, value in stats.items():
+                    format_stats_overall[key][stat_key] += value
+                    task_format[key][stat_key] += value
 
         if res.parse_successes:
             parse_successes += res.parse_successes
@@ -249,12 +305,21 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
             return float(ordered[mid])
         return (ordered[mid - 1] + ordered[mid]) / 2.0
 
+    def _percentile(values: List[float], pct: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        idx = int(round((len(ordered) - 1) * pct))
+        return float(ordered[max(0, min(idx, len(ordered) - 1))])
+
     answer_length = {
         "mean": {
             "target_len_tokens": _mean(diagnostics_overall["target_len_tokens"]),
             "pred_len_tokens": _mean(diagnostics_overall["pred_len_tokens"]),
             "length_ratio": _mean(diagnostics_overall["length_ratio"]),
             "abs_len_error": _mean(diagnostics_overall["abs_len_error"]),
+            "pred_len_tokens_p50": _percentile(diagnostics_overall["pred_len_tokens"], 0.5),
+            "pred_len_tokens_p90": _percentile(diagnostics_overall["pred_len_tokens"], 0.9),
         },
         "by_task": {
             task: {
@@ -262,12 +327,34 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
                 "pred_len_tokens": _mean(payload["pred_len_tokens"]),
                 "length_ratio": _mean(payload["length_ratio"]),
                 "abs_len_error": _mean(payload["abs_len_error"]),
+                "pred_len_tokens_p50": _percentile(payload["pred_len_tokens"], 0.5),
+                "pred_len_tokens_p90": _percentile(payload["pred_len_tokens"], 0.9),
             }
             for task, payload in diagnostics_by_task.items()
         },
         "eos_emitted_rate": (eos_emitted / total_seen if total_seen else 0.0),
         "eos_emitted_rate_by_task": {
             task: (eos_emitted_by_task.get(task, 0) / task_counts.get(task, 1))
+            for task in task_counts
+        },
+        "eos_first_rate": (total_first_token_eos / total_seen if total_seen else 0.0),
+        "eos_first_rate_by_task": {
+            task: (first_token_eos_by_task.get(task, 0) / task_counts.get(task, 1))
+            for task in task_counts
+        },
+        "empty_rate": (total_empty_predictions / total_seen if total_seen else 0.0),
+        "empty_rate_by_task": {
+            task: (empty_predictions_by_task.get(task, 0) / task_counts.get(task, 1))
+            for task in task_counts
+        },
+        "max_new_tokens_rate": (
+            stop_reason_counts.get("max_new_tokens", 0) / total_seen if total_seen else 0.0
+        ),
+        "max_new_tokens_rate_by_task": {
+            task: (
+                stop_reason_by_task.get(task, {}).get("max_new_tokens", 0)
+                / task_counts.get(task, 1)
+            )
             for task in task_counts
         },
         "stop_reason_counts": stop_reason_counts,
@@ -320,7 +407,14 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
             else 0.0
         ),
         "numeric_abs_error": _mean(diagnostics_overall["numeric_abs_errors"]),
+        "numeric_abs_error_median": _median(diagnostics_overall["numeric_abs_errors"]),
         "numeric_rel_error": _mean(diagnostics_overall["numeric_rel_errors"]),
+        "numeric_parse_fail_rate": (
+            total_parse_failures / total_numeric_samples if total_numeric_samples else 0.0
+        ),
+        "length_mismatch_rate": (
+            total_numeric_length_mismatch / total_numeric_length if total_numeric_length else 0.0
+        ),
         "by_task": {
             task: {
                 "parse_success_rate": (
@@ -345,13 +439,78 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
                     else 0.0
                 ),
                 "numeric_abs_error": _mean(payload["numeric_abs_errors"]),
+                "numeric_abs_error_median": _median(payload["numeric_abs_errors"]),
                 "numeric_rel_error": _mean(payload["numeric_rel_errors"]),
+                "numeric_parse_fail_rate": (
+                    per_task[task]["parse_failures"]
+                    / (
+                        per_task[task]["parse_failures"]
+                        + parse_successes_by_task.get(task, 0)
+                    )
+                    if (
+                        per_task[task]["parse_failures"]
+                        + parse_successes_by_task.get(task, 0)
+                    )
+                    else 0.0
+                ),
+                "length_mismatch_rate": (
+                    numeric_length_mismatch_by_task.get(task, 0)
+                    / numeric_length_total_by_task.get(task, 0)
+                    if numeric_length_total_by_task.get(task, 0)
+                    else 0.0
+                ),
             }
             for task, payload in diagnostics_by_task.items()
             if task in per_task
         },
         "failure_counts": parse_failure_counts,
         "failure_counts_by_task": parse_failure_by_task,
+    }
+
+    label_metrics = {
+        "invalid_label_rate": (total_invalid_labels / total_seen if total_seen else 0.0),
+        "invalid_label_rate_by_task": {
+            task: (invalid_label_by_task.get(task, 0) / task_counts.get(task, 1))
+            for task in task_counts
+        },
+        "confusion_counts": label_confusion_overall,
+        "confusion_counts_by_task": label_confusion_by_task,
+    }
+
+    def _format_rates(stats: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, float]]:
+        result: Dict[str, Dict[str, float]] = {}
+        for key, values in stats.items():
+            count = values.get("count", 0)
+            result[key] = {
+                "count": float(count),
+                "accuracy": (values.get("correct", 0) / count if count else 0.0),
+                "empty_rate": (values.get("empty", 0) / count if count else 0.0),
+                "eos_first_rate": (values.get("eos_first", 0) / count if count else 0.0),
+            }
+        return result
+
+    prompt_format = {
+        "overall": _format_rates(format_stats_overall),
+        "by_task": {
+            task: _format_rates(stats) for task, stats in format_stats_by_task.items()
+        },
+    }
+
+    soft_hard_gap = {
+        "token": {
+            "overall": overall_token_accuracy - overall,
+            "by_task": {
+                task: (per_task_token_accuracy[task] - per_task_acc[task])
+                for task in per_task_acc
+            },
+        },
+        "prefix": {
+            "overall": overall_prefix_accuracy - overall,
+            "by_task": {
+                task: (per_task_prefix_accuracy[task] - per_task_acc[task])
+                for task in per_task_acc
+            },
+        },
     }
     return {
         "grid_version": ood_grid.OOD_GRID_VERSION,
@@ -369,10 +528,24 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
         "overall_mae": overall_mae,
         "overall_parse_failures": total_parse_failures,
         "overall_parse_failure_rate": overall_parse_failure_rate,
+        "overall_empty_rate": (total_empty_predictions / total_seen if total_seen else 0.0),
+        "overall_eos_first_rate": (total_first_token_eos / total_seen if total_seen else 0.0),
+        "overall_invalid_label_rate": (
+            total_invalid_labels / total_seen if total_seen else 0.0
+        ),
+        "overall_numeric_parse_fail_rate": (
+            total_parse_failures
+            / (parse_successes + total_parse_failures)
+            if (parse_successes + total_parse_failures)
+            else 0.0
+        ),
         "diagnostics": {
             "answer_length": answer_length,
             "repetition": repetition,
             "parse": parse_metrics,
+            "labels": label_metrics,
+            "prompt_format": prompt_format,
+            "soft_hard_gap": soft_hard_gap,
             "task_counts": task_counts,
             "difficulty_by_task": task_difficulty_mean,
         },
