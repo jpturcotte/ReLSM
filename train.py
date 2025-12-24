@@ -3008,6 +3008,8 @@ def train(args):
                                 task,
                                 global_step,
                                 args.curriculum_cooldown,
+                                acc_threshold_high=args.curriculum_acc_threshold_high,
+                                acc_threshold_low=args.curriculum_acc_threshold_low,
                             )
                             state = task_curriculum.get_task_state(task)
                             curriculum_metrics[f"curriculum.difficulty.{task}"] = state[
@@ -3254,6 +3256,18 @@ def main():
         type=int,
         default=500,
         help="Steps to wait between curriculum difficulty updates per task",
+    )
+    parser.add_argument(
+        "--curriculum_acc_threshold_high",
+        type=float,
+        default=0.70,
+        help="EMA accuracy threshold for increasing per-task difficulty",
+    )
+    parser.add_argument(
+        "--curriculum_acc_threshold_low",
+        type=float,
+        default=0.50,
+        help="EMA accuracy threshold for decreasing per-task difficulty",
     )
     parser.add_argument(
         "--curriculum_min_task_evals",

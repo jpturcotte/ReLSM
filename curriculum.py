@@ -113,8 +113,8 @@ class TaskCurriculumState:
         step: int,
         cooldown: int,
         *,
-        acc_threshold_high: float = 0.85,
-        acc_threshold_low: float = 0.55,
+        acc_threshold_high: float = 0.70,
+        acc_threshold_low: float = 0.50,
     ) -> float:
         self._ensure_task(task)
         task_state = self._state[task]
