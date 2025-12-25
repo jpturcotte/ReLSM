@@ -255,7 +255,7 @@ class DagUnlockState:
 
         self._backslide = False
         for task, gate in self.gate.items():
-            if gate <= 0.0:
+            if gate <= 0.0 or task in self.roots:
                 continue
             thresholds = self.thresholds.get(task, {})
             for prereq, minimum in thresholds.items():
