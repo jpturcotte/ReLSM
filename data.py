@@ -1062,12 +1062,15 @@ class AlgorithmicDataset(IterableDataset):
                     difficulty_schedule=self.difficulty_schedule,
                     task_weighting=self.task_weighting,
                 )
+            prompt_tokens = self._encode_text(example["input"])
+            prompt_len = len(prompt_tokens)
             tokens = self._encode_text(example["text"])
             if self.tokenizer.eos_token_id is not None:
                 tokens.append(self.tokenizer.eos_token_id)
 
             if len(tokens) > self.max_seq_len:
                 tokens = tokens[:self.max_seq_len]
+            prompt_len = min(prompt_len, len(tokens))
 
             input_ids = torch.tensor(tokens, dtype=torch.long)
             pad_len = self.max_seq_len - len(input_ids)
@@ -1081,6 +1084,8 @@ class AlgorithmicDataset(IterableDataset):
 
             labels = input_ids.clone()
             labels = labels.masked_fill(attention_mask == 0, -100)
+            if prompt_len > 0:
+                labels[:prompt_len] = -100
 
             n_tokens = int((labels[1:] != -100).sum().item())
             self.tokens_seen += n_tokens
@@ -1205,12 +1210,15 @@ class FixedAlgorithmicDataset(Dataset):
                 difficulty_schedule=self.difficulty_schedule,
                 task_weighting=self.task_weighting,
             )
+            prompt_tokens = self._encode_text(example["input"])
+            prompt_len = len(prompt_tokens)
             tokens = self._encode_text(example["text"])
             if self.tokenizer.eos_token_id is not None:
                 tokens.append(self.tokenizer.eos_token_id)
 
             if len(tokens) > self.max_seq_len:
                 tokens = tokens[: self.max_seq_len]
+            prompt_len = min(prompt_len, len(tokens))
 
             input_ids = torch.tensor(tokens, dtype=torch.long)
             pad_len = self.max_seq_len - len(input_ids)
@@ -1224,6 +1232,8 @@ class FixedAlgorithmicDataset(Dataset):
 
             labels = input_ids.clone()
             labels = labels.masked_fill(attention_mask == 0, -100)
+            if prompt_len > 0:
+                labels[:prompt_len] = -100
 
             payload = {
                 "input_ids": input_ids,
