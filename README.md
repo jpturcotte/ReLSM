@@ -289,6 +289,7 @@ This codebase synthesizes and tests ideas from:
 - `--curriculum_cooldown`: Steps to wait between curriculum difficulty updates per task.
 - `--curriculum_min_task_evals`: Minimum evals per task before the curriculum can adjust difficulty.
 - `--curriculum_jitter`: Probability of replaying easier samples per task.
+- `--task_curriculum_strategy dag`: Optional DAG-based staged unlock with EMA thresholds, patience, and replay mixing (use with `--use_task_curriculum`).
 
 ## Expected Results (Hypotheses)
 
