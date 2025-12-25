@@ -243,7 +243,7 @@ class DagUnlockState:
             return False
         for prereq, minimum in thresholds.items():
             score = ema_acc.get(prereq, 0.0)
-            if score < minimum + self.unlock_margin:
+            if score < minimum - self.unlock_margin:
                 return False
         return True
 
