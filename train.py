@@ -1882,6 +1882,7 @@ def train(args):
                 return [], {}, {}
             gates = [dag_gate_snapshot.get(task, 0.0) for task in tasks]
             unlocked = [idx for idx, gate in enumerate(gates) if gate > 0.0]
+            locked = [idx for idx, gate in enumerate(gates) if gate <= 0.0]
             if not unlocked:
                 total = sum(weights)
                 probs = {
@@ -1936,6 +1937,19 @@ def train(args):
                 floor_frontier = min_prob_frontier_total / len(frontier_indices)
                 for idx in frontier_indices:
                     probs[idx] = max(probs[idx], floor_frontier)
+
+            locked_floor_total = max(args.dag_locked_floor, 0.0)
+            if locked and locked_floor_total > 0.0:
+                locked_weight_total = sum(weights[idx] for idx in locked)
+                if locked_weight_total <= 0.0:
+                    locked_weight_total = float(len(locked))
+                    for idx in locked:
+                        weights[idx] = 1.0
+                for idx in locked:
+                    probs[idx] = max(
+                        probs[idx],
+                        locked_floor_total * (weights[idx] / locked_weight_total),
+                    )
 
             total = sum(probs)
             if total <= 0.0:
@@ -3165,25 +3179,10 @@ def train(args):
                     curriculum_metrics: Dict[str, float] = {}
                     curriculum_log_lines: List[str] = []
                     if task_curriculum is not None:
-                        for task, acc in task_eval.get("per_task_accuracy", {}).items():
+                        per_task_accuracy = task_eval.get("per_task_accuracy", {})
+                        for task, acc in per_task_accuracy.items():
                             loss_proxy = 1.0 - acc
                             task_curriculum.update_metrics(task, acc, loss_proxy, global_step)
-                            task_curriculum.step_curriculum(
-                                task,
-                                global_step,
-                                args.curriculum_cooldown,
-                            )
-                            state = task_curriculum.get_task_state(task)
-                            curriculum_metrics[f"curriculum.difficulty.{task}"] = state[
-                                "difficulty"
-                            ]
-                            curriculum_metrics[f"curriculum.ema_acc.{task}"] = state[
-                                "ema_acc"
-                            ]
-                            curriculum_log_lines.append(
-                                f"{task}: d={state['difficulty']:.2f} "
-                                f"ema={state['ema_acc']:.2f}"
-                            )
                         if dag_state is not None:
                             ema_snapshot = {
                                 task: task_curriculum.get_task_state(task)["ema_acc"]
@@ -3216,6 +3215,43 @@ def train(args):
                                 dag_replay_ratio_snapshot
                             )
                             curriculum_metrics.update(dag_metrics)
+                        unlock_warmup_evals = (
+                            args.dag_unlock_warmup_evals
+                            if args.dag_unlock_warmup_evals is not None
+                            else args.curriculum_min_task_evals
+                        )
+                        unlock_warmup_evals = max(int(unlock_warmup_evals), 0)
+                        for task, acc in per_task_accuracy.items():
+                            should_step_curriculum = True
+                            if dag_state is not None:
+                                gate = dag_gate_snapshot.get(task, 0.0)
+                                if gate <= 0.0:
+                                    should_step_curriculum = False
+                                else:
+                                    unlocked_index = dag_state.unlocked_eval_index.get(task)
+                                    if unlocked_index is not None:
+                                        evals_since_unlock = (
+                                            dag_state.eval_index - unlocked_index
+                                        )
+                                        if evals_since_unlock < unlock_warmup_evals:
+                                            should_step_curriculum = False
+                            if should_step_curriculum:
+                                task_curriculum.step_curriculum(
+                                    task,
+                                    global_step,
+                                    args.curriculum_cooldown,
+                                )
+                            state = task_curriculum.get_task_state(task)
+                            curriculum_metrics[f"curriculum.difficulty.{task}"] = state[
+                                "difficulty"
+                            ]
+                            curriculum_metrics[f"curriculum.ema_acc.{task}"] = state[
+                                "ema_acc"
+                            ]
+                            curriculum_log_lines.append(
+                                f"{task}: d={state['difficulty']:.2f} "
+                                f"ema={state['ema_acc']:.2f}"
+                            )
                         if curriculum_metrics:
                             logger.log(step=global_step, phase="eval", **curriculum_metrics)
                             log_print("  Curriculum: " + " | ".join(sorted(curriculum_log_lines)))
@@ -3474,10 +3510,18 @@ def main():
     parser.add_argument("--dag_ramp_evals", type=int, default=3)
     parser.add_argument("--dag_replay_ratio", type=float, default=0.20)
     parser.add_argument("--dag_replay_ratio_backslide", type=float, default=0.35)
+    parser.add_argument("--dag_locked_floor", type=float, default=0.02)
     parser.add_argument("--dag_unlock_margin", type=float, default=0.01)
     parser.add_argument("--dag_lock_margin", type=float, default=0.03)
     parser.add_argument("--dag_frontier_recent_evals", type=int, default=4)
     parser.add_argument("--dag_mastery_margin", type=float, default=0.02)
+    parser.add_argument(
+        "--dag_unlock_warmup_evals",
+        type=int,
+        default=None,
+        help="Eval count to wait after a task unlocks before adjusting difficulty "
+        "(defaults to --curriculum_min_task_evals).",
+    )
     parser.add_argument("--mix_band_tokens", type=int, default=None,
                        help="Transition band (tokens) between algorithmic and language phases")
     parser.add_argument("--persistent_alg_frac", type=float, default=0.15,
