@@ -32,7 +32,7 @@ from functools import partial
 from multiprocessing import Manager, Value
 from pathlib import Path
 from contextlib import nullcontext
-from typing import Optional, Dict, List, Sequence, Any, Tuple
+from typing import Optional, Dict, List, Sequence, Any, Tuple, Set
 
 import numpy as np
 
@@ -43,7 +43,7 @@ import torch.nn as nn
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 
-from curriculum import TaskCurriculumState
+from curriculum import DagUnlockState, TaskCurriculumState
 from data import get_task_weight
 from utils import (
     DEFAULT_TOKENIZER_NAME,
@@ -1752,6 +1752,7 @@ def train(args):
     eval_difficulty_fn = None
     weighting_fn = None
     weighting_adjust_fn = None
+    dag_state = None
     if args.use_task_curriculum:
         difficulty_value = None
     elif not args.fixed_data and args.difficulty_schedule in {"linear", "phased", "fixed"}:
@@ -1788,6 +1789,48 @@ def train(args):
             min_task_evals=args.curriculum_min_task_evals,
         )
 
+        dag_gate_snapshot: Dict[str, float] = {}
+        dag_frontier_snapshot: Set[str] = set()
+        dag_replay_ratio_snapshot = 0.0
+        dag_unlocked_snapshot: Set[str] = set()
+        dag_prob_snapshot: Dict[str, float] = {}
+        dag_gated_weight_snapshot: Dict[str, float] = {}
+        dag_ema_snapshot: Dict[str, float] = {}
+
+        if args.task_curriculum_strategy == "dag":
+            dag_roots = ["successor", "copy", "reverse"]
+            dag_prereqs = {
+                "chain": ["copy"],
+                "parity": ["copy", "reverse"],
+                "addition": ["chain", "parity"],
+                "multiplication": ["addition", "chain"],
+                "mod_add": ["addition", "parity"],
+                "compare": ["addition"],
+                "dyck": ["copy", "reverse"],
+            }
+            dag_thresholds = {
+                "chain": {"copy": 0.99},
+                "parity": {"copy": 0.99, "reverse": 0.98},
+                "addition": {"chain": 0.95, "parity": 0.95},
+                "multiplication": {"addition": 0.97, "chain": 0.95},
+                "mod_add": {"addition": 0.97, "parity": 0.95},
+                "compare": {"addition": 0.97},
+                "dyck": {"copy": 0.99, "reverse": 0.98},
+            }
+            dag_state = DagUnlockState(
+                roots=dag_roots,
+                prereqs=dag_prereqs,
+                thresholds=dag_thresholds,
+                patience_evals=args.dag_patience_evals,
+                ramp_evals=args.dag_ramp_evals,
+                replay_ratio=args.dag_replay_ratio,
+                replay_ratio_backslide=args.dag_replay_ratio_backslide,
+                unlock_margin=args.dag_unlock_margin,
+                lock_margin=args.dag_lock_margin,
+                frontier_recent_evals=args.dag_frontier_recent_evals,
+                mastery_margin=args.dag_mastery_margin,
+            )
+
         difficulty_snapshot: Dict[str, float] = {}
         weights_snapshot: Dict[str, float] = {}
 
@@ -1797,6 +1840,13 @@ def train(args):
             weights_snapshot = task_curriculum.get_sampling_weights_snapshot()
 
         refresh_curriculum_snapshots()
+        if dag_state is not None:
+            dag_gate_snapshot = dag_state.get_gate_snapshot()
+            dag_frontier_snapshot = dag_state.compute_frontier({})
+            dag_replay_ratio_snapshot = dag_state.compute_replay_ratio({})
+            dag_unlocked_snapshot = {
+                task for task, gate in dag_gate_snapshot.items() if gate > 0.0
+            }
 
         def difficulty_fn(task: str) -> float:
             if args.easy_mix_frac > 0.0 and random.random() < args.easy_mix_frac:
@@ -1824,6 +1874,80 @@ def train(args):
             if mean_difficulty >= 0.2:
                 return weights
             return _apply_minimum_probability(weights, min_task_prob)
+
+        def _compute_dag_weighting(
+            tasks: Sequence[str], weights: Sequence[float]
+        ) -> Tuple[List[float], Dict[str, float], Dict[str, float]]:
+            if not tasks:
+                return [], {}, {}
+            gates = [dag_gate_snapshot.get(task, 0.0) for task in tasks]
+            unlocked = [idx for idx, gate in enumerate(gates) if gate > 0.0]
+            if not unlocked:
+                total = sum(weights)
+                probs = {
+                    task: (weight / total if total else 0.0)
+                    for task, weight in zip(tasks, weights)
+                }
+                return list(weights), probs, {task: weight for task, weight in zip(tasks, weights)}
+
+            gated_weights = [weight * gate for weight, gate in zip(weights, gates)]
+            total_gated = sum(gated_weights[idx] for idx in unlocked)
+            if total_gated <= 0.0:
+                for idx in unlocked:
+                    gated_weights[idx] = 1.0
+                total_gated = float(len(unlocked))
+
+            frontier_set = set(dag_frontier_snapshot)
+            frontier_indices = [
+                idx for idx, task in enumerate(tasks) if task in frontier_set and gates[idx] > 0.0
+            ]
+            replay_indices = [
+                idx for idx in unlocked if idx not in frontier_indices
+            ]
+
+            total_frontier = sum(gated_weights[idx] for idx in frontier_indices)
+            total_replay = sum(gated_weights[idx] for idx in replay_indices)
+
+            probs: List[float] = [0.0] * len(tasks)
+            replay_ratio = dag_replay_ratio_snapshot
+            if total_frontier > 0.0:
+                for idx in frontier_indices:
+                    probs[idx] += (1.0 - replay_ratio) * (gated_weights[idx] / total_frontier)
+            if total_replay > 0.0:
+                for idx in replay_indices:
+                    probs[idx] += replay_ratio * (gated_weights[idx] / total_replay)
+
+            if sum(probs) <= 0.0:
+                uniform = 1.0 / len(unlocked)
+                for idx in unlocked:
+                    probs[idx] = uniform
+
+            min_prob_unlocked_total = 0.02
+            floor_unlocked = min_prob_unlocked_total / len(unlocked)
+            for idx in unlocked:
+                probs[idx] = max(probs[idx], floor_unlocked)
+
+            min_prob_frontier_total = 0.03
+            if frontier_indices:
+                floor_frontier = min_prob_frontier_total / len(frontier_indices)
+                for idx in frontier_indices:
+                    probs[idx] = max(probs[idx], floor_frontier)
+
+            total = sum(probs)
+            if total <= 0.0:
+                uniform = 1.0 / len(unlocked)
+                for idx in unlocked:
+                    probs[idx] = uniform
+                total = 1.0
+            probs = [prob / total for prob in probs]
+            prob_map = {task: prob for task, prob in zip(tasks, probs)}
+            gated_map = {task: weight for task, weight in zip(tasks, gated_weights)}
+            return probs, prob_map, gated_map
+
+        if dag_state is not None:
+            def weighting_adjust_fn(tasks: Sequence[str], weights: List[float]) -> List[float]:
+                adjusted, _, _ = _compute_dag_weighting(tasks, weights)
+                return adjusted
 
     # Phase 1: Algorithmic
     if args.fixed_data:
@@ -2543,13 +2667,27 @@ def train(args):
                 task_metrics: Dict[str, float] = {}
                 active_tasks = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
                 progress_ratio = min(curriculum.tokens_seen / max(args.alg_tokens, 1), 1.0)
-                task_weights, task_probs = _compute_task_sampling(
-                    active_tasks, progress_ratio, args.task_weighting
-                )
-                for task, prob in task_probs.items():
-                    task_metrics[f"train.task_prob.{task}"] = prob
-                for task, weight in task_weights.items():
-                    task_metrics[f"train.task_weight.{task}"] = weight
+                if dag_state is not None:
+                    base_weights = [weights_snapshot.get(task, 1.0) for task in active_tasks]
+                    final_weights, final_probs, gated_weights = _compute_dag_weighting(
+                        active_tasks, base_weights
+                    )
+                    dag_prob_snapshot = dict(final_probs)
+                    dag_gated_weight_snapshot = dict(gated_weights)
+                    for task, prob in final_probs.items():
+                        task_metrics[f"train.task_prob.{task}"] = prob
+                    for task, weight in gated_weights.items():
+                        task_metrics[f"train.task_weight.{task}"] = weight
+                    for task, gate in dag_gate_snapshot.items():
+                        task_metrics[f"train.task_gate.{task}"] = gate
+                else:
+                    task_weights, task_probs = _compute_task_sampling(
+                        active_tasks, progress_ratio, args.task_weighting
+                    )
+                    for task, prob in task_probs.items():
+                        task_metrics[f"train.task_prob.{task}"] = prob
+                    for task, weight in task_weights.items():
+                        task_metrics[f"train.task_weight.{task}"] = weight
                 for task, count in task_window_counts.items():
                     task_metrics[f"train.task_count_window.{task}"] = float(count)
                     if count > 0:
@@ -2614,15 +2752,37 @@ def train(args):
                     )
                 active_tasks = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
                 progress_ratio = min(curriculum.tokens_seen / max(args.alg_tokens, 1), 1.0)
-                eval_task_weights, eval_task_probs = _compute_task_sampling(
-                    active_tasks, progress_ratio, args.task_weighting
-                )
-                eval_task_metrics = {
-                    f"eval.task_prob.{task}": prob for task, prob in eval_task_probs.items()
-                }
-                eval_task_metrics.update(
-                    {f"eval.task_weight.{task}": weight for task, weight in eval_task_weights.items()}
-                )
+                if dag_state is not None:
+                    base_weights = [weights_snapshot.get(task, 1.0) for task in active_tasks]
+                    _, eval_task_probs, eval_gated_weights = _compute_dag_weighting(
+                        active_tasks, base_weights
+                    )
+                    eval_task_metrics = {
+                        f"eval.task_prob.{task}": prob
+                        for task, prob in eval_task_probs.items()
+                    }
+                    eval_task_metrics.update(
+                        {
+                            f"eval.task_weight.{task}": weight
+                            for task, weight in eval_gated_weights.items()
+                        }
+                    )
+                    eval_task_metrics.update(
+                        {f"eval.task_gate.{task}": gate for task, gate in dag_gate_snapshot.items()}
+                    )
+                else:
+                    eval_task_weights, eval_task_probs = _compute_task_sampling(
+                        active_tasks, progress_ratio, args.task_weighting
+                    )
+                    eval_task_metrics = {
+                        f"eval.task_prob.{task}": prob for task, prob in eval_task_probs.items()
+                    }
+                    eval_task_metrics.update(
+                        {
+                            f"eval.task_weight.{task}": weight
+                            for task, weight in eval_task_weights.items()
+                        }
+                    )
                 with torch.no_grad():
                     params = [
                         param.detach().view(-1)
@@ -3020,6 +3180,38 @@ def train(args):
                                 f"{task}: d={state['difficulty']:.2f} "
                                 f"ema={state['ema_acc']:.2f}"
                             )
+                        if dag_state is not None:
+                            ema_snapshot = {
+                                task: task_curriculum.get_task_state(task)["ema_acc"]
+                                for task in task_eval.get("per_task_accuracy", {})
+                            }
+                            dag_state.update_from_ema(ema_snapshot)
+                            dag_gate_snapshot = dag_state.get_gate_snapshot()
+                            dag_frontier_snapshot = dag_state.compute_frontier(ema_snapshot)
+                            dag_replay_ratio_snapshot = dag_state.compute_replay_ratio(
+                                ema_snapshot
+                            )
+                            dag_unlocked_snapshot = {
+                                task for task, gate in dag_gate_snapshot.items() if gate > 0.0
+                            }
+                            dag_ema_snapshot = dict(ema_snapshot)
+                            dag_metrics = {
+                                f"curriculum.gate.{task}": gate
+                                for task, gate in dag_gate_snapshot.items()
+                            }
+                            dag_metrics["curriculum.dag_paused"] = (
+                                1.0 if dag_state.paused else 0.0
+                            )
+                            dag_metrics["curriculum.dag_frontier_size"] = float(
+                                len(dag_frontier_snapshot)
+                            )
+                            dag_metrics["curriculum.dag_unlocked_size"] = float(
+                                len(dag_unlocked_snapshot)
+                            )
+                            dag_metrics["curriculum.dag_replay_ratio"] = (
+                                dag_replay_ratio_snapshot
+                            )
+                            curriculum_metrics.update(dag_metrics)
                         if curriculum_metrics:
                             logger.log(step=global_step, phase="eval", **curriculum_metrics)
                             log_print("  Curriculum: " + " | ".join(sorted(curriculum_log_lines)))
@@ -3250,6 +3442,13 @@ def main():
         help="Enable per-task competence curriculum for algorithmic data",
     )
     parser.add_argument(
+        "--task_curriculum_strategy",
+        type=str,
+        default="adaptive",
+        choices=["adaptive", "dag"],
+        help="Task-level curriculum strategy: adaptive (current) or dag (staged unlock + replay).",
+    )
+    parser.add_argument(
         "--curriculum_cooldown",
         type=int,
         default=500,
@@ -3267,6 +3466,14 @@ def main():
         default=0.1,
         help="Probability of replaying easier samples per task",
     )
+    parser.add_argument("--dag_patience_evals", type=int, default=4)
+    parser.add_argument("--dag_ramp_evals", type=int, default=3)
+    parser.add_argument("--dag_replay_ratio", type=float, default=0.20)
+    parser.add_argument("--dag_replay_ratio_backslide", type=float, default=0.35)
+    parser.add_argument("--dag_unlock_margin", type=float, default=0.01)
+    parser.add_argument("--dag_lock_margin", type=float, default=0.03)
+    parser.add_argument("--dag_frontier_recent_evals", type=int, default=4)
+    parser.add_argument("--dag_mastery_margin", type=float, default=0.02)
     parser.add_argument("--mix_band_tokens", type=int, default=None,
                        help="Transition band (tokens) between algorithmic and language phases")
     parser.add_argument("--persistent_alg_frac", type=float, default=0.15,

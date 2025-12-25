@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Sequence, Set
 
 
 class TaskCurriculumState:
@@ -186,3 +186,141 @@ class TaskCurriculumState:
         if not values:
             return 0.0
         return sum(values) / len(values)
+
+
+class DagUnlockState:
+    """Track DAG-based staged unlock state using EMA accuracy thresholds."""
+
+    def __init__(
+        self,
+        *,
+        roots: Sequence[str],
+        prereqs: Dict[str, Sequence[str]],
+        thresholds: Dict[str, Dict[str, float]],
+        patience_evals: int = 4,
+        ramp_evals: int = 3,
+        replay_ratio: float = 0.2,
+        replay_ratio_backslide: float = 0.35,
+        unlock_margin: float = 0.01,
+        lock_margin: float = 0.03,
+        frontier_recent_evals: int = 4,
+        mastery_margin: float = 0.02,
+        mastery_baseline: float = 0.99,
+    ) -> None:
+        self.roots = set(roots)
+        self.prereqs = {task: list(reqs) for task, reqs in prereqs.items()}
+        self.thresholds = {task: dict(values) for task, values in thresholds.items()}
+        self.patience_evals = max(int(patience_evals), 1)
+        self.ramp_evals = max(int(ramp_evals), 1)
+        self.replay_ratio = float(replay_ratio)
+        self.replay_ratio_backslide = float(replay_ratio_backslide)
+        self.unlock_margin = float(unlock_margin)
+        self.lock_margin = float(lock_margin)
+        self.frontier_recent_evals = max(int(frontier_recent_evals), 1)
+        self.mastery_margin = float(mastery_margin)
+        self.mastery_baseline = float(mastery_baseline)
+        self.eval_index = 0
+        self.paused = False
+        self._backslide = False
+
+        tasks: Set[str] = set(self.roots)
+        tasks.update(self.prereqs.keys())
+        for reqs in self.prereqs.values():
+            tasks.update(reqs)
+        tasks.update(self.thresholds.keys())
+        self.tasks = sorted(tasks)
+
+        self.gate: Dict[str, float] = {task: 0.0 for task in self.tasks}
+        self.streak: Dict[str, int] = {task: 0 for task in self.tasks}
+        self.unlocked_eval_index: Dict[str, int] = {}
+        for root in self.roots:
+            self.gate[root] = 1.0
+            self.unlocked_eval_index[root] = 0
+
+    def _prereqs_satisfied(self, task: str, ema_acc: Dict[str, float]) -> bool:
+        thresholds = self.thresholds.get(task, {})
+        if not thresholds:
+            return False
+        for prereq, minimum in thresholds.items():
+            score = ema_acc.get(prereq, 0.0)
+            if score < minimum - self.unlock_margin:
+                return False
+        return True
+
+    def update_from_ema(self, ema_acc: Dict[str, float]) -> None:
+        self.eval_index += 1
+        for root in self.roots:
+            self.gate[root] = 1.0
+            self.unlocked_eval_index.setdefault(root, 0)
+
+        self._backslide = False
+        for task, gate in self.gate.items():
+            if gate <= 0.0:
+                continue
+            thresholds = self.thresholds.get(task, {})
+            for prereq, minimum in thresholds.items():
+                score = ema_acc.get(prereq, 0.0)
+                if score < minimum - self.lock_margin:
+                    self._backslide = True
+                    break
+            if self._backslide:
+                break
+
+        self.paused = self._backslide
+        newly_unlocked: Set[str] = set()
+
+        if not self.paused:
+            for task in self.tasks:
+                if task in self.roots:
+                    continue
+                if self.gate.get(task, 0.0) > 0.0:
+                    continue
+                if self._prereqs_satisfied(task, ema_acc):
+                    self.streak[task] = self.streak.get(task, 0) + 1
+                else:
+                    self.streak[task] = 0
+                if self.streak[task] >= self.patience_evals:
+                    initial_gate = 1.0 if self.ramp_evals <= 1 else 1.0 / self.ramp_evals
+                    self.gate[task] = initial_gate
+                    self.unlocked_eval_index.setdefault(task, self.eval_index)
+                    newly_unlocked.add(task)
+
+            if self.ramp_evals > 1:
+                ramp = 1.0 / self.ramp_evals
+                for task, gate in list(self.gate.items()):
+                    if task in newly_unlocked or task in self.roots:
+                        continue
+                    if 0.0 < gate < 1.0:
+                        self.gate[task] = min(1.0, gate + ramp)
+
+    def get_gate(self, task: str) -> float:
+        return float(self.gate.get(task, 0.0))
+
+    def get_gate_snapshot(self) -> Dict[str, float]:
+        return {task: float(value) for task, value in self.gate.items()}
+
+    def is_unlocked(self, task: str) -> bool:
+        return self.get_gate(task) > 0.0
+
+    def compute_frontier(self, ema_acc: Dict[str, float]) -> Set[str]:
+        frontier: Set[str] = set()
+        for task, gate in self.gate.items():
+            if gate <= 0.0:
+                continue
+            unlocked_index = self.unlocked_eval_index.get(task)
+            if unlocked_index is None:
+                continue
+            if self.eval_index - unlocked_index <= self.frontier_recent_evals:
+                frontier.add(task)
+                for prereq in self.prereqs.get(task, []):
+                    threshold = self.thresholds.get(task, {}).get(
+                        prereq, self.mastery_baseline
+                    )
+                    if ema_acc.get(prereq, 0.0) < threshold + self.mastery_margin:
+                        frontier.add(prereq)
+        return frontier
+
+    def compute_replay_ratio(self, ema_acc: Dict[str, float]) -> float:
+        if self.paused or self._backslide:
+            return self.replay_ratio_backslide
+        return self.replay_ratio
