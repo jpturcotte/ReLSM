@@ -50,7 +50,7 @@ def test_dag_unlock_and_ramp():
     assert state.get_gate("successor") == pytest.approx(1.0)
     assert state.get_gate("chain") == pytest.approx(0.0)
 
-    ema = {"copy": 0.99, "reverse": 0.98}
+    ema = {"copy": 1.0, "reverse": 0.99}
     for _ in range(3):
         state.update_from_ema(ema)
         assert state.get_gate("chain") == pytest.approx(0.0)
@@ -73,11 +73,11 @@ def test_dag_unlock_and_ramp():
 
 def test_dag_unlock_addition_and_backslide():
     state = _make_state()
-    ema = {"copy": 0.99, "reverse": 0.98}
+    ema = {"copy": 1.0, "reverse": 0.99}
     for _ in range(6):
         state.update_from_ema(ema)
 
-    ema_add = {"chain": 0.95, "parity": 0.95, "copy": 0.99, "reverse": 0.98}
+    ema_add = {"chain": 0.96, "parity": 0.96, "copy": 1.0, "reverse": 0.99}
     for _ in range(4):
         state.update_from_ema(ema_add)
 
@@ -89,8 +89,8 @@ def test_dag_unlock_addition_and_backslide():
         "chain": 0.95,
         "parity": 0.90,
         "addition": 0.97,
-        "copy": 0.99,
-        "reverse": 0.98,
+        "copy": 1.0,
+        "reverse": 0.99,
     }
     state.update_from_ema(ema_backslide)
     assert state.paused is True

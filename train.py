@@ -1910,6 +1910,10 @@ def train(args):
 
             probs: List[float] = [0.0] * len(tasks)
             replay_ratio = dag_replay_ratio_snapshot
+            if not frontier_indices:
+                replay_ratio = 1.0
+            elif not replay_indices:
+                replay_ratio = 0.0
             if total_frontier > 0.0:
                 for idx in frontier_indices:
                     probs[idx] += (1.0 - replay_ratio) * (gated_weights[idx] / total_frontier)
@@ -3183,7 +3187,7 @@ def train(args):
                         if dag_state is not None:
                             ema_snapshot = {
                                 task: task_curriculum.get_task_state(task)["ema_acc"]
-                                for task in task_eval.get("per_task_accuracy", {})
+                                for task in dag_state.tasks
                             }
                             dag_state.update_from_ema(ema_snapshot)
                             dag_gate_snapshot = dag_state.get_gate_snapshot()
