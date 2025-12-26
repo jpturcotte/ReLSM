@@ -44,7 +44,7 @@ from torch.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 
 from curriculum import DagUnlockState, TaskCurriculumState
-from data import get_task_weight
+from data import get_task_weight, make_collate_fn
 from utils import (
     DEFAULT_TOKENIZER_NAME,
     aggregate,
@@ -1715,9 +1715,22 @@ def train(args):
     # Optimize model execution
     if args.compile and hasattr(torch, "compile"):
         log_print("Compiling model with torch.compile...")
+        if not args.compile_dynamic:
+            log_print(
+                "Warning: dynamic padding enables variable sequence lengths; "
+                "torch.compile may recompile on shape changes. Consider "
+                "--compile_dynamic or disabling --compile if you see stalls."
+            )
         # 'reduce-overhead' is excellent for smaller models or CPU training
-        # If this errors on your setup, try mode="default"
-        model = torch.compile(model, mode="reduce-overhead")
+        # If this errors on your setup, try mode='default'
+        compile_kwargs = {"mode": "reduce-overhead"}
+        if args.compile_dynamic:
+            compile_kwargs["dynamic"] = True
+        try:
+            model = torch.compile(model, **compile_kwargs)
+        except TypeError:
+            compile_kwargs.pop("dynamic", None)
+            model = torch.compile(model, **compile_kwargs)
 
     config = model.config
 
@@ -1962,10 +1975,12 @@ def train(args):
             gated_map = {task: weight for task, weight in zip(tasks, gated_weights)}
             return probs, prob_map, gated_map
 
-        if dag_state is not None:
-            def weighting_adjust_fn(tasks: Sequence[str], weights: List[float]) -> List[float]:
-                adjusted, _, _ = _compute_dag_weighting(tasks, weights)
-                return adjusted
+    if dag_state is not None:
+        def weighting_adjust_fn(tasks: Sequence[str], weights: List[float]) -> List[float]:
+            adjusted, _, _ = _compute_dag_weighting(tasks, weights)
+            return adjusted
+
+    collate_fn = make_collate_fn(tokenizer)
 
     # Phase 1: Algorithmic
     if args.fixed_data:
@@ -1988,6 +2003,7 @@ def train(args):
             shuffle=True,  # reshuffle fixed set each epoch to avoid ordering artifacts
             num_workers=args.num_workers,
             pin_memory=True,
+            collate_fn=collate_fn,
         )
     else:
         alg_dataset = AlgorithmicDataset(
@@ -2013,6 +2029,7 @@ def train(args):
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,
+            collate_fn=collate_fn,
         )
     
     # Phase 2: Language (only load if we'll use it)
@@ -2027,6 +2044,7 @@ def train(args):
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,
+            collate_fn=collate_fn,
         )
     else:
         lang_loader = alg_loader  # Fallback
@@ -2087,6 +2105,7 @@ def train(args):
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,
+            collate_fn=collate_fn,
         )
 
     # Fixed probe batch for eval-only diagnostics
@@ -2111,6 +2130,7 @@ def train(args):
         shuffle=False,
         num_workers=0,
         pin_memory=False,
+        collate_fn=collate_fn,
     )
     probe_batch = next(iter(probe_loader))
     
@@ -3707,6 +3727,11 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (recommended for Linux only)")
+    parser.add_argument(
+        "--compile_dynamic",
+        action="store_true",
+        help="Enable dynamic shapes for torch.compile when batches vary in length.",
+    )
 
     args = parser.parse_args()
 
