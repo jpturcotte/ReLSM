@@ -20,10 +20,12 @@ Also includes:
 
 import random
 import math
+from functools import partial
 from typing import List, Dict, Optional, Tuple, Iterator, Callable, Iterable, Union, Sequence
 from dataclasses import dataclass
 import torch
 from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
+from torch.nn.utils.rnn import pad_sequence
 
 
 # =============================================================================
@@ -1073,17 +1075,8 @@ class AlgorithmicDataset(IterableDataset):
             prompt_len = min(prompt_len, len(tokens))
 
             input_ids = torch.tensor(tokens, dtype=torch.long)
-            pad_len = self.max_seq_len - len(input_ids)
-            pad_id = self.tokenizer.pad_token_id or 0
-            if pad_len > 0:
-                input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
-
-            attention_mask = torch.ones_like(input_ids)
-            if pad_len > 0:
-                attention_mask[-pad_len:] = 0
 
             labels = input_ids.clone()
-            labels = labels.masked_fill(attention_mask == 0, -100)
             if prompt_len > 0:
                 labels[:prompt_len] = -100
 
@@ -1221,17 +1214,8 @@ class FixedAlgorithmicDataset(Dataset):
             prompt_len = min(prompt_len, len(tokens))
 
             input_ids = torch.tensor(tokens, dtype=torch.long)
-            pad_len = self.max_seq_len - len(input_ids)
-            pad_id = self.tokenizer.pad_token_id or 0
-            if pad_len > 0:
-                input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
-
-            attention_mask = torch.ones_like(input_ids)
-            if pad_len > 0:
-                attention_mask[-pad_len:] = 0
 
             labels = input_ids.clone()
-            labels = labels.masked_fill(attention_mask == 0, -100)
             if prompt_len > 0:
                 labels[:prompt_len] = -100
 
@@ -1539,19 +1523,51 @@ class LanguageDataset(IterableDataset):
                 tokens = tokens[:self.max_seq_len]
 
             input_ids = torch.tensor(tokens, dtype=torch.long)
-            pad_len = self.max_seq_len - len(input_ids)
-            pad_id = self.tokenizer.pad_token_id or 0
-            if pad_len > 0:
-                input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id)])
-
-            attention_mask = torch.ones_like(input_ids)
-            if pad_len > 0:
-                attention_mask[-pad_len:] = 0
 
             labels = input_ids.clone()
-            labels = labels.masked_fill(attention_mask == 0, -100)
 
             yield {"input_ids": input_ids, "labels": labels}
+
+
+def _collate_with_padding(
+    examples: Sequence[Dict[str, torch.Tensor]],
+    *,
+    pad_id: int,
+    label_pad_id: int = -100,
+) -> Dict[str, torch.Tensor]:
+    input_ids = pad_sequence(
+        [ex["input_ids"] for ex in examples],
+        batch_first=True,
+        padding_value=pad_id,
+    )
+    labels = pad_sequence(
+        [ex["labels"] for ex in examples],
+        batch_first=True,
+        padding_value=label_pad_id,
+    )
+    batch: Dict[str, torch.Tensor] = {"input_ids": input_ids, "labels": labels}
+
+    for key in examples[0]:
+        if key in {"input_ids", "labels"}:
+            continue
+        values = [ex[key] for ex in examples]
+        first = values[0]
+        if torch.is_tensor(first):
+            try:
+                batch[key] = torch.stack(values)
+            except RuntimeError:
+                batch[key] = values
+        elif isinstance(first, (int, float, bool)):
+            batch[key] = torch.tensor(values)
+        else:
+            batch[key] = values
+
+    return batch
+
+
+def make_collate_fn(tokenizer) -> Callable[[Sequence[Dict[str, torch.Tensor]]], Dict[str, torch.Tensor]]:
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    return partial(_collate_with_padding, pad_id=pad_id)
 
 
 # =============================================================================
@@ -1797,21 +1813,24 @@ def create_curriculum_loaders(
         tokenizer=tokenizer,
         max_seq_len=lang_seq_len,
     )
-    
+
+    collate_fn = make_collate_fn(tokenizer)
     alg_loader = DataLoader(
         alg_dataset,
         batch_size=alg_batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=collate_fn,
     )
-    
+
     lang_loader = DataLoader(
         lang_dataset,
         batch_size=lang_batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=collate_fn,
     )
     
     return alg_loader, lang_loader
