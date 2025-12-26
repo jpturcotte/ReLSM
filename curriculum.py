@@ -237,6 +237,85 @@ class DagUnlockState:
             self.gate[root] = 1.0
             self.unlocked_eval_index[root] = 0
 
+    def state_dict(self) -> Dict[str, object]:
+        return {
+            "roots": list(self.roots),
+            "prereqs": {task: list(reqs) for task, reqs in self.prereqs.items()},
+            "thresholds": {task: dict(values) for task, values in self.thresholds.items()},
+            "patience_evals": int(self.patience_evals),
+            "ramp_evals": int(self.ramp_evals),
+            "replay_ratio": float(self.replay_ratio),
+            "replay_ratio_backslide": float(self.replay_ratio_backslide),
+            "unlock_margin": float(self.unlock_margin),
+            "lock_margin": float(self.lock_margin),
+            "frontier_recent_evals": int(self.frontier_recent_evals),
+            "mastery_margin": float(self.mastery_margin),
+            "mastery_baseline": float(self.mastery_baseline),
+            "eval_index": int(self.eval_index),
+            "paused": bool(self.paused),
+            "backslide": bool(self._backslide),
+            "gate": {task: float(value) for task, value in self.gate.items()},
+            "streak": {task: int(value) for task, value in self.streak.items()},
+            "unlocked_eval_index": {
+                task: int(value) for task, value in self.unlocked_eval_index.items()
+            },
+        }
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        if not state:
+            return
+        if "roots" in state:
+            self.roots = set(state["roots"])
+        if "prereqs" in state:
+            self.prereqs = {
+                task: list(reqs) for task, reqs in state["prereqs"].items()
+            }
+        if "thresholds" in state:
+            self.thresholds = {
+                task: dict(values) for task, values in state["thresholds"].items()
+            }
+        if "patience_evals" in state:
+            self.patience_evals = max(int(state["patience_evals"]), 1)
+        if "ramp_evals" in state:
+            self.ramp_evals = max(int(state["ramp_evals"]), 1)
+        if "replay_ratio" in state:
+            self.replay_ratio = float(state["replay_ratio"])
+        if "replay_ratio_backslide" in state:
+            self.replay_ratio_backslide = float(state["replay_ratio_backslide"])
+        if "unlock_margin" in state:
+            self.unlock_margin = float(state["unlock_margin"])
+        if "lock_margin" in state:
+            self.lock_margin = float(state["lock_margin"])
+        if "frontier_recent_evals" in state:
+            self.frontier_recent_evals = max(int(state["frontier_recent_evals"]), 1)
+        if "mastery_margin" in state:
+            self.mastery_margin = float(state["mastery_margin"])
+        if "mastery_baseline" in state:
+            self.mastery_baseline = float(state["mastery_baseline"])
+        if "eval_index" in state:
+            self.eval_index = int(state["eval_index"])
+        if "paused" in state:
+            self.paused = bool(state["paused"])
+        if "backslide" in state:
+            self._backslide = bool(state["backslide"])
+
+        tasks: Set[str] = set(self.roots)
+        tasks.update(self.prereqs.keys())
+        for reqs in self.prereqs.values():
+            tasks.update(reqs)
+        tasks.update(self.thresholds.keys())
+        self.tasks = sorted(tasks)
+
+        if "gate" in state:
+            self.gate = {task: float(value) for task, value in state["gate"].items()}
+        if "streak" in state:
+            self.streak = {task: int(value) for task, value in state["streak"].items()}
+        if "unlocked_eval_index" in state:
+            self.unlocked_eval_index = {
+                task: int(value)
+                for task, value in state["unlocked_eval_index"].items()
+            }
+
     def _prereqs_satisfied(self, task: str, ema_acc: Dict[str, float]) -> bool:
         thresholds = self.thresholds.get(task, {})
         if not thresholds:

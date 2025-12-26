@@ -2242,6 +2242,8 @@ def train(args):
         }
         if task_curriculum is not None:
             payload["curriculum_state"] = task_curriculum.state_dict()
+        if dag_state is not None:
+            payload["dag_state"] = dag_state.state_dict()
         return payload
 
     def save_rotating_checkpoint(step: int, tokens_seen: int, tag: Optional[str] = None) -> Optional[Path]:
@@ -2292,6 +2294,8 @@ def train(args):
             task_curriculum.load_state_dict(checkpoint["curriculum_state"])
         if checkpoint.get("task_curriculum_config"):
             _apply_task_curriculum_config(checkpoint["task_curriculum_config"])
+        if dag_state is not None and checkpoint.get("dag_state"):
+            dag_state.load_state_dict(checkpoint["dag_state"])
         if checkpoint.get("curriculum_rng_state") is not None:
             curriculum.rng.setstate(checkpoint["curriculum_rng_state"])
         resume_tokens = int(checkpoint.get("tokens_seen", 0))
