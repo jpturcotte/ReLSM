@@ -95,3 +95,24 @@ def test_dag_unlock_addition_and_backslide():
     state.update_from_ema(ema_backslide)
     assert state.paused is True
     assert state.compute_replay_ratio(ema_backslide) == pytest.approx(0.35)
+
+
+def test_dag_unlock_state_roundtrip():
+    state = _make_state()
+    ema = {"copy": 1.0, "reverse": 0.99}
+    for _ in range(5):
+        state.update_from_ema(ema)
+
+    ema_add = {"chain": 0.96, "parity": 0.96, "copy": 1.0, "reverse": 0.99}
+    for _ in range(4):
+        state.update_from_ema(ema_add)
+
+    payload = state.state_dict()
+    restored = _make_state()
+    restored.load_state_dict(payload)
+
+    assert restored.eval_index == state.eval_index
+    assert restored.paused == state.paused
+    assert restored.get_gate_snapshot() == state.get_gate_snapshot()
+    assert restored.streak == state.streak
+    assert restored.unlocked_eval_index == state.unlocked_eval_index
