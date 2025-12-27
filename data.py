@@ -720,6 +720,7 @@ class AlgorithmicGenerator:
         allow_negative: Optional[bool] = None,
         length_range: Optional[Tuple[int, int]] = None,
         digits: Optional[int] = None,
+        digit_range: Optional[Tuple[int, int]] = None,
     ) -> Dict[str, str]:
         """Carry propagation chains for long-range state maintenance."""
         rng = rng or random
@@ -735,20 +736,22 @@ class AlgorithmicGenerator:
         ops = max(1, n_ops if n_ops is not None else sampled_ops)
 
         if bucket == "easy":
-            digit_range = (2, 3)
+            default_digit_range = (2, 3)
             suffix_range = (1, 2)
             small_max = 3
             one_prob = 0.8
         elif bucket == "medium":
-            digit_range = (3, 5)
+            default_digit_range = (3, 5)
             suffix_range = (2, 3)
             small_max = 5
             one_prob = 0.7
         else:
-            digit_range = (5, 8)
+            default_digit_range = (5, 8)
             suffix_range = (3, 5)
             small_max = 9
             one_prob = 0.6
+
+        active_digit_range = digit_range if digit_range is not None else default_digit_range
 
         if operand_high is not None:
             small_max = max(2, operand_high)
@@ -756,7 +759,7 @@ class AlgorithmicGenerator:
             allow_negative = False
 
         if digits is None:
-            total_digits = rng.randint(digit_range[0], digit_range[1])
+            total_digits = rng.randint(active_digit_range[0], active_digit_range[1])
         else:
             total_digits = max(1, digits)
         max_suffix = min(total_digits, suffix_range[1])
