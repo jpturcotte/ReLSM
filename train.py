@@ -1811,24 +1811,24 @@ def train(args):
         dag_ema_snapshot: Dict[str, float] = {}
 
         if args.task_curriculum_strategy == "dag":
-            dag_roots = ["successor", "copy", "reverse"]
+            dag_roots = ["copy", "reverse", "compare"]
             dag_prereqs = {
-                "chain": ["copy"],
+                "successor": ["copy", "reverse", "compare"],
                 "parity": ["copy", "reverse"],
+                "chain": ["successor"],
                 "addition": ["chain", "parity"],
-                "multiplication": ["addition", "chain"],
-                "mod_add": ["addition", "parity"],
-                "compare": ["addition"],
-                "dyck": ["copy", "reverse"],
+                "mod_add": ["addition"],
+                "multiplication": ["addition", "reverse"],
+                "dyck": ["multiplication"],
             }
             dag_thresholds = {
-                "chain": {"copy": 0.99},
+                "successor": {"copy": 0.99, "reverse": 0.98, "compare": 0.98},
                 "parity": {"copy": 0.99, "reverse": 0.98},
+                "chain": {"successor": 0.99},
                 "addition": {"chain": 0.95, "parity": 0.95},
-                "multiplication": {"addition": 0.97, "chain": 0.95},
-                "mod_add": {"addition": 0.97, "parity": 0.95},
-                "compare": {"addition": 0.97},
-                "dyck": {"copy": 0.99, "reverse": 0.98},
+                "mod_add": {"addition": 0.97},
+                "multiplication": {"addition": 0.97, "reverse": 0.98},
+                "dyck": {"multiplication": 0.97},
             }
             dag_state = DagUnlockState(
                 roots=dag_roots,

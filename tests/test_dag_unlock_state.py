@@ -9,24 +9,24 @@ from curriculum import DagUnlockState
 
 
 def _make_state():
-    dag_roots = ["successor", "copy", "reverse"]
+    dag_roots = ["copy", "reverse", "compare"]
     dag_prereqs = {
-        "chain": ["copy"],
+        "successor": ["copy", "reverse", "compare"],
         "parity": ["copy", "reverse"],
+        "chain": ["successor"],
         "addition": ["chain", "parity"],
-        "multiplication": ["addition", "chain"],
-        "mod_add": ["addition", "parity"],
-        "compare": ["addition"],
-        "dyck": ["copy", "reverse"],
+        "mod_add": ["addition"],
+        "multiplication": ["addition", "reverse"],
+        "dyck": ["multiplication"],
     }
     dag_thresholds = {
-        "chain": {"copy": 0.99},
+        "successor": {"copy": 0.99, "reverse": 0.98, "compare": 0.98},
         "parity": {"copy": 0.99, "reverse": 0.98},
+        "chain": {"successor": 0.99},
         "addition": {"chain": 0.95, "parity": 0.95},
-        "multiplication": {"addition": 0.97, "chain": 0.95},
-        "mod_add": {"addition": 0.97, "parity": 0.95},
-        "compare": {"addition": 0.97},
-        "dyck": {"copy": 0.99, "reverse": 0.98},
+        "mod_add": {"addition": 0.97},
+        "multiplication": {"addition": 0.97, "reverse": 0.98},
+        "dyck": {"multiplication": 0.97},
     }
     return DagUnlockState(
         roots=dag_roots,
@@ -47,37 +47,61 @@ def test_dag_unlock_and_ramp():
     state = _make_state()
     assert state.get_gate("copy") == pytest.approx(1.0)
     assert state.get_gate("reverse") == pytest.approx(1.0)
-    assert state.get_gate("successor") == pytest.approx(1.0)
+    assert state.get_gate("compare") == pytest.approx(1.0)
+    assert state.get_gate("successor") == pytest.approx(0.0)
     assert state.get_gate("chain") == pytest.approx(0.0)
 
-    ema = {"copy": 1.0, "reverse": 0.99}
+    ema = {"copy": 1.0, "reverse": 0.99, "compare": 0.99}
     for _ in range(3):
         state.update_from_ema(ema)
-        assert state.get_gate("chain") == pytest.approx(0.0)
+        assert state.get_gate("successor") == pytest.approx(0.0)
 
     state.update_from_ema(ema)
-    chain_gate = state.get_gate("chain")
-    assert 0.0 < chain_gate < 1.0
+    successor_gate = state.get_gate("successor")
+    assert 0.0 < successor_gate < 1.0
 
     frontier = state.compute_frontier(ema)
-    assert "chain" in frontier
+    assert "successor" in frontier
     assert "copy" in frontier
 
     state.update_from_ema(ema)
-    assert state.get_gate("chain") == pytest.approx(chain_gate + 1.0 / 3.0)
+    assert state.get_gate("successor") == pytest.approx(successor_gate + 1.0 / 3.0)
 
     state.update_from_ema(ema)
-    assert state.get_gate("chain") == pytest.approx(1.0)
+    state.update_from_ema(ema)
+    assert state.get_gate("successor") == pytest.approx(1.0)
+
+    ema_chain = {"copy": 1.0, "reverse": 0.99, "compare": 0.99, "successor": 0.99}
+    for _ in range(4):
+        state.update_from_ema(ema_chain)
+
+    assert state.get_gate("chain") > 0.0
     assert state.get_gate("parity") > 0.0
 
 
 def test_dag_unlock_addition_and_backslide():
     state = _make_state()
-    ema = {"copy": 1.0, "reverse": 0.99}
+    ema_roots = {"copy": 1.0, "reverse": 0.99, "compare": 0.99}
     for _ in range(6):
-        state.update_from_ema(ema)
+        state.update_from_ema(ema_roots)
 
-    ema_add = {"chain": 0.96, "parity": 0.96, "copy": 1.0, "reverse": 0.99}
+    ema_chain = {
+        "successor": 0.99,
+        "copy": 1.0,
+        "reverse": 0.99,
+        "compare": 0.99,
+    }
+    for _ in range(4):
+        state.update_from_ema(ema_chain)
+
+    ema_add = {
+        "chain": 0.96,
+        "parity": 0.96,
+        "successor": 0.99,
+        "copy": 1.0,
+        "reverse": 0.99,
+        "compare": 0.99,
+    }
     for _ in range(4):
         state.update_from_ema(ema_add)
 
@@ -89,8 +113,10 @@ def test_dag_unlock_addition_and_backslide():
         "chain": 0.95,
         "parity": 0.90,
         "addition": 0.97,
+        "successor": 0.99,
         "copy": 1.0,
         "reverse": 0.99,
+        "compare": 0.99,
     }
     state.update_from_ema(ema_backslide)
     assert state.paused is True
@@ -99,11 +125,27 @@ def test_dag_unlock_addition_and_backslide():
 
 def test_dag_unlock_state_roundtrip():
     state = _make_state()
-    ema = {"copy": 1.0, "reverse": 0.99}
+    ema_roots = {"copy": 1.0, "reverse": 0.99, "compare": 0.99}
     for _ in range(5):
-        state.update_from_ema(ema)
+        state.update_from_ema(ema_roots)
 
-    ema_add = {"chain": 0.96, "parity": 0.96, "copy": 1.0, "reverse": 0.99}
+    ema_chain = {
+        "successor": 0.99,
+        "copy": 1.0,
+        "reverse": 0.99,
+        "compare": 0.99,
+    }
+    for _ in range(4):
+        state.update_from_ema(ema_chain)
+
+    ema_add = {
+        "chain": 0.96,
+        "parity": 0.96,
+        "successor": 0.99,
+        "copy": 1.0,
+        "reverse": 0.99,
+        "compare": 0.99,
+    }
     for _ in range(4):
         state.update_from_ema(ema_add)
 

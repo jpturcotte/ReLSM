@@ -126,13 +126,13 @@ TASK_DIFFICULTY_CONFIG = {
     },
     "chain": {
         "phases": [
-            (0.00, 0.20, {"length_range": (2, 3)}),
-            (0.20, 0.60, {"length_range": (2, 4)}),
-            (0.60, 0.90, {"length_range": (2, 5)}),
-            (0.90, 1.00, {"length_range": (4, 5)}),
+            (0.00, 0.20, {"length_range": (1, 2), "digit_range": (2, 4)}),
+            (0.20, 0.50, {"length_range": (2, 3), "digit_range": (4, 12)}),
+            (0.50, 0.80, {"length_range": (3, 5), "digit_range": (12, 24)}),
+            (0.80, 1.00, {"length_range": (5, 8), "digit_range": (24, 32)}),
         ],
-        "train_max": 5,
-        "ood_start": 6,
+        "train_max": 8,
+        "ood_start": 9,
     },
     "compare": {
         "phases": [
@@ -719,63 +719,75 @@ class AlgorithmicGenerator:
         operand_high: Optional[int] = None,
         allow_negative: Optional[bool] = None,
         length_range: Optional[Tuple[int, int]] = None,
+        digits: Optional[int] = None,
     ) -> Dict[str, str]:
-        """Chain of arithmetic operations"""
+        """Carry propagation chains for long-range state maintenance."""
         rng = rng or random
         default_range = AlgorithmicGenerator._length_range(
             difficulty,
-            easy=(2, 3),
-            medium=(3, 5),
-            hard=(5, 8),
+            easy=(1, 2),
+            medium=(2, 4),
+            hard=(3, 6),
         )
-        op_counts = length_range if length_range is not None else default_range
         bucket = AlgorithmicGenerator._difficulty_bucket(difficulty)
-        if bucket == "easy":
-            default_operand_high = 9
-            start_range = (5, 40)
-            default_allow_negative = False
-        elif bucket == "medium":
-            default_operand_high = 20
-            start_range = (10, 60)
-            default_allow_negative = rng.random() < 0.5
-        else:
-            default_operand_high = 50
-            start_range = (20, 100)
-            default_allow_negative = True
-
-        operand_high = operand_high if operand_high is not None else default_operand_high
-        allow_negative = allow_negative if allow_negative is not None else default_allow_negative
-
+        op_counts = length_range if length_range is not None else default_range
         sampled_ops = rng.randint(op_counts[0], op_counts[1])
-        ops = n_ops if n_ops is not None else sampled_ops
-        val = rng.randint(start_range[0], start_range[1])
-        parts = [str(val)]
+        ops = max(1, n_ops if n_ops is not None else sampled_ops)
 
+        if bucket == "easy":
+            digit_range = (2, 3)
+            suffix_range = (1, 2)
+            small_max = 3
+            one_prob = 0.8
+        elif bucket == "medium":
+            digit_range = (3, 5)
+            suffix_range = (2, 3)
+            small_max = 5
+            one_prob = 0.7
+        else:
+            digit_range = (5, 8)
+            suffix_range = (3, 5)
+            small_max = 9
+            one_prob = 0.6
+
+        if operand_high is not None:
+            small_max = max(2, operand_high)
+        if allow_negative:
+            allow_negative = False
+
+        if digits is None:
+            total_digits = rng.randint(digit_range[0], digit_range[1])
+        else:
+            total_digits = max(1, digits)
+        max_suffix = min(total_digits, suffix_range[1])
+        min_suffix = min(suffix_range[0], max_suffix)
+        suffix_len = rng.randint(min_suffix, max_suffix)
+        prefix_len = total_digits - suffix_len
+        if prefix_len > 0:
+            prefix_val = AlgorithmicGenerator._sample_int_with_digits(rng, prefix_len)
+            prefix_str = str(prefix_val)
+        else:
+            prefix_str = ""
+
+        base_str = f"{prefix_str}{'9' * suffix_len}"
+        base_val = int(base_str)
+
+        addends: List[int] = []
         for _ in range(ops):
-            op = rng.choice(["+", "-"])
-            operand = rng.randint(1, operand_high)
-            if not allow_negative and op == "-" and val - operand < 0:
-                op = "+"
-            parts.append(f"{op} {operand}")
-            val = val + operand if op == "+" else val - operand
+            if rng.random() < one_prob:
+                addends.append(1)
+            else:
+                addends.append(rng.randint(2, small_max))
 
-        expr = " ".join(parts)
-
-        prompt = AlgorithmicGenerator._choose_prompt(
-            rng,
-            [
-                "Calculate {expr}. Answer: ",
-                "Evaluate {expr}. Answer: ",
-                "Compute the result of {expr}. Answer: ",
-                "What does {expr} simplify to? Answer: ",
-            ],
-            expr=expr,
-        )
+        chain_terms = [base_str] + [str(addend) for addend in addends]
+        chain_expr = "->".join(chain_terms)
+        result = base_val + sum(addends)
+        prompt = f"Chain {chain_expr}. Answer: "
 
         return {
-            "text": f"{prompt}{val}",
+            "text": f"{prompt}{result}",
             "input": prompt,
-            "target": str(val),
+            "target": str(result),
             "task": "chain",
         }
 
