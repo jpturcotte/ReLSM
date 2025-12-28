@@ -2206,6 +2206,8 @@ def train(args):
     global_step = 0
     tokens_seen = 0
     start_time = time.time()
+    last_log_time = start_time
+    last_log_tokens = tokens_seen
     best_alg_acc = 0.0
     last_grad_norm = 0.0
     checkpoint_paths: List[Path] = []
@@ -2337,6 +2339,8 @@ def train(args):
             f"(step={global_step}, tokens_seen={tokens_seen}, "
             f"best_alg_acc={best_alg_acc:.4f})"
         )
+        last_log_time = time.time()
+        last_log_tokens = tokens_seen
     
     # Estimate steps with hybrid calculation for sparse algorithmic and dense language data
     algo_steps = args.alg_tokens // (args.alg_batch_size * 40)
@@ -2553,8 +2557,9 @@ def train(args):
             
             # Logging
             if global_step % args.log_interval == 0:
-                elapsed = time.time() - start_time
-                toks_per_sec = tokens_seen / max(elapsed, 1e-6)
+                elapsed = time.time() - last_log_time
+                tokens_since_log = tokens_seen - last_log_tokens
+                toks_per_sec = tokens_since_log / max(elapsed, 1e-6)
                 peak_vram = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0.0
                 avg_loss = running_loss / args.log_interval
                 avg_K = running_inner_steps / args.log_interval if running_inner_steps > 0 else 0.0
@@ -2600,10 +2605,22 @@ def train(args):
                     max(lr_actuals_clean) if lr_actuals_clean else float("nan")
                 )
                 lr_for_print = lr_actual if not math.isnan(lr_actual) else expected_lr
-                print(
+                base_log_line = (
                     f"Loss: {avg_loss:.4f} | LR: {lr_for_print:.2e} "
-                    f"(expected {expected_lr:.2e})"
+                    f"(expected {expected_lr:.2e}) | Tok/s: {toks_per_sec:.0f}"
                 )
+                if args.extended_logging:
+                    log_print(
+                        f"Step {global_step:>6} | "
+                        f"Phase: {phase[:4]:>4} | "
+                        f"Progress: {progress:>5.1f}% | "
+                        f"{base_log_line} | "
+                        f"VRAM: {peak_vram:.1f}GB"
+                        + (f" | K: {avg_K:.1f}" if avg_K > 0 else "")
+                        + (f" | ponder: {avg_ponder:.3f}" if avg_ponder > 0 else "")
+                    )
+                else:
+                    print(base_log_line)
                 if (
                     not lr_mismatch_warned
                     and not math.isnan(expected_lr)
@@ -2619,20 +2636,12 @@ def train(args):
                     lr_mismatch_warned = True
 
                 if args.extended_logging:
-                    log_print(f"Step {global_step:>6} | "
-                              f"Phase: {phase[:4]:>4} | "
-                              f"Progress: {progress:>5.1f}% | "
-                              f"Tok/s: {toks_per_sec:.0f} | "
-                              f"VRAM: {peak_vram:.1f}GB" +
-                              (f" | K: {avg_K:.1f}" if avg_K > 0 else "") +
-                              (f" | ponder: {avg_ponder:.3f}" if avg_ponder > 0 else ""))
                     difficulty_by_task = _difficulty_by_task()
                     log_print(
                         "  Difficulty by task: "
                         f"{_format_difficulty_by_task(difficulty_by_task)} "
                         f"(easy_mix: {args.easy_mix_frac})"
                     )
-                    log_print(f"  LR: {expected_lr:.2e} (schedule: {args.lr_schedule})")
                     log_print(f"  Grad norm: {last_grad_norm:.1f}")
                     log_print(f"  Weight norm: {weight_norm:.1f}")
                     if args.weight_decay > 0.0:
@@ -2776,9 +2785,12 @@ def train(args):
                 task_window_counts.clear()
                 task_window_input_len.clear()
                 task_window_target_len.clear()
+                last_log_time = time.time()
+                last_log_tokens = tokens_seen
             
             # Evaluation
             if global_step % args.eval_interval == 0:
+                eval_start = time.time()
                 if args.extended_logging:
                     log_print("\nRunning evaluation...")
                 difficulty_logged = _current_difficulty()
@@ -3397,8 +3409,12 @@ def train(args):
                         log_print(f"  Language PPL: {ppl:.2f}")
                     logger.log(step=global_step, phase="eval", val_loss=math.log(ppl))
 
+                eval_duration = time.time() - eval_start
+                print(f"Eval duration: {eval_duration:.2f}s")
+                logger.log(step=global_step, phase="eval", eval_duration=eval_duration)
                 logger.plot()
                 logger.save()
+                last_log_time += eval_duration
 
                 checkpoint_path = save_rotating_checkpoint(global_step, tokens_seen)
                 if checkpoint_path is not None and args.extended_logging:
