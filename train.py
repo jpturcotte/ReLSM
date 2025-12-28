@@ -833,12 +833,15 @@ def _decode_example_text(example: Dict[str, torch.Tensor], tokenizer) -> Optiona
 
 
 def _extract_prompt_target(full_text: str) -> Optional[Dict[str, str]]:
-    marker = "Answer: "
+    marker = "Answer:"
     idx = full_text.rfind(marker)
     if idx == -1:
         return None
-    prompt = full_text[: idx + len(marker)]
-    target = full_text[idx + len(marker) :].strip()
+    prompt_end = idx + len(marker)
+    if prompt_end < len(full_text) and full_text[prompt_end] == " ":
+        prompt_end += 1
+    prompt = full_text[:prompt_end]
+    target = full_text[prompt_end:].strip()
     if not prompt or target == "":
         return None
     return {"prompt": prompt, "target": target}
