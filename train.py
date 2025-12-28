@@ -187,17 +187,44 @@ class MetricsLogger:
         return steps, vals
 
     def _append_snapshot(self):
-        snapshot = {
-            "hyperparameters": self.hyperparameters,
-            "records": self.records,
-            "task_accuracies": self.task_accuracies,
-            "ood_task_accuracies": self.ood_task_accuracies,
-            "train_task_accuracies": self.train_task_accuracies,
-        }
         tmp_path = self._metrics_path.with_suffix(".json.tmp")
         with open(tmp_path, "w") as f:
-            json.dump(snapshot, f)
+            json.dump({"type": "hyperparameters", "data": self.hyperparameters}, f)
             f.write("\n")
+            for record in self.records:
+                json.dump({"type": "record", **record}, f)
+                f.write("\n")
+            for task, records in self.task_accuracies.items():
+                for entry in records:
+                    json.dump(
+                        {"type": "task_accuracy", "target": "eval", "task": task, **entry},
+                        f,
+                    )
+                    f.write("\n")
+            for task, records in self.ood_task_accuracies.items():
+                for entry in records:
+                    json.dump(
+                        {
+                            "type": "task_accuracy",
+                            "target": "eval_ood",
+                            "task": task,
+                            **entry,
+                        },
+                        f,
+                    )
+                    f.write("\n")
+            for task, records in self.train_task_accuracies.items():
+                for entry in records:
+                    json.dump(
+                        {
+                            "type": "task_accuracy",
+                            "target": "train",
+                            "task": task,
+                            **entry,
+                        },
+                        f,
+                    )
+                    f.write("\n")
         os.replace(tmp_path, self._metrics_path)
     
     def summary(self) -> Dict:
@@ -2936,6 +2963,18 @@ def train(args):
                             "[warn] eval diagnostics are empty; check diagnostic wiring for eval."
                         )
 
+                    per_task_mae = alg_results.get("per_task_mae", {}) or {}
+                    per_task_token_accuracy = alg_results.get("per_task_token_accuracy", {}) or {}
+                    per_task_distance = alg_results.get("per_task_distance", {}) or {}
+                    per_task_prefix_accuracy = (
+                        alg_results.get("per_task_prefix_accuracy", {}) or {}
+                    )
+                    per_task_accuracy = alg_results.get("per_task_accuracy", {}) or {}
+
+                    flat_per_task_accuracy = {
+                        f"accuracy.{task}": acc for task, acc in per_task_accuracy.items()
+                    }
+
                     logger.log(
                         step=global_step,
                         phase="eval",
@@ -2944,25 +2983,12 @@ def train(args):
                         algorithmic_distance=overall_distance,
                         algorithmic_prefix_accuracy=overall_prefix_accuracy,
                         algorithmic_mae=overall_mae,
-                        algorithmic_iid_accuracy=overall_acc,
-                        algorithmic_iid_token_accuracy=overall_token_accuracy,
-                        algorithmic_iid_distance=overall_distance,
-                        algorithmic_iid_prefix_accuracy=overall_prefix_accuracy,
-                        algorithmic_iid_mae=overall_mae,
                         eval_difficulty=difficulty_logged,
                         algorithmic_samples=alg_results.get("sampled_examples_by_task", {}),
-                        algorithmic_iid_samples=alg_results.get("sampled_examples_by_task", {}),
+                        **flat_per_task_accuracy,
                         **flat_eval_diagnostics,
                         **eval_task_metrics,
                     )
-
-                    per_task_mae = alg_results.get("per_task_mae", {}) or {}
-                    per_task_token_accuracy = alg_results.get("per_task_token_accuracy", {}) or {}
-                    per_task_distance = alg_results.get("per_task_distance", {}) or {}
-                    per_task_prefix_accuracy = (
-                        alg_results.get("per_task_prefix_accuracy", {}) or {}
-                    )
-                    per_task_accuracy = alg_results.get("per_task_accuracy", {}) or {}
                     if per_task_accuracy:
                         warn_on_format_crash(
                             "Algorithmic IID",
@@ -3322,6 +3348,19 @@ def train(args):
                                 diagnostics.get("prompt_format", {}),
                             )
 
+                    per_task_mae = task_eval.get("per_task_mae", {}) or {}
+                    per_task_token_accuracy = task_eval.get("per_task_token_accuracy", {}) or {}
+                    per_task_distance = task_eval.get("per_task_distance", {}) or {}
+                    per_task_prefix_accuracy = (
+                        task_eval.get("per_task_prefix_accuracy", {}) or {}
+                    )
+                    per_task_accuracy = task_eval.get("per_task_accuracy", {}) or {}
+
+                    flat_per_task_train_accuracy = {
+                        f"train_accuracy.{task}": acc
+                        for task, acc in per_task_accuracy.items()
+                    }
+
                     logger.log(
                         step=global_step,
                         phase="eval",
@@ -3333,19 +3372,12 @@ def train(args):
                         train_eval_prefix_accuracy=task_eval.get("overall_prefix_accuracy"),
                         eval_difficulty=difficulty_logged,
                         train_eval_samples=task_eval.get("sampled_examples_by_task", {}),
+                        **flat_per_task_train_accuracy,
                         **_flatten_eval_diagnostics(
                             "train_eval", task_eval.get("diagnostics", {})
                         ),
                         **eval_task_metrics,
                     )
-
-                    per_task_mae = task_eval.get("per_task_mae", {}) or {}
-                    per_task_token_accuracy = task_eval.get("per_task_token_accuracy", {}) or {}
-                    per_task_distance = task_eval.get("per_task_distance", {}) or {}
-                    per_task_prefix_accuracy = (
-                        task_eval.get("per_task_prefix_accuracy", {}) or {}
-                    )
-                    per_task_accuracy = task_eval.get("per_task_accuracy", {}) or {}
                     if per_task_accuracy:
                         warn_on_format_crash(
                             f"Training eval ({train_eval_label})",
