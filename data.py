@@ -368,10 +368,10 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "Compute ({a} + {b}) mod {mod}. Answer: ",
-                "What is ({a} + {b}) modulo {mod}? Answer: ",
-                "Add {a} and {b}, then take mod {mod}. Answer: ",
-                "({a} plus {b}) % {mod} equals. Answer: ",
+                "Compute ({a} + {b}) mod {mod}. Answer:",
+                "What is ({a} + {b}) modulo {mod}? Answer:",
+                "Add {a} and {b}, then take mod {mod}. Answer:",
+                "({a} plus {b}) % {mod} equals. Answer:",
             ],
             a=a,
             b=b,
@@ -408,10 +408,10 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "parity({bits}). Answer: ",
-                "Is the number of ones in {bits} even (0) or odd (1)? Answer: ",
-                "Compute the parity bit for {bits}. Answer: ",
-                "Parity of {bits}? Answer: ",
+                "parity({bits}). Answer:",
+                "Is the number of ones in {bits} even (0) or odd (1)? Answer:",
+                "Compute the parity bit for {bits}. Answer:",
+                "Parity of {bits}? Answer:",
             ],
             bits=bit_str,
         )
@@ -466,11 +466,11 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "Compute: {a} + {b}. Answer: ",
-                "What is {a} plus {b}? Answer: ",
-                "Add {a} and {b}. Answer: ",
-                "Sum {a} with {b}. Answer: ",
-                "{a} + {b} equals. Answer: ",
+                "Compute: {a} + {b}. Answer:",
+                "What is {a} plus {b}? Answer:",
+                "Add {a} and {b}. Answer:",
+                "Sum {a} with {b}. Answer:",
+                "{a} + {b} equals. Answer:",
             ],
             a=a,
             b=b,
@@ -510,10 +510,10 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "Multiply: {a} * {b}. Answer: ",
-                "What is {a} times {b}? Answer: ",
-                "Product of {a} and {b}. Answer: ",
-                "Compute {a} multiplied by {b}. Answer: ",
+                "Multiply: {a} * {b}. Answer:",
+                "What is {a} times {b}? Answer:",
+                "Product of {a} and {b}. Answer:",
+                "Compute {a} multiplied by {b}. Answer:",
             ],
             a=a,
             b=b,
@@ -549,10 +549,10 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "Copy the sequence {seq}. Answer: ",
-                "Repeat the sequence {seq}. Answer: ",
-                "Copy this list exactly: {seq}. Answer: ",
-                "Write the same numbers again: {seq}. Answer: ",
+                "Copy the sequence {seq}. Answer:",
+                "Repeat the sequence {seq}. Answer:",
+                "Copy this list exactly: {seq}. Answer:",
+                "Write the same numbers again: {seq}. Answer:",
             ],
             seq=seq_str,
         )
@@ -588,10 +588,10 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "Reverse: {seq}. Answer: ",
-                "Write {seq} backwards. Answer: ",
-                "Reverse the order of {seq}. Answer: ",
-                "Flip the sequence {seq}. Answer: ",
+                "Reverse: {seq}. Answer:",
+                "Write {seq} backwards. Answer:",
+                "Reverse the order of {seq}. Answer:",
+                "Flip the sequence {seq}. Answer:",
             ],
             seq=seq_str,
         )
@@ -696,10 +696,10 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "Is '{seq}' balanced? Answer: ",
-                "Does {seq} form a correct parentheses string? Answer: ",
-                "Dyck check for {seq}. Answer: ",
-                "Check Dyck validity for: {seq}. Answer: ",
+                "Is '{seq}' balanced? Answer:",
+                "Does {seq} form a correct parentheses string? Answer:",
+                "Dyck check for {seq}. Answer:",
+                "Check Dyck validity for: {seq}. Answer:",
             ],
             seq=seq_str,
         )
@@ -785,7 +785,7 @@ class AlgorithmicGenerator:
         chain_terms = [base_str] + [str(addend) for addend in addends]
         chain_expr = "->".join(chain_terms)
         result = base_val + sum(addends)
-        prompt = f"Chain {chain_expr}. Answer: "
+        prompt = f"Chain {chain_expr}. Answer:"
 
         return {
             "text": f"{prompt}{result}",
@@ -821,10 +821,10 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "Compare {a} and {b}. Answer: ",
-                "Which relation holds between {a} and {b} (>, <, or =)? Answer: ",
-                "Compare {a} to {b} (>, <, or =). Answer: ",
-                "Between {a} and {b}, choose the relation. Answer: ",
+                "Compare {a} and {b}. Answer:",
+                "Which relation holds between {a} and {b} (>, <, or =)? Answer:",
+                "Compare {a} to {b} (>, <, or =). Answer:",
+                "Between {a} and {b}, choose the relation. Answer:",
             ],
             a=a,
             b=b,
@@ -859,10 +859,10 @@ class AlgorithmicGenerator:
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
             [
-                "succ({n}). Answer: ",
-                "What is the successor of {n}? Answer: ",
-                "Next integer after {n} is. Answer: ",
-                "Increment {n} by one. Answer: ",
+                "succ({n}). Answer:",
+                "What is the successor of {n}? Answer:",
+                "Next integer after {n} is. Answer:",
+                "Increment {n} by one. Answer:",
             ],
             n=n,
         )
@@ -1746,7 +1746,7 @@ class OODLengthGenerator:
         """Addition with more digits than training."""
         a = random.randint(10**(n_digits-1), 10**n_digits - 1)
         b = random.randint(10**(n_digits-1), 10**n_digits - 1)
-        prompt = f"{a} + {b}. Answer: "
+        prompt = f"{a} + {b}. Answer:"
         target = str(a + b)
         return {
             "input": prompt,
@@ -1762,7 +1762,7 @@ class OODLengthGenerator:
         """Parity with longer sequences than training."""
         bits = [random.randint(0, 1) for _ in range(length)]
         parity = sum(bits) % 2
-        prompt = f"parity({''.join(map(str, bits))}). Answer: "
+        prompt = f"parity({''.join(map(str, bits))}). Answer:"
         target = str(parity)
         return {
             "input": prompt,
@@ -1778,7 +1778,7 @@ class OODLengthGenerator:
         """Copy with longer sequences than training."""
         seq = [random.randint(0, 9) for _ in range(length)]
         seq_str = " ".join(map(str, seq))
-        prompt = f"Copy the sequence {seq_str}. Answer: "
+        prompt = f"Copy the sequence {seq_str}. Answer:"
         target = seq_str
         return {
             "input": prompt,
