@@ -35,7 +35,7 @@ class DummyTokenizer:
 def test_algorithmic_prompts_use_answer_prefix():
     for gen in (AlgorithmicGenerator.copy_sequence, AlgorithmicGenerator.reverse_sequence):
         example = gen(rng=test_rng, length=4)
-        assert example["input"].endswith("Answer: ")
+        assert example["input"].endswith("Answer:")
         assert example["text"] == f"{example['input']}{example['target']}"
         assert "Answer:" not in example["target"]
 
