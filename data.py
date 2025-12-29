@@ -980,7 +980,8 @@ class AlgorithmicDataset(IterableDataset):
     """
     Dataset for Phase 1: Algorithmic Grokking.
     Generates fresh data each epoch for true procedural sampling.
-    Uses token-based dynamic batching to keep per-step token counts stable.
+    Uses token-based dynamic batching with length bucketing to keep per-step
+    token counts stable while minimizing padding overhead.
     """
 
     def __init__(
@@ -1026,6 +1027,7 @@ class AlgorithmicDataset(IterableDataset):
         # examples to avoid metadata overhead from very short sequences.
         self._target_batch_tokens = self.base_batch_size * self.max_seq_len
         self._max_batch_size = self.base_batch_size * self.max_batch_multiplier
+        # Default to splitting into 3 roughly equal buckets.
         if length_bucket_boundaries is None:
             first = max(1, self.max_seq_len // 3)
             second = max(first + 1, (2 * self.max_seq_len) // 3)
@@ -1081,7 +1083,7 @@ class AlgorithmicDataset(IterableDataset):
 
         num_buckets = len(self._length_bucket_boundaries) + 1
         batch_buffers: List[List[Dict[str, torch.Tensor]]] = [[] for _ in range(num_buckets)]
-        buffered_tokens = [0 for _ in range(num_buckets)]
+        buffer_max_len = [0 for _ in range(num_buckets)]
 
         for _ in range(worker_id, self.num_examples, num_workers):
             progress = min(self.tokens_seen / max(self._worker_token_budget, 1), 1.0)
@@ -1143,15 +1145,18 @@ class AlgorithmicDataset(IterableDataset):
             seq_len = int(input_ids.numel())
             bucket_idx = self._length_bucket_index(seq_len)
             batch_buffers[bucket_idx].append(payload)
-            buffered_tokens[bucket_idx] += seq_len
+            buffer_max_len[bucket_idx] = max(buffer_max_len[bucket_idx], seq_len)
+
+            current_batch_size = len(batch_buffers[bucket_idx])
+            estimated_tensor_size = current_batch_size * buffer_max_len[bucket_idx]
 
             if (
-                len(batch_buffers[bucket_idx]) >= self._max_batch_size
-                or buffered_tokens[bucket_idx] >= self._target_batch_tokens
+                current_batch_size >= self._max_batch_size
+                or estimated_tensor_size >= self._target_batch_tokens
             ):
                 yield batch_buffers[bucket_idx]
                 batch_buffers[bucket_idx] = []
-                buffered_tokens[bucket_idx] = 0
+                buffer_max_len[bucket_idx] = 0
 
         for bucket_buffer in batch_buffers:
             if bucket_buffer:
@@ -1325,6 +1330,7 @@ def create_algorithmic_dataset(
     total_tokens: Optional[int] = None,
     easy_mix_frac: float = 0.2,
     min_difficulty: float = 0.0,
+    length_bucket_boundaries: Optional[Sequence[int]] = None,
 ) -> Union[AlgorithmicDataset, FixedAlgorithmicDataset]:
     """Factory that returns fixed or infinite dataset based on flag."""
 
@@ -1366,6 +1372,7 @@ def create_algorithmic_dataset(
         total_tokens=total_tokens,
         easy_mix_frac=easy_mix_frac,
         min_difficulty=min_difficulty,
+        length_bucket_boundaries=length_bucket_boundaries,
     )
 
 

@@ -3451,6 +3451,7 @@ def train(args):
                 logger.log(step=global_step, phase="eval", eval_duration=eval_duration)
                 logger.plot()
                 logger.save()
+                torch.cuda.empty_cache()
                 last_log_time += eval_duration
 
                 checkpoint_path = save_rotating_checkpoint(global_step, tokens_seen)
