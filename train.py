@@ -2040,6 +2040,7 @@ def train(args):
             tokenizer=tokenizer,
             num_examples=args.alg_examples,
             max_seq_len=args.alg_seq_len,
+            base_batch_size=args.alg_batch_size,
             tasks=alg_tasks,
             seed=args.seed,
             difficulty_value=difficulty_value,
@@ -2055,7 +2056,7 @@ def train(args):
         )
         alg_loader = DataLoader(
             alg_dataset,
-            batch_size=args.alg_batch_size,
+            batch_size=None,
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,
@@ -2117,6 +2118,7 @@ def train(args):
                 tokenizer=tokenizer,
                 num_examples=args.train_eval_samples or args.eval_samples,
                 max_seq_len=args.alg_seq_len,
+                base_batch_size=args.train_eval_batch_size,
                 tasks=alg_tasks,
                 seed=args.seed + 123,
                 difficulty_value=None,
@@ -2131,7 +2133,7 @@ def train(args):
 
         train_eval_loader = DataLoader(
             base_dataset,
-            batch_size=args.train_eval_batch_size,
+            batch_size=None,
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,

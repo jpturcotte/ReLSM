@@ -980,6 +980,7 @@ class AlgorithmicDataset(IterableDataset):
     """
     Dataset for Phase 1: Algorithmic Grokking.
     Generates fresh data each epoch for true procedural sampling.
+    Uses token-based dynamic batching to keep per-step token counts stable.
     """
 
     def __init__(
@@ -987,6 +988,8 @@ class AlgorithmicDataset(IterableDataset):
         tokenizer,
         num_examples: int = 100000,
         max_seq_len: int = 128,
+        base_batch_size: int = 1,
+        max_batch_multiplier: int = 4,
         tasks: Optional[List[str]] = None,
         seed: Optional[int] = None,
         difficulty_value=None,
@@ -1003,6 +1006,8 @@ class AlgorithmicDataset(IterableDataset):
         self.tokenizer = tokenizer
         self.num_examples = num_examples
         self.max_seq_len = max_seq_len
+        self.base_batch_size = max(1, int(base_batch_size))
+        self.max_batch_multiplier = max(1, int(max_batch_multiplier))
         self.tasks = tasks
         self.seed = seed
         self.difficulty_value = difficulty_value
@@ -1016,6 +1021,10 @@ class AlgorithmicDataset(IterableDataset):
         self.min_difficulty = min_difficulty
         self.include_lengths = include_lengths
         self.tokens_seen = 0
+        # Target a fixed token budget per batch while capping the number of
+        # examples to avoid metadata overhead from very short sequences.
+        self._target_batch_tokens = self.base_batch_size * self.max_seq_len
+        self._max_batch_size = self.base_batch_size * self.max_batch_multiplier
         self._token_budget = max(
             1,
             total_tokens
@@ -1037,7 +1046,7 @@ class AlgorithmicDataset(IterableDataset):
     def __len__(self):
         return self.num_examples
 
-    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+    def __iter__(self) -> Iterator[List[Dict[str, torch.Tensor]]]:
         worker_info = get_worker_info()
 
         # Keep tokens_seen cumulative across epochs so difficulty schedules carry
@@ -1057,6 +1066,9 @@ class AlgorithmicDataset(IterableDataset):
         num_workers = worker_info.num_workers if worker_info is not None else 1
 
         self._worker_token_budget = max(1, self._token_budget / num_workers)
+
+        batch_buffer: List[Dict[str, torch.Tensor]] = []
+        buffered_tokens = 0
 
         for _ in range(worker_id, self.num_examples, num_workers):
             progress = min(self.tokens_seen / max(self._worker_token_budget, 1), 1.0)
@@ -1115,7 +1127,16 @@ class AlgorithmicDataset(IterableDataset):
             if self.include_lengths:
                 payload["input_len_tokens"] = self._encode_length(example["input"])
                 payload["target_len_tokens"] = self._encode_length(example["target"])
-            yield payload
+            batch_buffer.append(payload)
+            buffered_tokens += int(input_ids.numel())
+
+            if len(batch_buffer) >= self._max_batch_size or buffered_tokens >= self._target_batch_tokens:
+                yield batch_buffer
+                batch_buffer = []
+                buffered_tokens = 0
+
+        if batch_buffer:
+            yield batch_buffer
 
     def _sample_task(
         self,
@@ -1272,6 +1293,8 @@ def create_algorithmic_dataset(
     fixed: bool = False,
     num_examples: int = 100000,
     max_seq_len: int = 128,
+    base_batch_size: int = 1,
+    max_batch_multiplier: int = 4,
     tasks: Optional[List[str]] = None,
     seed: int = 42,
     difficulty_value=None,
@@ -1311,6 +1334,8 @@ def create_algorithmic_dataset(
         tokenizer=tokenizer,
         num_examples=num_examples,
         max_seq_len=max_seq_len,
+        base_batch_size=base_batch_size,
+        max_batch_multiplier=max_batch_multiplier,
         tasks=tasks,
         seed=seed,
         difficulty_value=difficulty_value,
@@ -1830,6 +1855,7 @@ def create_curriculum_loaders(
         tokenizer=tokenizer,
         num_examples=alg_examples,
         max_seq_len=alg_seq_len,
+        base_batch_size=alg_batch_size,
         seed=42,
     )
     
@@ -1841,7 +1867,7 @@ def create_curriculum_loaders(
     collate_fn = make_collate_fn(tokenizer)
     alg_loader = DataLoader(
         alg_dataset,
-        batch_size=alg_batch_size,
+        batch_size=None,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
