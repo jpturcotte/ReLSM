@@ -1083,7 +1083,7 @@ class AlgorithmicDataset(IterableDataset):
 
         num_buckets = len(self._length_bucket_boundaries) + 1
         batch_buffers: List[List[Dict[str, torch.Tensor]]] = [[] for _ in range(num_buckets)]
-        buffered_tokens = [0 for _ in range(num_buckets)]
+        buffer_max_len = [0 for _ in range(num_buckets)]
 
         for _ in range(worker_id, self.num_examples, num_workers):
             progress = min(self.tokens_seen / max(self._worker_token_budget, 1), 1.0)
@@ -1145,15 +1145,18 @@ class AlgorithmicDataset(IterableDataset):
             seq_len = int(input_ids.numel())
             bucket_idx = self._length_bucket_index(seq_len)
             batch_buffers[bucket_idx].append(payload)
-            buffered_tokens[bucket_idx] += seq_len
+            buffer_max_len[bucket_idx] = max(buffer_max_len[bucket_idx], seq_len)
+
+            current_batch_size = len(batch_buffers[bucket_idx])
+            estimated_tensor_size = current_batch_size * buffer_max_len[bucket_idx]
 
             if (
-                len(batch_buffers[bucket_idx]) >= self._max_batch_size
-                or buffered_tokens[bucket_idx] >= self._target_batch_tokens
+                current_batch_size >= self._max_batch_size
+                or estimated_tensor_size >= self._target_batch_tokens
             ):
                 yield batch_buffers[bucket_idx]
                 batch_buffers[bucket_idx] = []
-                buffered_tokens[bucket_idx] = 0
+                buffer_max_len[bucket_idx] = 0
 
         for bucket_buffer in batch_buffers:
             if bucket_buffer:
