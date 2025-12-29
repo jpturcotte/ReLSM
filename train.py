@@ -2825,6 +2825,7 @@ def train(args):
                 eval_start = time.time()
                 if args.extended_logging:
                     log_print("\nRunning evaluation...")
+                iid_bumped_tasks: Set[str] = set()
                 difficulty_logged = _current_difficulty()
                 if args.extended_logging:
                     difficulty_by_task = _difficulty_by_task()
@@ -3068,6 +3069,7 @@ def train(args):
                                 )
                                 task_curriculum.override_difficulty(task, 0.5)
                                 task_curriculum.update_metrics(task, acc, None, global_step)
+                                iid_bumped_tasks.add(task)
                                 did_sync = True
                         if did_sync:
                             refresh_curriculum_snapshots()
@@ -3290,6 +3292,8 @@ def train(args):
                         unlock_warmup_evals = max(int(unlock_warmup_evals), 0)
                         for task, acc in per_task_accuracy.items():
                             should_step_curriculum = True
+                            if task in iid_bumped_tasks:
+                                should_step_curriculum = False
                             if dag_state is not None:
                                 gate = dag_gate_snapshot.get(task, 0.0)
                                 if gate <= 0.0:
