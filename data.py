@@ -1002,6 +1002,7 @@ class AlgorithmicDataset(IterableDataset):
         easy_mix_frac: float = 0.2,
         min_difficulty: float = 0.0,
         include_lengths: bool = False,
+        length_bucket_boundaries: Optional[Sequence[int]] = None,
     ):
         self.tokenizer = tokenizer
         self.num_examples = num_examples
@@ -1025,6 +1026,11 @@ class AlgorithmicDataset(IterableDataset):
         # examples to avoid metadata overhead from very short sequences.
         self._target_batch_tokens = self.base_batch_size * self.max_seq_len
         self._max_batch_size = self.base_batch_size * self.max_batch_multiplier
+        if length_bucket_boundaries is None:
+            first = max(1, self.max_seq_len // 3)
+            second = max(first + 1, (2 * self.max_seq_len) // 3)
+            length_bucket_boundaries = (first, second)
+        self._length_bucket_boundaries = tuple(sorted(set(length_bucket_boundaries)))
         self._token_budget = max(
             1,
             total_tokens
@@ -1045,6 +1051,12 @@ class AlgorithmicDataset(IterableDataset):
 
     def __len__(self):
         return self.num_examples
+
+    def _length_bucket_index(self, seq_len: int) -> int:
+        for idx, boundary in enumerate(self._length_bucket_boundaries):
+            if seq_len <= boundary:
+                return idx
+        return len(self._length_bucket_boundaries)
 
     def __iter__(self) -> Iterator[List[Dict[str, torch.Tensor]]]:
         worker_info = get_worker_info()
@@ -1067,8 +1079,9 @@ class AlgorithmicDataset(IterableDataset):
 
         self._worker_token_budget = max(1, self._token_budget / num_workers)
 
-        batch_buffer: List[Dict[str, torch.Tensor]] = []
-        buffered_tokens = 0
+        num_buckets = len(self._length_bucket_boundaries) + 1
+        batch_buffers: List[List[Dict[str, torch.Tensor]]] = [[] for _ in range(num_buckets)]
+        buffered_tokens = [0 for _ in range(num_buckets)]
 
         for _ in range(worker_id, self.num_examples, num_workers):
             progress = min(self.tokens_seen / max(self._worker_token_budget, 1), 1.0)
@@ -1127,16 +1140,22 @@ class AlgorithmicDataset(IterableDataset):
             if self.include_lengths:
                 payload["input_len_tokens"] = self._encode_length(example["input"])
                 payload["target_len_tokens"] = self._encode_length(example["target"])
-            batch_buffer.append(payload)
-            buffered_tokens += int(input_ids.numel())
+            seq_len = int(input_ids.numel())
+            bucket_idx = self._length_bucket_index(seq_len)
+            batch_buffers[bucket_idx].append(payload)
+            buffered_tokens[bucket_idx] += seq_len
 
-            if len(batch_buffer) >= self._max_batch_size or buffered_tokens >= self._target_batch_tokens:
-                yield batch_buffer
-                batch_buffer = []
-                buffered_tokens = 0
+            if (
+                len(batch_buffers[bucket_idx]) >= self._max_batch_size
+                or buffered_tokens[bucket_idx] >= self._target_batch_tokens
+            ):
+                yield batch_buffers[bucket_idx]
+                batch_buffers[bucket_idx] = []
+                buffered_tokens[bucket_idx] = 0
 
-        if batch_buffer:
-            yield batch_buffer
+        for bucket_buffer in batch_buffers:
+            if bucket_buffer:
+                yield bucket_buffer
 
     def _sample_task(
         self,
