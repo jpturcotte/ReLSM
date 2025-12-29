@@ -980,7 +980,8 @@ class AlgorithmicDataset(IterableDataset):
     """
     Dataset for Phase 1: Algorithmic Grokking.
     Generates fresh data each epoch for true procedural sampling.
-    Uses token-based dynamic batching to keep per-step token counts stable.
+    Uses token-based dynamic batching with length bucketing to keep per-step
+    token counts stable while minimizing padding overhead.
     """
 
     def __init__(
@@ -1026,6 +1027,7 @@ class AlgorithmicDataset(IterableDataset):
         # examples to avoid metadata overhead from very short sequences.
         self._target_batch_tokens = self.base_batch_size * self.max_seq_len
         self._max_batch_size = self.base_batch_size * self.max_batch_multiplier
+        # Default to splitting into 3 roughly equal buckets.
         if length_bucket_boundaries is None:
             first = max(1, self.max_seq_len // 3)
             second = max(first + 1, (2 * self.max_seq_len) // 3)
@@ -1325,6 +1327,7 @@ def create_algorithmic_dataset(
     total_tokens: Optional[int] = None,
     easy_mix_frac: float = 0.2,
     min_difficulty: float = 0.0,
+    length_bucket_boundaries: Optional[Sequence[int]] = None,
 ) -> Union[AlgorithmicDataset, FixedAlgorithmicDataset]:
     """Factory that returns fixed or infinite dataset based on flag."""
 
@@ -1366,6 +1369,7 @@ def create_algorithmic_dataset(
         total_tokens=total_tokens,
         easy_mix_frac=easy_mix_frac,
         min_difficulty=min_difficulty,
+        length_bucket_boundaries=length_bucket_boundaries,
     )
 
 
