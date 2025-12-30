@@ -69,6 +69,190 @@ from utils import (
 
 plt.switch_backend("Agg")
 
+def compute_dag_weighting(
+    tasks: Sequence[str],
+    weights: Sequence[float],
+    dag_gate_snapshot: Dict[str, float],
+    dag_frontier_snapshot: Set[str],
+    dag_replay_ratio_snapshot: float,
+    dag_locked_floor: float,
+) -> Tuple[List[float], Dict[str, float], Dict[str, float]]:
+    if not tasks:
+        return [], {}, {}
+    gates = [dag_gate_snapshot.get(task, 0.0) for task in tasks]
+    unlocked = [idx for idx, gate in enumerate(gates) if gate > 0.0]
+    locked = [idx for idx, gate in enumerate(gates) if gate <= 0.0]
+    if not unlocked:
+        total = sum(weights)
+        probs = {
+            task: (weight / total if total else 0.0)
+            for task, weight in zip(tasks, weights)
+        }
+        return list(weights), probs, {task: weight for task, weight in zip(tasks, weights)}
+
+    gated_weights = [weight * gate for weight, gate in zip(weights, gates)]
+    total_gated = sum(gated_weights[idx] for idx in unlocked)
+    if total_gated <= 0.0:
+        for idx in unlocked:
+            gated_weights[idx] = 1.0
+        total_gated = float(len(unlocked))
+
+    frontier_set = set(dag_frontier_snapshot)
+    frontier_indices = [
+        idx for idx, task in enumerate(tasks) if task in frontier_set and gates[idx] > 0.0
+    ]
+    replay_indices = [
+        idx for idx in unlocked if idx not in frontier_indices
+    ]
+
+    total_frontier = sum(gated_weights[idx] for idx in frontier_indices)
+    total_replay = sum(gated_weights[idx] for idx in replay_indices)
+
+    probs: List[float] = [0.0] * len(tasks)
+    replay_ratio = dag_replay_ratio_snapshot
+    if not frontier_indices:
+        replay_ratio = 1.0
+    elif not replay_indices:
+        replay_ratio = 0.0
+    if total_frontier > 0.0:
+        for idx in frontier_indices:
+            probs[idx] += (1.0 - replay_ratio) * (gated_weights[idx] / total_frontier)
+    if total_replay > 0.0:
+        for idx in replay_indices:
+            probs[idx] += replay_ratio * (gated_weights[idx] / total_replay)
+
+    if sum(probs) <= 0.0:
+        uniform = 1.0 / len(unlocked)
+        for idx in unlocked:
+            probs[idx] = uniform
+
+    min_prob_unlocked_total = 0.02
+    floor_unlocked = min_prob_unlocked_total / len(unlocked)
+    for idx in unlocked:
+        probs[idx] = max(probs[idx], floor_unlocked)
+
+    min_prob_frontier_total = 0.03
+    if frontier_indices:
+        floor_frontier = min_prob_frontier_total / len(frontier_indices)
+        for idx in frontier_indices:
+            probs[idx] = max(probs[idx], floor_frontier)
+
+    locked_floor_total = max(dag_locked_floor, 0.0)
+    if locked and locked_floor_total > 0.0:
+        locked_weight_total = sum(weights[idx] for idx in locked)
+        if locked_weight_total <= 0.0:
+            locked_weight_total = float(len(locked))
+            for idx in locked:
+                weights[idx] = 1.0
+        for idx in locked:
+            probs[idx] = max(
+                probs[idx],
+                locked_floor_total * (weights[idx] / locked_weight_total),
+            )
+
+    total = sum(probs)
+    if total <= 0.0:
+        uniform = 1.0 / len(unlocked)
+        for idx in unlocked:
+            probs[idx] = uniform
+        total = 1.0
+    probs = [prob / total for prob in probs]
+    prob_map = {task: prob for task, prob in zip(tasks, probs)}
+    gated_map = {task: weight for task, weight in zip(tasks, gated_weights)}
+    return probs, prob_map, gated_map
+
+
+class CurriculumDifficultySampler:
+    def __init__(
+        self,
+        difficulty_snapshot: Dict[str, float],
+        *,
+        easy_mix_frac: float,
+        curriculum_jitter: float,
+        min_difficulty: float,
+    ) -> None:
+        self._difficulty_snapshot = difficulty_snapshot
+        self._easy_mix_frac = easy_mix_frac
+        self._curriculum_jitter = curriculum_jitter
+        self._min_difficulty = min_difficulty
+
+    def __call__(self, task: str) -> float:
+        if self._easy_mix_frac > 0.0 and random.random() < self._easy_mix_frac:
+            return random.uniform(0.0, 0.3)
+
+        difficulty = self._difficulty_snapshot.get(task, 0.2)
+        if self._curriculum_jitter > 0.0 and random.random() < self._curriculum_jitter:
+            return random.uniform(0.0, difficulty)
+        return max(difficulty, self._min_difficulty)
+
+
+class CurriculumEvalDifficultySampler:
+    def __init__(
+        self,
+        difficulty_snapshot: Dict[str, float],
+        *,
+        min_difficulty: float,
+    ) -> None:
+        self._difficulty_snapshot = difficulty_snapshot
+        self._min_difficulty = min_difficulty
+
+    def __call__(self, task: str) -> float:
+        return max(self._difficulty_snapshot.get(task, 0.2), self._min_difficulty)
+
+
+class CurriculumWeightingSampler:
+    def __init__(self, weights_snapshot: Dict[str, float]) -> None:
+        self._weights_snapshot = weights_snapshot
+
+    def __call__(self, task: str) -> float:
+        return self._weights_snapshot.get(task, 1.0)
+
+
+class CurriculumWeightingAdjuster:
+    def __init__(
+        self,
+        difficulty_snapshot: Dict[str, float],
+        *,
+        min_task_prob: float,
+    ) -> None:
+        self._difficulty_snapshot = difficulty_snapshot
+        self._min_task_prob = min_task_prob
+
+    def __call__(self, tasks: Sequence[str], weights: List[float]) -> List[float]:
+        if not tasks:
+            return weights
+        mean_difficulty = sum(
+            self._difficulty_snapshot.get(task, 0.2) for task in tasks
+        ) / len(tasks)
+        if mean_difficulty >= 0.2:
+            return weights
+        return _apply_minimum_probability(weights, self._min_task_prob)
+
+
+class DagWeightingAdjuster:
+    def __init__(
+        self,
+        dag_gate_snapshot: Dict[str, float],
+        dag_frontier_snapshot: Set[str],
+        dag_replay_ratio_snapshot: List[float],
+        dag_locked_floor: float,
+    ) -> None:
+        self._dag_gate_snapshot = dag_gate_snapshot
+        self._dag_frontier_snapshot = dag_frontier_snapshot
+        self._dag_replay_ratio_snapshot = dag_replay_ratio_snapshot
+        self._dag_locked_floor = dag_locked_floor
+
+    def __call__(self, tasks: Sequence[str], weights: List[float]) -> List[float]:
+        adjusted, _, _ = compute_dag_weighting(
+            tasks,
+            weights,
+            self._dag_gate_snapshot,
+            self._dag_frontier_snapshot,
+            self._dag_replay_ratio_snapshot[0],
+            self._dag_locked_floor,
+        )
+        return adjusted
+
 def get_lr(
     tokens_seen: int,
     warmup_tokens: int,
@@ -1834,7 +2018,7 @@ def train(args):
 
         dag_gate_snapshot: Dict[str, float] = {}
         dag_frontier_snapshot: Set[str] = set()
-        dag_replay_ratio_snapshot = 0.0
+        dag_replay_ratio_snapshot: List[float] = [0.0]
         dag_unlocked_snapshot: Set[str] = set()
         dag_prob_snapshot: Dict[str, float] = {}
         dag_gated_weight_snapshot: Dict[str, float] = {}
@@ -1879,136 +2063,49 @@ def train(args):
 
         def refresh_curriculum_snapshots() -> None:
             nonlocal difficulty_snapshot, weights_snapshot
-            difficulty_snapshot = task_curriculum.get_difficulty_snapshot()
-            weights_snapshot = task_curriculum.get_sampling_weights_snapshot()
+            difficulty_snapshot.clear()
+            difficulty_snapshot.update(task_curriculum.get_difficulty_snapshot())
+            weights_snapshot.clear()
+            weights_snapshot.update(task_curriculum.get_sampling_weights_snapshot())
 
         refresh_curriculum_snapshots()
         if dag_state is not None:
-            dag_gate_snapshot = dag_state.get_gate_snapshot()
-            dag_frontier_snapshot = dag_state.compute_frontier({})
-            dag_replay_ratio_snapshot = dag_state.compute_replay_ratio({})
-            dag_unlocked_snapshot = {
-                task for task, gate in dag_gate_snapshot.items() if gate > 0.0
-            }
+            dag_gate_snapshot.clear()
+            dag_gate_snapshot.update(dag_state.get_gate_snapshot())
+            dag_frontier_snapshot.clear()
+            dag_frontier_snapshot.update(dag_state.compute_frontier({}))
+            dag_replay_ratio_snapshot[0] = dag_state.compute_replay_ratio({})
+            dag_unlocked_snapshot.clear()
+            dag_unlocked_snapshot.update(
+                {task for task, gate in dag_gate_snapshot.items() if gate > 0.0}
+            )
 
-        def difficulty_fn(task: str) -> float:
-            if args.easy_mix_frac > 0.0 and random.random() < args.easy_mix_frac:
-                return random.uniform(0.0, 0.3)
-
-            difficulty = difficulty_snapshot.get(task, 0.2)
-            if args.curriculum_jitter > 0.0 and random.random() < args.curriculum_jitter:
-                return random.uniform(0.0, difficulty)
-            return difficulty
-
-        def eval_difficulty_fn(task: str) -> float:
-            return max(difficulty_snapshot.get(task, 0.2), args.min_difficulty)
+        difficulty_fn = CurriculumDifficultySampler(
+            difficulty_snapshot,
+            easy_mix_frac=args.easy_mix_frac,
+            curriculum_jitter=args.curriculum_jitter,
+            min_difficulty=args.min_difficulty,
+        )
+        eval_difficulty_fn = CurriculumEvalDifficultySampler(
+            difficulty_snapshot,
+            min_difficulty=args.min_difficulty,
+        )
 
         min_task_prob = 0.05
 
-        def weighting_fn(task: str) -> float:
-            return weights_snapshot.get(task, 1.0)
-
-        def weighting_adjust_fn(tasks: Sequence[str], weights: List[float]) -> List[float]:
-            if not tasks:
-                return weights
-            mean_difficulty = sum(
-                difficulty_snapshot.get(task, 0.2) for task in tasks
-            ) / len(tasks)
-            if mean_difficulty >= 0.2:
-                return weights
-            return _apply_minimum_probability(weights, min_task_prob)
-
-        def _compute_dag_weighting(
-            tasks: Sequence[str], weights: Sequence[float]
-        ) -> Tuple[List[float], Dict[str, float], Dict[str, float]]:
-            if not tasks:
-                return [], {}, {}
-            gates = [dag_gate_snapshot.get(task, 0.0) for task in tasks]
-            unlocked = [idx for idx, gate in enumerate(gates) if gate > 0.0]
-            locked = [idx for idx, gate in enumerate(gates) if gate <= 0.0]
-            if not unlocked:
-                total = sum(weights)
-                probs = {
-                    task: (weight / total if total else 0.0)
-                    for task, weight in zip(tasks, weights)
-                }
-                return list(weights), probs, {task: weight for task, weight in zip(tasks, weights)}
-
-            gated_weights = [weight * gate for weight, gate in zip(weights, gates)]
-            total_gated = sum(gated_weights[idx] for idx in unlocked)
-            if total_gated <= 0.0:
-                for idx in unlocked:
-                    gated_weights[idx] = 1.0
-                total_gated = float(len(unlocked))
-
-            frontier_set = set(dag_frontier_snapshot)
-            frontier_indices = [
-                idx for idx, task in enumerate(tasks) if task in frontier_set and gates[idx] > 0.0
-            ]
-            replay_indices = [
-                idx for idx in unlocked if idx not in frontier_indices
-            ]
-
-            total_frontier = sum(gated_weights[idx] for idx in frontier_indices)
-            total_replay = sum(gated_weights[idx] for idx in replay_indices)
-
-            probs: List[float] = [0.0] * len(tasks)
-            replay_ratio = dag_replay_ratio_snapshot
-            if not frontier_indices:
-                replay_ratio = 1.0
-            elif not replay_indices:
-                replay_ratio = 0.0
-            if total_frontier > 0.0:
-                for idx in frontier_indices:
-                    probs[idx] += (1.0 - replay_ratio) * (gated_weights[idx] / total_frontier)
-            if total_replay > 0.0:
-                for idx in replay_indices:
-                    probs[idx] += replay_ratio * (gated_weights[idx] / total_replay)
-
-            if sum(probs) <= 0.0:
-                uniform = 1.0 / len(unlocked)
-                for idx in unlocked:
-                    probs[idx] = uniform
-
-            min_prob_unlocked_total = 0.02
-            floor_unlocked = min_prob_unlocked_total / len(unlocked)
-            for idx in unlocked:
-                probs[idx] = max(probs[idx], floor_unlocked)
-
-            min_prob_frontier_total = 0.03
-            if frontier_indices:
-                floor_frontier = min_prob_frontier_total / len(frontier_indices)
-                for idx in frontier_indices:
-                    probs[idx] = max(probs[idx], floor_frontier)
-
-            locked_floor_total = max(args.dag_locked_floor, 0.0)
-            if locked and locked_floor_total > 0.0:
-                locked_weight_total = sum(weights[idx] for idx in locked)
-                if locked_weight_total <= 0.0:
-                    locked_weight_total = float(len(locked))
-                    for idx in locked:
-                        weights[idx] = 1.0
-                for idx in locked:
-                    probs[idx] = max(
-                        probs[idx],
-                        locked_floor_total * (weights[idx] / locked_weight_total),
-                    )
-
-            total = sum(probs)
-            if total <= 0.0:
-                uniform = 1.0 / len(unlocked)
-                for idx in unlocked:
-                    probs[idx] = uniform
-                total = 1.0
-            probs = [prob / total for prob in probs]
-            prob_map = {task: prob for task, prob in zip(tasks, probs)}
-            gated_map = {task: weight for task, weight in zip(tasks, gated_weights)}
-            return probs, prob_map, gated_map
+        weighting_fn = CurriculumWeightingSampler(weights_snapshot)
+        weighting_adjust_fn = CurriculumWeightingAdjuster(
+            difficulty_snapshot,
+            min_task_prob=min_task_prob,
+        )
 
     if dag_state is not None:
-        def weighting_adjust_fn(tasks: Sequence[str], weights: List[float]) -> List[float]:
-            adjusted, _, _ = _compute_dag_weighting(tasks, weights)
-            return adjusted
+        weighting_adjust_fn = DagWeightingAdjuster(
+            dag_gate_snapshot,
+            dag_frontier_snapshot,
+            dag_replay_ratio_snapshot,
+            args.dag_locked_floor,
+        )
 
     collate_fn = make_collate_fn(tokenizer)
 
@@ -2752,8 +2849,13 @@ def train(args):
                 progress_ratio = min(curriculum.tokens_seen / max(args.alg_tokens, 1), 1.0)
                 if dag_state is not None:
                     base_weights = [weights_snapshot.get(task, 1.0) for task in active_tasks]
-                    final_weights, final_probs, gated_weights = _compute_dag_weighting(
-                        active_tasks, base_weights
+                    final_weights, final_probs, gated_weights = compute_dag_weighting(
+                        active_tasks,
+                        base_weights,
+                        dag_gate_snapshot,
+                        dag_frontier_snapshot,
+                        dag_replay_ratio_snapshot[0],
+                        args.dag_locked_floor,
                     )
                     dag_prob_snapshot = dict(final_probs)
                     dag_gated_weight_snapshot = dict(gated_weights)
@@ -2841,8 +2943,13 @@ def train(args):
                 progress_ratio = min(curriculum.tokens_seen / max(args.alg_tokens, 1), 1.0)
                 if dag_state is not None:
                     base_weights = [weights_snapshot.get(task, 1.0) for task in active_tasks]
-                    _, eval_task_probs, eval_gated_weights = _compute_dag_weighting(
-                        active_tasks, base_weights
+                    _, eval_task_probs, eval_gated_weights = compute_dag_weighting(
+                        active_tasks,
+                        base_weights,
+                        dag_gate_snapshot,
+                        dag_frontier_snapshot,
+                        dag_replay_ratio_snapshot[0],
+                        args.dag_locked_floor,
                     )
                     eval_task_metrics = {
                         f"eval.task_prob.{task}": prob
@@ -3258,14 +3365,19 @@ def train(args):
                                 for task in dag_state.tasks
                             }
                             dag_state.update_from_ema(ema_snapshot)
-                            dag_gate_snapshot = dag_state.get_gate_snapshot()
-                            dag_frontier_snapshot = dag_state.compute_frontier(ema_snapshot)
-                            dag_replay_ratio_snapshot = dag_state.compute_replay_ratio(
+                            dag_gate_snapshot.clear()
+                            dag_gate_snapshot.update(dag_state.get_gate_snapshot())
+                            dag_frontier_snapshot.clear()
+                            dag_frontier_snapshot.update(
+                                dag_state.compute_frontier(ema_snapshot)
+                            )
+                            dag_replay_ratio_snapshot[0] = dag_state.compute_replay_ratio(
                                 ema_snapshot
                             )
-                            dag_unlocked_snapshot = {
-                                task for task, gate in dag_gate_snapshot.items() if gate > 0.0
-                            }
+                            dag_unlocked_snapshot.clear()
+                            dag_unlocked_snapshot.update(
+                                {task for task, gate in dag_gate_snapshot.items() if gate > 0.0}
+                            )
                             dag_ema_snapshot = dict(ema_snapshot)
                             dag_metrics = {
                                 f"curriculum.gate.{task}": gate
@@ -3281,7 +3393,7 @@ def train(args):
                                 len(dag_unlocked_snapshot)
                             )
                             dag_metrics["curriculum.dag_replay_ratio"] = (
-                                dag_replay_ratio_snapshot
+                                dag_replay_ratio_snapshot[0]
                             )
                             curriculum_metrics.update(dag_metrics)
                         unlock_warmup_evals = (
