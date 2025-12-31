@@ -849,11 +849,12 @@ class BaselineTransformer(nn.Module):
                 # kv_cache[0] expected to be (K,V) for transformer paths
                 past_len = kv_cache[0][0].size(2)
 
-            if past_len > 0:
-                mask = torch.zeros((T, past_len + T), device=device)
+            if past_len > 0 or padding_mask is not None:
+                total_len = past_len + T
+                mask = torch.zeros((T, total_len), device=device)
                 mask[:, past_len:] = self._make_causal_mask(T, device)
                 mask = mask.unsqueeze(0).unsqueeze(0)
-                if padding_mask is not None:
+                if padding_mask is not None and past_len > 0:
                     past_padding = torch.zeros(
                         (B, 1, 1, past_len),
                         dtype=padding_mask.dtype,
