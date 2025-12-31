@@ -20,6 +20,9 @@ Metrics tracked for ladder comparison:
 """
 
 import os
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import sys
 import time
 import math
