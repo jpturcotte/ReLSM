@@ -105,7 +105,7 @@ class TransformerConfig:
     # Tokenization / sequence
     vocab_size: int = 50257
     max_seq_len: int = 1024
-    pad_token_id: int = 0
+    pad_token_id: Optional[int] = None
 
     # Transformer backbone
     d_model: int = 768
@@ -282,6 +282,7 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         position_ids: Optional[torch.Tensor] = None,
@@ -314,6 +315,11 @@ class Attention(nn.Module):
 
         k = self._repeat_kv(k)
         v = self._repeat_kv(v)
+
+        if mask is not None and padding_mask is not None:
+            mask = mask + padding_mask
+        elif padding_mask is not None:
+            mask = padding_mask
 
         dropout_p = self.attn_dropout.p if self.training else 0.0
         if mask is None:
@@ -356,11 +362,19 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        h, new_cache = self.attn(self.attn_norm(x), mask, kv_cache, use_cache, position_ids)
+        h, new_cache = self.attn(
+            self.attn_norm(x),
+            mask,
+            padding_mask,
+            kv_cache,
+            use_cache,
+            position_ids,
+        )
         x = x + h
         x = x + self.ff(self.ff_norm(x))
         return x, new_cache
@@ -798,6 +812,20 @@ class BaselineTransformer(nn.Module):
         h = h + self.thought_to_tok(z_sum)   # broadcast
         return h
 
+    def _build_padding_mask(
+        self,
+        input_ids: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if self.config.pad_token_id is None:
+            return None
+        is_pad = input_ids.eq(self.config.pad_token_id)
+        if not is_pad.any():
+            return None
+        B, T = input_ids.shape
+        mask = torch.zeros((B, 1, 1, T), dtype=dtype, device=input_ids.device)
+        return mask.masked_fill(is_pad.view(B, 1, 1, T), float("-inf"))
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -811,9 +839,7 @@ class BaselineTransformer(nn.Module):
 
         x = self.drop(self.tok_emb(input_ids))
 
-        is_not_pad = input_ids.ne(self.config.pad_token_id)
-        kv_mask = torch.zeros((B, 1, 1, T), dtype=x.dtype, device=device)
-        kv_mask = kv_mask.masked_fill(~is_not_pad.view(B, 1, 1, T), float("-inf"))
+        padding_mask = self._build_padding_mask(input_ids, x.dtype)
 
         # Baseline Transformer path uses causal mask; SSM path does not.
         mask = None
@@ -826,6 +852,14 @@ class BaselineTransformer(nn.Module):
             if past_len > 0:
                 mask = torch.zeros((T, past_len + T), device=device)
                 mask[:, past_len:] = self._make_causal_mask(T, device)
+                mask = mask.unsqueeze(0).unsqueeze(0)
+                if padding_mask is not None:
+                    past_padding = torch.zeros(
+                        (B, 1, 1, past_len),
+                        dtype=padding_mask.dtype,
+                        device=device,
+                    )
+                    padding_mask = torch.cat([past_padding, padding_mask], dim=-1)
             else:
                 mask = None
 
@@ -836,7 +870,7 @@ class BaselineTransformer(nn.Module):
             for step in range(self.config.n_unroll):
                 layer = self.unique_layers[step % len(self.unique_layers)]
                 layer_cache = kv_cache[step] if kv_cache is not None else None
-                x, cache = layer(x, mask, layer_cache, use_cache, position_ids)
+                x, cache = layer(x, mask, padding_mask, layer_cache, use_cache, position_ids)
                 if use_cache:
                     new_cache.append(cache)
         elif self._use_ssm:
@@ -848,18 +882,18 @@ class BaselineTransformer(nn.Module):
         else:
             for i, layer in enumerate(self.layers):
                 layer_cache = kv_cache[i] if kv_cache is not None else None
-                x, cache = layer(x, mask, layer_cache, use_cache, position_ids)
+                x, cache = layer(x, mask, padding_mask, layer_cache, use_cache, position_ids)
                 if use_cache:
                     new_cache.append(cache)
 
         # Optional memory compression (Exp4B)
         mem = None
         if self._use_mem and self.mem_comp is not None:
-            mem, x = self.mem_comp(x, kv_mask=kv_mask)
+            mem, x = self.mem_comp(x, kv_mask=padding_mask)
 
         # Optional thought loop (Exp2/3/4)
         if self._use_thought:
-            x = self._apply_thought_loop(x, mem, kv_mask=kv_mask)
+            x = self._apply_thought_loop(x, mem, kv_mask=padding_mask)
 
         x = self.norm(x)
         logits = self.lm_head(x)
