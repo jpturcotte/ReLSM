@@ -1006,6 +1006,7 @@ def create_model(
     max_seq_len: int = 1024,
     use_gqa: bool = False,
     variant: str = "baseline",
+    pad_token_id: Optional[int] = None,
     **kwargs,
 ) -> BaselineTransformer:
     """
@@ -1021,7 +1022,13 @@ def create_model(
     Variant:
       baseline | shared_loop | latent | act | ssm | ssm_mem
     """
-    base = dict(vocab_size=vocab_size, max_seq_len=max_seq_len, use_gqa=use_gqa, variant=variant)
+    base = dict(
+        vocab_size=vocab_size,
+        max_seq_len=max_seq_len,
+        use_gqa=use_gqa,
+        variant=variant,
+        pad_token_id=pad_token_id,
+    )
     base.update(kwargs)
 
     configs = {

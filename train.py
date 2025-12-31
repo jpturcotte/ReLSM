@@ -1918,6 +1918,7 @@ def train(args):
         size=size,
         variant=args.variant,
         vocab_size=tokenizer.vocab_size,
+        pad_token_id=tokenizer.pad_token_id,
         K=args.K,
         min_K=args.min_K,
         max_K=args.max_K,
