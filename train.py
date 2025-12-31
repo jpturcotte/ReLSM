@@ -720,8 +720,8 @@ def run_eval_diagnostics(
     def _capture_block_input(_module, inputs, _output):
         if inputs:
             last_block_input["x"] = inputs[0].detach()
-        if len(inputs) > 4 and inputs[4] is not None:
-            last_block_input["position_ids"] = inputs[4].detach()
+        if len(inputs) > 5 and inputs[5] is not None:
+            last_block_input["position_ids"] = inputs[5].detach()
 
     if diagnostic_blocks:
         indices = {
