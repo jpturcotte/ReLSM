@@ -105,6 +105,7 @@ class TransformerConfig:
     # Tokenization / sequence
     vocab_size: int = 50257
     max_seq_len: int = 1024
+    pad_token_id: Optional[int] = None
 
     # Transformer backbone
     d_model: int = 768
@@ -281,6 +282,7 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         position_ids: Optional[torch.Tensor] = None,
@@ -313,6 +315,11 @@ class Attention(nn.Module):
 
         k = self._repeat_kv(k)
         v = self._repeat_kv(v)
+
+        if mask is not None and padding_mask is not None:
+            mask = mask + padding_mask
+        elif padding_mask is not None:
+            mask = padding_mask
 
         dropout_p = self.attn_dropout.p if self.training else 0.0
         if mask is None:
@@ -355,11 +362,19 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        h, new_cache = self.attn(self.attn_norm(x), mask, kv_cache, use_cache, position_ids)
+        h, new_cache = self.attn(
+            self.attn_norm(x),
+            mask,
+            padding_mask,
+            kv_cache,
+            use_cache,
+            position_ids,
+        )
         x = x + h
         x = x + self.ff(self.ff_norm(x))
         return x, new_cache
@@ -388,7 +403,12 @@ class CrossAttention(nn.Module):
         self.o_proj = nn.Linear(d_model, d_model, bias=bias)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, q_in: torch.Tensor, kv_in: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        q_in: torch.Tensor,
+        kv_in: torch.Tensor,
+        kv_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         B, Q, D = q_in.shape
         _, T, _ = kv_in.shape
 
@@ -397,6 +417,8 @@ class CrossAttention(nn.Module):
         v = self.v_proj(kv_in).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
         w = (q @ k.transpose(-2, -1)) * self.scale
+        if kv_mask is not None:
+            w = w + kv_mask
         w = F.softmax(w, dim=-1, dtype=torch.float32).type_as(q)
         w = self.drop(w)
 
@@ -414,8 +436,13 @@ class ThoughtCore(nn.Module):
         self.ff_norm = RMSNorm(config.d_model)
         self.ff = FeedForward(config)
 
-    def forward(self, z: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
-        z = z + self.xattn(self.z_norm(z), self.kv_norm(kv))
+    def forward(
+        self,
+        z: torch.Tensor,
+        kv: torch.Tensor,
+        kv_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        z = z + self.xattn(self.z_norm(z), self.kv_norm(kv), kv_mask=kv_mask)
         z = z + self.ff(self.ff_norm(z))
         return z
 
@@ -437,11 +464,15 @@ class MemoryCompressor(nn.Module):
         self.mem_read = CrossAttention(config.d_model, config.n_heads, dropout=config.dropout, bias=config.bias)  # mem <- toks
         self.tok_read = CrossAttention(config.d_model, config.n_heads, dropout=config.dropout, bias=config.bias)  # toks <- mem
 
-    def forward(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        h: torch.Tensor,
+        kv_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, T, D = h.shape
         mem = self.mem_init.expand(B, -1, -1)
 
-        mem = mem + self.mem_read(self.mem_norm(mem), self.tok_norm(h))     # build memory summary
+        mem = mem + self.mem_read(self.mem_norm(mem), self.tok_norm(h), kv_mask=kv_mask)     # build memory summary
         h2 = h + self.tok_read(self.tok_norm(h), self.mem_norm(mem))        # inject memory back
         return mem, h2
 
@@ -705,7 +736,12 @@ class BaselineTransformer(nn.Module):
             return toks
         return torch.cat([mem, toks], dim=1)
 
-    def _apply_thought_loop(self, h: torch.Tensor, mem: Optional[torch.Tensor]) -> torch.Tensor:
+    def _apply_thought_loop(
+        self,
+        h: torch.Tensor,
+        mem: Optional[torch.Tensor],
+        kv_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Apply latent thought loop and inject a summary back into token hidden states.
         """
@@ -713,6 +749,16 @@ class BaselineTransformer(nn.Module):
         B, T, D = h.shape
 
         kv = self._select_kv_source(h, mem)
+        if kv_mask is not None:
+            if cfg.local_window and cfg.local_window > 0:
+                kv_mask = kv_mask[..., -cfg.local_window:]
+            if mem is not None:
+                mem_mask = torch.zeros(
+                    (B, 1, 1, mem.size(1)),
+                    device=h.device,
+                    dtype=kv_mask.dtype,
+                )
+                kv_mask = torch.cat([mem_mask, kv_mask], dim=-1)
         z = self.thought_init.expand(B, -1, -1)
 
         self.aux = {"inner_steps": 0, "ponder": 0.0}
@@ -726,7 +772,7 @@ class BaselineTransformer(nn.Module):
 
             # enforce a minimum number of steps
             for k in range(cfg.max_K):
-                z = self.thought_core(z, kv)
+                z = self.thought_core(z, kv, kv_mask=kv_mask)
 
                 p = torch.sigmoid(self.halt_head(z.mean(dim=1)))  # (B,1)
 
@@ -757,7 +803,7 @@ class BaselineTransformer(nn.Module):
         else:
             # Fixed-K
             for _ in range(max(1, cfg.K)):
-                z = self.thought_core(z, kv)
+                z = self.thought_core(z, kv, kv_mask=kv_mask)
             self.aux["inner_steps"] = int(max(1, cfg.K))
             self.aux["ponder"] = 0.0
 
@@ -765,6 +811,20 @@ class BaselineTransformer(nn.Module):
         z_sum = z.mean(dim=1, keepdim=True)  # (B,1,D)
         h = h + self.thought_to_tok(z_sum)   # broadcast
         return h
+
+    def _build_padding_mask(
+        self,
+        input_ids: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if self.config.pad_token_id is None:
+            return None
+        is_pad = input_ids.eq(self.config.pad_token_id)
+        if not is_pad.any():
+            return None
+        B, T = input_ids.shape
+        mask = torch.zeros((B, 1, 1, T), dtype=dtype, device=input_ids.device)
+        return mask.masked_fill(is_pad.view(B, 1, 1, T), float("-inf"))
 
     def forward(
         self,
@@ -779,14 +839,28 @@ class BaselineTransformer(nn.Module):
 
         x = self.drop(self.tok_emb(input_ids))
 
+        padding_mask = self._build_padding_mask(input_ids, x.dtype)
+
         # Baseline Transformer path uses causal mask; SSM path does not.
         mask = None
         if not self._use_ssm:
+            past_len = 0
             if kv_cache is not None and len(kv_cache) > 0 and kv_cache[0] is not None:
                 # kv_cache[0] expected to be (K,V) for transformer paths
                 past_len = kv_cache[0][0].size(2)
-                mask = torch.zeros((T, past_len + T), device=device)
+
+            if past_len > 0 or padding_mask is not None:
+                total_len = past_len + T
+                mask = torch.zeros((T, total_len), device=device)
                 mask[:, past_len:] = self._make_causal_mask(T, device)
+                mask = mask.unsqueeze(0).unsqueeze(0)
+                if padding_mask is not None and past_len > 0:
+                    past_padding = torch.zeros(
+                        (B, 1, 1, past_len),
+                        dtype=padding_mask.dtype,
+                        device=device,
+                    )
+                    padding_mask = torch.cat([past_padding, padding_mask], dim=-1)
             else:
                 mask = None
 
@@ -797,7 +871,7 @@ class BaselineTransformer(nn.Module):
             for step in range(self.config.n_unroll):
                 layer = self.unique_layers[step % len(self.unique_layers)]
                 layer_cache = kv_cache[step] if kv_cache is not None else None
-                x, cache = layer(x, mask, layer_cache, use_cache, position_ids)
+                x, cache = layer(x, mask, padding_mask, layer_cache, use_cache, position_ids)
                 if use_cache:
                     new_cache.append(cache)
         elif self._use_ssm:
@@ -809,18 +883,18 @@ class BaselineTransformer(nn.Module):
         else:
             for i, layer in enumerate(self.layers):
                 layer_cache = kv_cache[i] if kv_cache is not None else None
-                x, cache = layer(x, mask, layer_cache, use_cache, position_ids)
+                x, cache = layer(x, mask, padding_mask, layer_cache, use_cache, position_ids)
                 if use_cache:
                     new_cache.append(cache)
 
         # Optional memory compression (Exp4B)
         mem = None
         if self._use_mem and self.mem_comp is not None:
-            mem, x = self.mem_comp(x)
+            mem, x = self.mem_comp(x, kv_mask=padding_mask)
 
         # Optional thought loop (Exp2/3/4)
         if self._use_thought:
-            x = self._apply_thought_loop(x, mem)
+            x = self._apply_thought_loop(x, mem, kv_mask=padding_mask)
 
         x = self.norm(x)
         logits = self.lm_head(x)
@@ -933,6 +1007,7 @@ def create_model(
     max_seq_len: int = 1024,
     use_gqa: bool = False,
     variant: str = "baseline",
+    pad_token_id: Optional[int] = None,
     **kwargs,
 ) -> BaselineTransformer:
     """
@@ -948,7 +1023,13 @@ def create_model(
     Variant:
       baseline | shared_loop | latent | act | ssm | ssm_mem
     """
-    base = dict(vocab_size=vocab_size, max_seq_len=max_seq_len, use_gqa=use_gqa, variant=variant)
+    base = dict(
+        vocab_size=vocab_size,
+        max_seq_len=max_seq_len,
+        use_gqa=use_gqa,
+        variant=variant,
+        pad_token_id=pad_token_id,
+    )
     base.update(kwargs)
 
     configs = {
