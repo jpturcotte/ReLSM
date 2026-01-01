@@ -1999,6 +1999,11 @@ def train(args):
     
     log_print("\nLoading datasets...")
 
+    if args.disable_dynamic_task_weighting:
+        if args.task_weighting != "uniform":
+            log_print("Dynamic task weighting disabled; using uniform task sampling.")
+        args.task_weighting = "uniform"
+
     task_curriculum = None
     difficulty_fn = None
     eval_difficulty_fn = None
@@ -2118,13 +2123,14 @@ def train(args):
 
         min_task_prob = 0.05
 
-        weighting_fn = CurriculumWeightingSampler(weights_snapshot)
-        weighting_adjust_fn = CurriculumWeightingAdjuster(
-            difficulty_snapshot,
-            min_task_prob=min_task_prob,
-        )
+        if not args.disable_dynamic_task_weighting:
+            weighting_fn = CurriculumWeightingSampler(weights_snapshot)
+            weighting_adjust_fn = CurriculumWeightingAdjuster(
+                difficulty_snapshot,
+                min_task_prob=min_task_prob,
+            )
 
-    if dag_state is not None:
+    if dag_state is not None and not args.disable_dynamic_task_weighting:
         weighting_adjust_fn = DagWeightingAdjuster(
             dag_gate_snapshot,
             dag_frontier_snapshot,
@@ -3781,6 +3787,11 @@ def main():
         default="adaptive",
         choices=["uniform", "adaptive"],
         help="Task sampling weights",
+    )
+    parser.add_argument(
+        "--disable_dynamic_task_weighting",
+        action="store_true",
+        help="Disable dynamic task weighting and use uniform task sampling.",
     )
     parser.add_argument(
         "--use_task_curriculum",
