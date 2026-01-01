@@ -312,7 +312,7 @@ class MetricsLogger:
         self.records = []
         self.task_accuracies = {}
         self.ood_task_accuracies = {}
-        self.train_task_accuracies = {}
+        self.train_eval_task_accuracies = {}
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._metrics_path = self.output_dir / "metrics.json"
         if not self._metrics_path.exists():
@@ -334,23 +334,24 @@ class MetricsLogger:
         mean_distance: Optional[float] = None,
         mean_prefix_accuracy: Optional[float] = None,
     ):
-        if target == "train":
-            store = self.train_task_accuracies
+        if target == "train_eval":
+            store = self.train_eval_task_accuracies
         elif target == "eval_ood":
             store = self.ood_task_accuracies
         else:
             store = self.task_accuracies
         if task not in store:
             store[task] = []
-        entry = {"step": step, "accuracy": accuracy}
+        prefix = target
+        entry = {"step": step, f"{prefix}/acc/exact_match": accuracy}
         if mae is not None:
-            entry["mae"] = mae
+            entry[f"{prefix}/numeric/mae"] = mae
         if mean_token_accuracy is not None:
-            entry["mean_token_accuracy"] = mean_token_accuracy
+            entry[f"{prefix}/acc/token"] = mean_token_accuracy
         if mean_distance is not None:
-            entry["mean_distance"] = mean_distance
+            entry[f"{prefix}/acc/distance"] = mean_distance
         if mean_prefix_accuracy is not None:
-            entry["mean_prefix_accuracy"] = mean_prefix_accuracy
+            entry[f"{prefix}/acc/prefix"] = mean_prefix_accuracy
         store[task].append(entry)
     
     def save(self):
@@ -400,12 +401,12 @@ class MetricsLogger:
                         f,
                     )
                     f.write("\n")
-            for task, records in self.train_task_accuracies.items():
+            for task, records in self.train_eval_task_accuracies.items():
                 for entry in records:
                     json.dump(
                         {
                             "type": "task_accuracy",
-                            "target": "train",
+                            "target": "train_eval",
                             "task": task,
                             **entry,
                         },
@@ -415,11 +416,11 @@ class MetricsLogger:
         os.replace(tmp_path, self._metrics_path)
     
     def summary(self) -> Dict:
-        train_losses = self.series("train_loss")[1]
-        val_losses = self.series("val_loss")[1]
-        peak_vram = self.series("peak_vram_gb")[1]
-        tokens_per_sec = self.series("tokens_per_sec")[1]
-        tokens_seen = self.series("tokens_seen")[1]
+        train_losses = self.series("train/loss/ce")[1]
+        val_losses = self.series("eval/loss/ce")[1]
+        peak_vram = self.series("train/throughput/vram_gb")[1]
+        tokens_per_sec = self.series("train/throughput/tokens_per_sec")[1]
+        tokens_seen = self.series("train/throughput/tokens_seen")[1]
         return {
             "final_train_loss": train_losses[-1] if train_losses else None,
             "final_val_loss": val_losses[-1] if val_losses else None,
@@ -435,11 +436,11 @@ class MetricsLogger:
 
         # Loss plot
         plt.figure()
-        train_steps, train_losses = self.series("train_loss")
+        train_steps, train_losses = self.series("train/loss/ce")
         if train_steps and train_losses:
             plt.plot(train_steps, train_losses, label="train")
 
-        val_steps, val_losses = self.series("val_loss", phase="eval")
+        val_steps, val_losses = self.series("eval/loss/ce", phase="eval")
         if val_steps and val_losses:
             plt.plot(val_steps, val_losses, label="val")
 
@@ -455,17 +456,17 @@ class MetricsLogger:
         plt.close()
 
         # Update-scale proxies vs loss
-        update_steps, update_postclip = self.series("update_norm_est_postclip")
-        loss_steps, loss_values = self.series("train_loss")
+        update_steps, update_postclip = self.series("train/update/norm/postclip")
+        loss_steps, loss_values = self.series("train/loss/ce")
         if update_steps and update_postclip:
             fig, ax1 = plt.subplots()
-            ax1.plot(update_steps, update_postclip, label="update_norm_est_postclip")
+            ax1.plot(update_steps, update_postclip, label="train/update/norm/postclip")
             ax1.set_xlabel("Step")
             ax1.set_ylabel("Update norm (postclip)")
             ax1.grid(True)
             ax2 = ax1.twinx()
             if loss_steps and loss_values:
-                ax2.plot(loss_steps, loss_values, alpha=0.6, label="train_loss")
+                ax2.plot(loss_steps, loss_values, alpha=0.6, label="train/loss/ce")
                 ax2.set_ylabel("Loss")
                 ax2.set_yscale("log")
             lines, labels = ax1.get_legend_handles_labels()
@@ -477,21 +478,21 @@ class MetricsLogger:
             plt.close(fig)
 
         update_weight_steps, update_weight_postclip = self.series(
-            "update_to_weight_postclip"
+            "train/update/ratio/postclip"
         )
         if update_weight_steps and update_weight_postclip:
             fig, ax1 = plt.subplots()
             ax1.plot(
                 update_weight_steps,
                 update_weight_postclip,
-                label="update_to_weight_postclip",
+                label="train/update/ratio/postclip",
             )
             ax1.set_xlabel("Step")
             ax1.set_ylabel("Update/weight (postclip)")
             ax1.grid(True)
             ax2 = ax1.twinx()
             if loss_steps and loss_values:
-                ax2.plot(loss_steps, loss_values, alpha=0.6, label="train_loss")
+                ax2.plot(loss_steps, loss_values, alpha=0.6, label="train/loss/ce")
                 ax2.set_ylabel("Loss")
                 ax2.set_yscale("log")
             lines, labels = ax1.get_legend_handles_labels()
@@ -506,7 +507,7 @@ class MetricsLogger:
         plt.figure()
         for task, records in self.task_accuracies.items():
             steps = [entry["step"] for entry in records]
-            accuracies = [entry["accuracy"] for entry in records]
+            accuracies = [entry["eval/acc/exact_match"] for entry in records]
             if steps and accuracies:
                 plt.plot(steps, accuracies, label=task)
 
@@ -525,7 +526,7 @@ class MetricsLogger:
             plt.figure()
             for task, records in self.ood_task_accuracies.items():
                 steps = [entry["step"] for entry in records]
-                accuracies = [entry["accuracy"] for entry in records]
+                accuracies = [entry["eval_ood/acc/exact_match"] for entry in records]
                 if steps and accuracies:
                     plt.plot(steps, accuracies, label=task)
 
@@ -539,11 +540,11 @@ class MetricsLogger:
             plt.close()
 
         # Training task accuracy plot
-        if self.train_task_accuracies:
+        if self.train_eval_task_accuracies:
             plt.figure()
-            for task, records in self.train_task_accuracies.items():
+            for task, records in self.train_eval_task_accuracies.items():
                 steps = [entry["step"] for entry in records]
-                accuracies = [entry["accuracy"] for entry in records]
+                accuracies = [entry["train_eval/acc/exact_match"] for entry in records]
                 if steps and accuracies:
                     plt.plot(steps, accuracies, label=task)
 
@@ -747,7 +748,7 @@ def run_eval_diagnostics(
     for label in ("early", "mid", "late"):
         ff_out = ff_outputs.get(label)
         if ff_out is not None:
-            metrics[f"act_sparsity.ff.{label}"] = (
+            metrics[f"eval/act/sparsity/ff/{label}"] = (
                 (ff_out.abs() < 1e-4).float().mean().item()
             )
 
@@ -779,14 +780,14 @@ def run_eval_diagnostics(
             selected = probs[batch_ids, head_ids, pos_ids, :]
             entropy = -(selected * (selected + 1e-12).log()).sum(dim=-1)
             mean_by_head = entropy.mean(dim=1)
-            metrics["attn_entropy_last_mean"] = mean_by_head.mean().item()
-            metrics["attn_entropy_last_std"] = mean_by_head.std(unbiased=False).item()
+            metrics["eval/attn/entropy/last/mean"] = mean_by_head.mean().item()
+            metrics["eval/attn/entropy/last/std"] = mean_by_head.std(unbiased=False).item()
 
     if last_block is not None:
-        metrics["weight_entropy.last_block"] = compute_weight_entropy(last_block)
+        metrics["eval/weight/entropy/last_block"] = compute_weight_entropy(last_block)
     head_module = diagnostic_modules.get("head")
     if head_module is not None:
-        metrics["weight_entropy.head"] = compute_weight_entropy(head_module)
+        metrics["eval/weight/entropy/head"] = compute_weight_entropy(head_module)
 
     if was_training:
         model.train()
@@ -858,6 +859,16 @@ def _apply_minimum_probability(weights: Sequence[float], min_prob: float) -> Lis
     return adjusted
 
 
+def _relabel_phase(metrics: Dict[str, float], phase: str) -> Dict[str, float]:
+    relabeled = {}
+    for key, value in metrics.items():
+        if "/" in key:
+            relabeled[f"{phase}/{key.split('/', 1)[1]}"] = value
+        else:
+            relabeled[f"{phase}/{key}"] = value
+    return relabeled
+
+
 def _flatten_eval_diagnostics(prefix: str, diagnostics: Dict[str, Any]) -> Dict[str, float]:
     flat: Dict[str, float] = {}
     if not diagnostics:
@@ -866,145 +877,155 @@ def _flatten_eval_diagnostics(prefix: str, diagnostics: Dict[str, Any]) -> Dict[
     mean_lengths = answer_len.get("mean", {})
     for key, value in mean_lengths.items():
         metric = {
-            "target_len_tokens": "target_len",
-            "pred_len_tokens": "pred_len",
-            "length_ratio": "length_ratio",
-            "abs_len_error": "len_error",
-            "pred_len_tokens_p50": "pred_len_p50",
-            "pred_len_tokens_p90": "pred_len_p90",
-        }.get(key, key)
-        flat[f"{prefix}.{metric}.mean"] = float(value)
+            "target_len_tokens": "gen/len/target/mean",
+            "pred_len_tokens": "gen/len/pred/mean",
+            "length_ratio": "gen/len/ratio/mean",
+            "abs_len_error": "gen/len/error/mean",
+            "pred_len_tokens_p50": "gen/len/pred/p50",
+            "pred_len_tokens_p90": "gen/len/pred/p90",
+        }.get(key, f"gen/len/{key}/mean")
+        flat[f"{prefix}/{metric}"] = float(value)
     for task, payload in answer_len.get("by_task", {}).items():
         for key, value in payload.items():
             metric = {
-                "target_len_tokens": "target_len",
-                "pred_len_tokens": "pred_len",
-                "length_ratio": "length_ratio",
-                "abs_len_error": "len_error",
-                "pred_len_tokens_p50": "pred_len_p50",
-                "pred_len_tokens_p90": "pred_len_p90",
-            }.get(key, key)
-            flat[f"{prefix}.{metric}.by_task.{task}"] = float(value)
-    flat[f"{prefix}.eos_emitted_rate"] = float(answer_len.get("eos_emitted_rate", 0.0))
-    flat[f"{prefix}.eos_first_rate"] = float(answer_len.get("eos_first_rate", 0.0))
-    flat[f"{prefix}.empty_rate"] = float(answer_len.get("empty_rate", 0.0))
-    flat[f"{prefix}.max_new_tokens_rate"] = float(
+                "target_len_tokens": "gen/len/target",
+                "pred_len_tokens": "gen/len/pred",
+                "length_ratio": "gen/len/ratio",
+                "abs_len_error": "gen/len/error",
+                "pred_len_tokens_p50": "gen/len/pred/p50",
+                "pred_len_tokens_p90": "gen/len/pred/p90",
+            }.get(key, f"gen/len/{key}")
+            flat[f"{prefix}/{metric}/{task}"] = float(value)
+    flat[f"{prefix}/gen/stop/eos_rate"] = float(answer_len.get("eos_emitted_rate", 0.0))
+    flat[f"{prefix}/gen/stop/eos_first_rate"] = float(
+        answer_len.get("eos_first_rate", 0.0)
+    )
+    flat[f"{prefix}/gen/empty_rate"] = float(answer_len.get("empty_rate", 0.0))
+    flat[f"{prefix}/gen/stop/truncated_rate"] = float(
         answer_len.get("max_new_tokens_rate", 0.0)
     )
     for task, rate in answer_len.get("eos_emitted_rate_by_task", {}).items():
-        flat[f"{prefix}.eos_emitted_rate.by_task.{task}"] = float(rate)
+        flat[f"{prefix}/gen/stop/eos_rate/{task}"] = float(rate)
     for task, rate in answer_len.get("eos_first_rate_by_task", {}).items():
-        flat[f"{prefix}.eos_first_rate.by_task.{task}"] = float(rate)
+        flat[f"{prefix}/gen/stop/eos_first_rate/{task}"] = float(rate)
     for task, rate in answer_len.get("empty_rate_by_task", {}).items():
-        flat[f"{prefix}.empty_rate.by_task.{task}"] = float(rate)
+        flat[f"{prefix}/gen/empty_rate/{task}"] = float(rate)
     for task, rate in answer_len.get("max_new_tokens_rate_by_task", {}).items():
-        flat[f"{prefix}.max_new_tokens_rate.by_task.{task}"] = float(rate)
+        flat[f"{prefix}/gen/stop/truncated_rate/{task}"] = float(rate)
     for reason, count in answer_len.get("stop_reason_counts", {}).items():
-        flat[f"{prefix}.stop_reason.{reason}"] = float(count)
+        flat[f"{prefix}/gen/stop/reason/{reason}/count"] = float(count)
     for task, reasons in answer_len.get("stop_reason_counts_by_task", {}).items():
         for reason, count in reasons.items():
-            flat[f"{prefix}.stop_reason.by_task.{task}.{reason}"] = float(count)
+            flat[f"{prefix}/gen/stop/reason/{reason}/{task}/count"] = float(count)
 
     repetition = diagnostics.get("repetition", {})
     for metric_name, payload in repetition.items():
-        flat[f"{prefix}.{metric_name.replace('_rate','')}.mean"] = float(payload.get("mean", 0.0))
+        metric = {
+            "repeat_1gram_rate": "gen/repeat/1gram",
+            "repeat_2gram_rate": "gen/repeat/2gram",
+            "unique_token_fraction": "gen/repeat/unique_fraction",
+            "max_run_length": "gen/repeat/max_run_length",
+        }.get(metric_name, f"gen/repeat/{metric_name}")
+        flat[f"{prefix}/{metric}/mean"] = float(payload.get("mean", 0.0))
         if "median" in payload:
-            flat[f"{prefix}.{metric_name.replace('_rate','')}.median"] = float(
-                payload.get("median", 0.0)
-            )
+            flat[f"{prefix}/{metric}/median"] = float(payload.get("median", 0.0))
         for task, value in payload.get("by_task", {}).items():
-            flat[f"{prefix}.{metric_name.replace('_rate','')}.by_task.{task}"] = float(value)
+            flat[f"{prefix}/{metric}/{task}"] = float(value)
 
     parse = diagnostics.get("parse", {})
-    flat[f"{prefix}.parse_success_rate"] = float(parse.get("parse_success_rate", 0.0))
-    flat[f"{prefix}.non_numeric_rate"] = float(parse.get("non_numeric_rate", 0.0))
-    flat[f"{prefix}.numeric_abs_error.mean"] = float(parse.get("numeric_abs_error", 0.0))
-    flat[f"{prefix}.numeric_abs_error.median"] = float(
+    flat[f"{prefix}/acc/parse_success"] = float(parse.get("parse_success_rate", 0.0))
+    flat[f"{prefix}/numeric/non_numeric_rate"] = float(parse.get("non_numeric_rate", 0.0))
+    flat[f"{prefix}/numeric/mae"] = float(parse.get("numeric_abs_error", 0.0))
+    flat[f"{prefix}/numeric/mae_median"] = float(
         parse.get("numeric_abs_error_median", 0.0)
     )
-    flat[f"{prefix}.numeric_rel_error.mean"] = float(parse.get("numeric_rel_error", 0.0))
-    flat[f"{prefix}.numeric_parse_fail_rate"] = float(
+    flat[f"{prefix}/numeric/rel_error"] = float(parse.get("numeric_rel_error", 0.0))
+    flat[f"{prefix}/numeric/parse_fail_rate"] = float(
         parse.get("numeric_parse_fail_rate", 0.0)
     )
-    flat[f"{prefix}.numeric_length_mismatch_rate"] = float(
+    flat[f"{prefix}/numeric/len_mismatch_rate"] = float(
         parse.get("length_mismatch_rate", 0.0)
     )
     for task, payload in parse.get("by_task", {}).items():
-        flat[f"{prefix}.parse_success_rate.by_task.{task}"] = float(
+        flat[f"{prefix}/acc/parse_success/{task}"] = float(
             payload.get("parse_success_rate", 0.0)
         )
-        flat[f"{prefix}.non_numeric_rate.by_task.{task}"] = float(
+        flat[f"{prefix}/numeric/non_numeric_rate/{task}"] = float(
             payload.get("non_numeric_rate", 0.0)
         )
-        flat[f"{prefix}.numeric_abs_error.by_task.{task}"] = float(
+        flat[f"{prefix}/numeric/mae/{task}"] = float(
             payload.get("numeric_abs_error", 0.0)
         )
-        flat[f"{prefix}.numeric_abs_error.median.by_task.{task}"] = float(
+        flat[f"{prefix}/numeric/mae_median/{task}"] = float(
             payload.get("numeric_abs_error_median", 0.0)
         )
-        flat[f"{prefix}.numeric_rel_error.by_task.{task}"] = float(
+        flat[f"{prefix}/numeric/rel_error/{task}"] = float(
             payload.get("numeric_rel_error", 0.0)
         )
-        flat[f"{prefix}.numeric_parse_fail_rate.by_task.{task}"] = float(
+        flat[f"{prefix}/numeric/parse_fail_rate/{task}"] = float(
             payload.get("numeric_parse_fail_rate", 0.0)
         )
-        flat[f"{prefix}.numeric_length_mismatch_rate.by_task.{task}"] = float(
+        flat[f"{prefix}/numeric/len_mismatch_rate/{task}"] = float(
             payload.get("length_mismatch_rate", 0.0)
         )
     for reason, count in parse.get("failure_counts", {}).items():
-        flat[f"{prefix}.parse_failure.{reason}"] = float(count)
+        flat[f"{prefix}/numeric/parse_failure/{reason}/count"] = float(count)
     for task, reasons in parse.get("failure_counts_by_task", {}).items():
         for reason, count in reasons.items():
-            flat[f"{prefix}.parse_failure.by_task.{task}.{reason}"] = float(count)
+            flat[f"{prefix}/numeric/parse_failure/{reason}/{task}/count"] = float(count)
 
     labels = diagnostics.get("labels", {})
-    flat[f"{prefix}.invalid_label_rate"] = float(labels.get("invalid_label_rate", 0.0))
+    flat[f"{prefix}/class/invalid_label_rate"] = float(
+        labels.get("invalid_label_rate", 0.0)
+    )
     for task, rate in labels.get("invalid_label_rate_by_task", {}).items():
-        flat[f"{prefix}.invalid_label_rate.by_task.{task}"] = float(rate)
+        flat[f"{prefix}/class/invalid_label_rate/{task}"] = float(rate)
     for key, count in labels.get("confusion_counts", {}).items():
-        flat[f"{prefix}.label_confusion.{key}"] = float(count)
+        flat[f"{prefix}/class/confusion/{key}"] = float(count)
     for task, counts in labels.get("confusion_counts_by_task", {}).items():
         for key, count in counts.items():
-            flat[f"{prefix}.label_confusion.by_task.{task}.{key}"] = float(count)
+            flat[f"{prefix}/class/confusion/{task}/{key}"] = float(count)
 
     prompt_format = diagnostics.get("prompt_format", {})
     for key, payload in prompt_format.get("overall", {}).items():
-        flat[f"{prefix}.prompt_format.{key}.count"] = float(payload.get("count", 0.0))
-        flat[f"{prefix}.prompt_format.{key}.accuracy"] = float(
+        flat[f"{prefix}/gen/format/{key}/count"] = float(payload.get("count", 0.0))
+        flat[f"{prefix}/gen/format/{key}/acc"] = float(
             payload.get("accuracy", 0.0)
         )
-        flat[f"{prefix}.prompt_format.{key}.empty_rate"] = float(
+        flat[f"{prefix}/gen/format/{key}/empty_rate"] = float(
             payload.get("empty_rate", 0.0)
         )
-        flat[f"{prefix}.prompt_format.{key}.eos_first_rate"] = float(
+        flat[f"{prefix}/gen/format/{key}/eos_first_rate"] = float(
             payload.get("eos_first_rate", 0.0)
         )
     for task, stats in prompt_format.get("by_task", {}).items():
         for key, payload in stats.items():
-            flat[f"{prefix}.prompt_format.by_task.{task}.{key}.count"] = float(
+            flat[f"{prefix}/gen/format/{key}/{task}/count"] = float(
                 payload.get("count", 0.0)
             )
-            flat[f"{prefix}.prompt_format.by_task.{task}.{key}.accuracy"] = float(
+            flat[f"{prefix}/gen/format/{key}/{task}/acc"] = float(
                 payload.get("accuracy", 0.0)
             )
-            flat[f"{prefix}.prompt_format.by_task.{task}.{key}.empty_rate"] = float(
+            flat[f"{prefix}/gen/format/{key}/{task}/empty_rate"] = float(
                 payload.get("empty_rate", 0.0)
             )
-            flat[f"{prefix}.prompt_format.by_task.{task}.{key}.eos_first_rate"] = float(
+            flat[f"{prefix}/gen/format/{key}/{task}/eos_first_rate"] = float(
                 payload.get("eos_first_rate", 0.0)
             )
 
     soft_hard_gap = diagnostics.get("soft_hard_gap", {})
     for metric in ("token", "prefix"):
         gap = soft_hard_gap.get(metric, {})
-        flat[f"{prefix}.soft_hard_gap.{metric}.overall"] = float(gap.get("overall", 0.0))
+        flat[f"{prefix}/acc/soft_hard_gap/{metric}/overall"] = float(
+            gap.get("overall", 0.0)
+        )
         for task, value in gap.get("by_task", {}).items():
-            flat[f"{prefix}.soft_hard_gap.{metric}.by_task.{task}"] = float(value)
+            flat[f"{prefix}/acc/soft_hard_gap/{metric}/{task}"] = float(value)
 
     for task, count in diagnostics.get("task_counts", {}).items():
-        flat[f"{prefix}.task_count.{task}"] = float(count)
+        flat[f"{prefix}/throughput/task_count/{task}"] = float(count)
     for task, value in diagnostics.get("difficulty_by_task", {}).items():
-        flat[f"{prefix}.difficulty.by_task.{task}"] = float(value)
+        flat[f"{prefix}/curriculum/difficulty/{task}"] = float(value)
     return flat
 
 
@@ -2674,10 +2695,10 @@ def train(args):
                         if module is None:
                             continue
                         mod_grad_norm, mod_weight_norm = module_grad_weight_norm(module)
-                        flush_diagnostic_metrics[f"grad_norm.{key}"] = mod_grad_norm
-                        flush_diagnostic_metrics[f"weight_norm.{key}"] = mod_weight_norm
+                        flush_diagnostic_metrics[f"train/grad/norm/{key}"] = mod_grad_norm
+                        flush_diagnostic_metrics[f"train/weight/norm/{key}"] = mod_weight_norm
                         if not math.isnan(mod_grad_norm) and not math.isnan(mod_weight_norm):
-                            flush_diagnostic_metrics[f"grad_to_weight.{key}"] = (
+                            flush_diagnostic_metrics[f"train/grad/ratio/{key}"] = (
                                 mod_grad_norm / (mod_weight_norm + 1e-12)
                             )
                 scaler.step(optimizer)
@@ -2811,42 +2832,46 @@ def train(args):
                         if module is None:
                             continue
                         mod_grad_norm, mod_weight_norm = module_grad_weight_norm(module)
-                        diagnostic_metrics[f"grad_norm.{key}"] = mod_grad_norm
-                        diagnostic_metrics[f"weight_norm.{key}"] = mod_weight_norm
+                        diagnostic_metrics[f"train/grad/norm/{key}"] = mod_grad_norm
+                        diagnostic_metrics[f"train/weight/norm/{key}"] = mod_weight_norm
                         if not math.isnan(mod_grad_norm) and not math.isnan(mod_weight_norm):
-                            diagnostic_metrics[f"grad_to_weight.{key}"] = (
+                            diagnostic_metrics[f"train/grad/ratio/{key}"] = (
                                 mod_grad_norm / (mod_weight_norm + 1e-12)
                             )
 
                 # Per-module update proxies for diagnostic modules.
                 for key, mod_grad_norm in list(diagnostic_metrics.items()):
-                    if not key.startswith("grad_norm."):
+                    if not key.startswith("train/grad/norm/"):
                         continue
                     if math.isnan(mod_grad_norm):
                         continue
-                    module_key = key.split("grad_norm.", 1)[1]
-                    mod_weight_norm = diagnostic_metrics.get(f"weight_norm.{module_key}")
+                    module_key = key.split("train/grad/norm/", 1)[1]
+                    mod_weight_norm = diagnostic_metrics.get(
+                        f"train/weight/norm/{module_key}"
+                    )
                     if mod_weight_norm is None or math.isnan(mod_weight_norm):
                         continue
-                    diagnostic_metrics[f"update_norm_est.{module_key}"] = lr_actual * mod_grad_norm
-                    diagnostic_metrics[f"update_to_weight.{module_key}"] = (
+                    diagnostic_metrics[f"train/update/norm/{module_key}"] = (
+                        lr_actual * mod_grad_norm
+                    )
+                    diagnostic_metrics[f"train/update/ratio/{module_key}"] = (
                         lr_actual * mod_grad_norm / (mod_weight_norm + 1e-12)
                     )
 
                 if math.isnan(last_grad_norm):
-                    diagnostic_metrics["grad_clipped"] = float("nan")
-                    diagnostic_metrics["grad_clip_ratio"] = float("nan")
+                    diagnostic_metrics["train/grad/clipped"] = float("nan")
+                    diagnostic_metrics["train/grad/clip_ratio"] = float("nan")
                 else:
                     grad_clipped = 1.0 if last_grad_norm > args.grad_clip else 0.0
-                    diagnostic_metrics["grad_clipped"] = grad_clipped
-                    diagnostic_metrics["grad_clip_ratio"] = (
+                    diagnostic_metrics["train/grad/clipped"] = grad_clipped
+                    diagnostic_metrics["train/grad/clip_ratio"] = (
                         args.grad_clip / (last_grad_norm + 1e-12) if grad_clipped else 1.0
                     )
 
                 lr_actual_metrics: Dict[str, float] = {}
                 if not math.isnan(lr_actual_min) and not math.isnan(lr_actual_max):
-                    lr_actual_metrics["lr_actual_min"] = lr_actual_min
-                    lr_actual_metrics["lr_actual_max"] = lr_actual_max
+                    lr_actual_metrics["train/optim/lr_actual_min"] = lr_actual_min
+                    lr_actual_metrics["train/optim/lr_actual_max"] = lr_actual_max
 
                 task_metrics: Dict[str, float] = {}
                 active_tasks = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
@@ -2864,51 +2889,55 @@ def train(args):
                     dag_prob_snapshot = dict(final_probs)
                     dag_gated_weight_snapshot = dict(gated_weights)
                     for task, prob in final_probs.items():
-                        task_metrics[f"train.task_prob.{task}"] = prob
+                        task_metrics[f"train/curriculum/prob/{task}"] = prob
                     for task, weight in gated_weights.items():
-                        task_metrics[f"train.task_weight.{task}"] = weight
+                        task_metrics[f"train/curriculum/weight/{task}"] = weight
                     for task, gate in dag_gate_snapshot.items():
-                        task_metrics[f"train.task_gate.{task}"] = gate
+                        task_metrics[f"train/curriculum/gate/{task}"] = gate
                 else:
                     task_weights, task_probs = _compute_task_sampling(
                         active_tasks, progress_ratio, args.task_weighting
                     )
                     for task, prob in task_probs.items():
-                        task_metrics[f"train.task_prob.{task}"] = prob
+                        task_metrics[f"train/curriculum/prob/{task}"] = prob
                     for task, weight in task_weights.items():
-                        task_metrics[f"train.task_weight.{task}"] = weight
+                        task_metrics[f"train/curriculum/weight/{task}"] = weight
                 for task, count in task_window_counts.items():
-                    task_metrics[f"train.task_count_window.{task}"] = float(count)
+                    task_metrics[f"train/throughput/task_count_window/{task}"] = float(
+                        count
+                    )
                     if count > 0:
-                        task_metrics[f"train.task_input_len.{task}"] = (
+                        task_metrics[f"train/throughput/task_input_len/{task}"] = (
                             task_window_input_len[task] / count
                         )
-                        task_metrics[f"train.task_target_len.{task}"] = (
+                        task_metrics[f"train/throughput/task_target_len/{task}"] = (
                             task_window_target_len[task] / count
                         )
 
                 logger.log(
                     step=global_step,
                     phase=phase,
-                    train_loss=avg_loss,
-                    tokens_seen=tokens_seen,
-                    tokens_per_sec=toks_per_sec,
-                    peak_vram_gb=peak_vram,
-                    avg_inner_steps=avg_K,
-                    ponder=avg_ponder,
-                    difficulty=difficulty_logged,
-                    token_accuracy=last_token_accuracy,
-                    pct_masked_tokens=last_pct_masked_tokens,
-                    grad_norm=last_grad_norm,
-                    weight_norm=weight_norm,
-                    lr_expected=expected_lr,
-                    lr_actual=lr_actual,
-                    update_norm_est_preclip=update_norm_est_preclip,
-                    update_norm_est_postclip=update_norm_est_postclip,
-                    update_to_weight_preclip=update_to_weight_preclip,
-                    update_to_weight_postclip=update_to_weight_postclip,
-                    grad_to_weight_global=grad_to_weight_global,
-                    update_to_weight_global_postclip=update_to_weight_global_postclip,
+                    **{
+                        "train/loss/ce": avg_loss,
+                        "train/throughput/tokens_seen": tokens_seen,
+                        "train/throughput/tokens_per_sec": toks_per_sec,
+                        "train/throughput/vram_gb": peak_vram,
+                        "train/act/inner_steps": avg_K,
+                        "train/loss/ponder": avg_ponder,
+                        "train/curriculum/difficulty": difficulty_logged,
+                        "train/acc/token": last_token_accuracy,
+                        "train/acc/masked_token_rate": last_pct_masked_tokens,
+                        "train/grad/norm/global": last_grad_norm,
+                        "train/weight/norm/global": weight_norm,
+                        "train/optim/lr_expected": expected_lr,
+                        "train/optim/lr_actual": lr_actual,
+                        "train/update/norm/preclip": update_norm_est_preclip,
+                        "train/update/norm/postclip": update_norm_est_postclip,
+                        "train/update/ratio/preclip": update_to_weight_preclip,
+                        "train/update/ratio/postclip": update_to_weight_postclip,
+                        "train/grad/ratio/global": grad_to_weight_global,
+                        "train/update/ratio/postclip_global": update_to_weight_global_postclip,
+                    },
                     **diagnostic_metrics,
                     **lr_actual_metrics,
                     **task_metrics,
@@ -2956,28 +2985,32 @@ def train(args):
                         args.dag_locked_floor,
                     )
                     eval_task_metrics = {
-                        f"eval.task_prob.{task}": prob
+                        f"eval/curriculum/prob/{task}": prob
                         for task, prob in eval_task_probs.items()
                     }
                     eval_task_metrics.update(
                         {
-                            f"eval.task_weight.{task}": weight
+                            f"eval/curriculum/weight/{task}": weight
                             for task, weight in eval_gated_weights.items()
                         }
                     )
                     eval_task_metrics.update(
-                        {f"eval.task_gate.{task}": gate for task, gate in dag_gate_snapshot.items()}
+                        {
+                            f"eval/curriculum/gate/{task}": gate
+                            for task, gate in dag_gate_snapshot.items()
+                        }
                     )
                 else:
                     eval_task_weights, eval_task_probs = _compute_task_sampling(
                         active_tasks, progress_ratio, args.task_weighting
                     )
                     eval_task_metrics = {
-                        f"eval.task_prob.{task}": prob for task, prob in eval_task_probs.items()
+                        f"eval/curriculum/prob/{task}": prob
+                        for task, prob in eval_task_probs.items()
                     }
                     eval_task_metrics.update(
                         {
-                            f"eval.task_weight.{task}": weight
+                            f"eval/curriculum/weight/{task}": weight
                             for task, weight in eval_task_weights.items()
                         }
                     )
@@ -3075,7 +3108,7 @@ def train(args):
                     flat_eval_diagnostics = _flatten_eval_diagnostics(
                         "eval", alg_results.get("diagnostics", {})
                     )
-                    if not any(key.startswith("eval.") for key in flat_eval_diagnostics):
+                    if not any(key.startswith("eval/") for key in flat_eval_diagnostics):
                         print(
                             "[warn] eval diagnostics are empty; check diagnostic wiring for eval."
                         )
@@ -3089,20 +3122,44 @@ def train(args):
                     per_task_accuracy = alg_results.get("per_task_accuracy", {}) or {}
 
                     flat_per_task_accuracy = {
-                        f"accuracy.{task}": acc for task, acc in per_task_accuracy.items()
+                        f"eval/acc/exact_match/{task}": acc
+                        for task, acc in per_task_accuracy.items()
+                    }
+                    flat_per_task_token_accuracy = {
+                        f"eval/acc/token/{task}": acc
+                        for task, acc in per_task_token_accuracy.items()
+                    }
+                    flat_per_task_prefix_accuracy = {
+                        f"eval/acc/prefix/{task}": acc
+                        for task, acc in per_task_prefix_accuracy.items()
+                    }
+                    flat_per_task_distance = {
+                        f"eval/acc/distance/{task}": dist
+                        for task, dist in per_task_distance.items()
+                    }
+                    flat_per_task_mae = {
+                        f"eval/numeric/mae/{task}": mae
+                        for task, mae in per_task_mae.items()
+                        if mae is not None
                     }
 
                     logger.log(
                         step=global_step,
                         phase="eval",
-                        algorithmic_accuracy=overall_acc,
-                        algorithmic_token_accuracy=overall_token_accuracy,
-                        algorithmic_distance=overall_distance,
-                        algorithmic_prefix_accuracy=overall_prefix_accuracy,
-                        algorithmic_mae=overall_mae,
-                        eval_difficulty=difficulty_logged,
-                        algorithmic_samples=alg_results.get("sampled_examples_by_task", {}),
+                        **{
+                            "eval/acc/exact_match": overall_acc,
+                            "eval/acc/token": overall_token_accuracy,
+                            "eval/acc/distance": overall_distance,
+                            "eval/acc/prefix": overall_prefix_accuracy,
+                            "eval/numeric/mae": overall_mae,
+                            "eval/curriculum/difficulty": difficulty_logged,
+                            "eval/samples": alg_results.get("sampled_examples_by_task", {}),
+                        },
                         **flat_per_task_accuracy,
+                        **flat_per_task_token_accuracy,
+                        **flat_per_task_prefix_accuracy,
+                        **flat_per_task_distance,
+                        **flat_per_task_mae,
                         **flat_eval_diagnostics,
                         **eval_task_metrics,
                     )
@@ -3212,6 +3269,13 @@ def train(args):
                     overall_token_accuracy = ood_results.get("overall_token_accuracy", 0.0)
                     overall_distance = ood_results.get("overall_distance", 1.0)
                     overall_prefix_accuracy = ood_results.get("overall_prefix_accuracy", 0.0)
+                    per_task_mae = ood_results.get("per_task_mae", {}) or {}
+                    per_task_token_accuracy = ood_results.get("per_task_token_accuracy", {}) or {}
+                    per_task_distance = ood_results.get("per_task_distance", {}) or {}
+                    per_task_prefix_accuracy = (
+                        ood_results.get("per_task_prefix_accuracy", {}) or {}
+                    )
+                    per_task_accuracy = ood_results.get("per_task_accuracy", {}) or {}
                     if args.extended_logging:
                         log_print(
                             "  Algorithmic OOD metrics: "
@@ -3247,26 +3311,41 @@ def train(args):
                     logger.log(
                         step=global_step,
                         phase="eval",
-                        algorithmic_ood_accuracy=overall_acc,
-                        algorithmic_ood_token_accuracy=overall_token_accuracy,
-                        algorithmic_ood_distance=overall_distance,
-                        algorithmic_ood_prefix_accuracy=overall_prefix_accuracy,
-                        algorithmic_ood_mae=overall_mae,
-                        eval_difficulty=difficulty_logged,
-                        algorithmic_ood_samples=ood_results.get("sampled_examples_by_task", {}),
+                        **{
+                            "eval_ood/acc/exact_match": overall_acc,
+                            "eval_ood/acc/token": overall_token_accuracy,
+                            "eval_ood/acc/distance": overall_distance,
+                            "eval_ood/acc/prefix": overall_prefix_accuracy,
+                            "eval_ood/numeric/mae": overall_mae,
+                            "eval_ood/curriculum/difficulty": difficulty_logged,
+                            "eval_ood/samples": ood_results.get("sampled_examples_by_task", {}),
+                        },
+                        **{
+                            f"eval_ood/acc/exact_match/{task}": acc
+                            for task, acc in per_task_accuracy.items()
+                        },
+                        **{
+                            f"eval_ood/acc/token/{task}": acc
+                            for task, acc in per_task_token_accuracy.items()
+                        },
+                        **{
+                            f"eval_ood/acc/prefix/{task}": acc
+                            for task, acc in per_task_prefix_accuracy.items()
+                        },
+                        **{
+                            f"eval_ood/acc/distance/{task}": dist
+                            for task, dist in per_task_distance.items()
+                        },
+                        **{
+                            f"eval_ood/numeric/mae/{task}": mae
+                            for task, mae in per_task_mae.items()
+                            if mae is not None
+                        },
                         **_flatten_eval_diagnostics(
                             "eval_ood", ood_results.get("diagnostics", {})
                         ),
-                        **eval_task_metrics,
+                        **_relabel_phase(eval_task_metrics, "eval_ood"),
                     )
-
-                    per_task_mae = ood_results.get("per_task_mae", {}) or {}
-                    per_task_token_accuracy = ood_results.get("per_task_token_accuracy", {}) or {}
-                    per_task_distance = ood_results.get("per_task_distance", {}) or {}
-                    per_task_prefix_accuracy = (
-                        ood_results.get("per_task_prefix_accuracy", {}) or {}
-                    )
-                    per_task_accuracy = ood_results.get("per_task_accuracy", {}) or {}
                     if per_task_accuracy:
                         warn_on_format_crash(
                             "Algorithmic OOD",
@@ -3384,19 +3463,19 @@ def train(args):
                             )
                             dag_ema_snapshot = dict(ema_snapshot)
                             dag_metrics = {
-                                f"curriculum.gate.{task}": gate
+                                f"eval/curriculum/gate/{task}": gate
                                 for task, gate in dag_gate_snapshot.items()
                             }
-                            dag_metrics["curriculum.dag_paused"] = (
+                            dag_metrics["eval/curriculum/dag_paused"] = (
                                 1.0 if dag_state.paused else 0.0
                             )
-                            dag_metrics["curriculum.dag_frontier_size"] = float(
+                            dag_metrics["eval/curriculum/dag_frontier_size"] = float(
                                 len(dag_frontier_snapshot)
                             )
-                            dag_metrics["curriculum.dag_unlocked_size"] = float(
+                            dag_metrics["eval/curriculum/dag_unlocked_size"] = float(
                                 len(dag_unlocked_snapshot)
                             )
-                            dag_metrics["curriculum.dag_replay_ratio"] = (
+                            dag_metrics["eval/curriculum/dag_replay_ratio"] = (
                                 dag_replay_ratio_snapshot[0]
                             )
                             curriculum_metrics.update(dag_metrics)
@@ -3429,10 +3508,10 @@ def train(args):
                                     args.curriculum_cooldown,
                                 )
                             state = task_curriculum.get_task_state(task)
-                            curriculum_metrics[f"curriculum.difficulty.{task}"] = state[
+                            curriculum_metrics[f"eval/curriculum/difficulty/{task}"] = state[
                                 "difficulty"
                             ]
-                            curriculum_metrics[f"curriculum.ema_acc.{task}"] = state[
+                            curriculum_metrics[f"eval/curriculum/ema_acc/{task}"] = state[
                                 "ema_acc"
                             ]
                             curriculum_log_lines.append(
@@ -3481,27 +3560,45 @@ def train(args):
                     )
                     per_task_accuracy = task_eval.get("per_task_accuracy", {}) or {}
 
-                    flat_per_task_train_accuracy = {
-                        f"train_accuracy.{task}": acc
-                        for task, acc in per_task_accuracy.items()
-                    }
-
                     logger.log(
                         step=global_step,
                         phase="eval",
-                        train_accuracy=train_acc,
-                        train_eval_loss=train_loss_eval,
-                        train_eval_mae=overall_task_mae,
-                        train_eval_token_accuracy=task_eval.get("overall_token_accuracy"),
-                        train_eval_distance=task_eval.get("overall_distance"),
-                        train_eval_prefix_accuracy=task_eval.get("overall_prefix_accuracy"),
-                        eval_difficulty=difficulty_logged,
-                        train_eval_samples=task_eval.get("sampled_examples_by_task", {}),
-                        **flat_per_task_train_accuracy,
+                        **{
+                            "train_eval/acc/token": train_acc,
+                            "train_eval/loss/ce": train_loss_eval,
+                            "train_eval/acc/exact_match": overall_task_acc,
+                            "train_eval/numeric/mae": overall_task_mae,
+                            "train_eval/acc/token": task_eval.get("overall_token_accuracy"),
+                            "train_eval/acc/distance": task_eval.get("overall_distance"),
+                            "train_eval/acc/prefix": task_eval.get("overall_prefix_accuracy"),
+                            "train_eval/curriculum/difficulty": difficulty_logged,
+                            "train_eval/samples": task_eval.get("sampled_examples_by_task", {}),
+                        },
+                        **{
+                            f"train_eval/acc/exact_match/{task}": acc
+                            for task, acc in per_task_accuracy.items()
+                        },
+                        **{
+                            f"train_eval/acc/token/{task}": acc
+                            for task, acc in per_task_token_accuracy.items()
+                        },
+                        **{
+                            f"train_eval/acc/prefix/{task}": acc
+                            for task, acc in per_task_prefix_accuracy.items()
+                        },
+                        **{
+                            f"train_eval/acc/distance/{task}": dist
+                            for task, dist in per_task_distance.items()
+                        },
+                        **{
+                            f"train_eval/numeric/mae/{task}": mae
+                            for task, mae in per_task_mae.items()
+                            if mae is not None
+                        },
                         **_flatten_eval_diagnostics(
                             "train_eval", task_eval.get("diagnostics", {})
                         ),
-                        **eval_task_metrics,
+                        **_relabel_phase(eval_task_metrics, "train_eval"),
                     )
                     if per_task_accuracy:
                         warn_on_format_crash(
@@ -3519,7 +3616,7 @@ def train(args):
                             task,
                             acc,
                             global_step,
-                            target="train",
+                            target="train_eval",
                             mae=task_mae,
                             mean_token_accuracy=per_task_token_accuracy.get(task),
                             mean_distance=per_task_distance.get(task),
@@ -3564,11 +3661,22 @@ def train(args):
                     ppl = evaluate_perplexity(model, lang_loader, device, ctx)
                     if args.extended_logging:
                         log_print(f"  Language PPL: {ppl:.2f}")
-                    logger.log(step=global_step, phase="eval", val_loss=math.log(ppl))
+                    logger.log(
+                        step=global_step,
+                        phase="eval",
+                        **{
+                            "eval/loss/ppl": ppl,
+                            "eval/loss/ce": math.log(ppl),
+                        },
+                    )
 
                 eval_duration = time.time() - eval_start
                 print(f"Eval duration: {eval_duration:.2f}s")
-                logger.log(step=global_step, phase="eval", eval_duration=eval_duration)
+                logger.log(
+                    step=global_step,
+                    phase="eval",
+                    **{"eval/throughput/eval_duration": eval_duration},
+                )
                 logger.plot()
                 logger.save()
                 torch.cuda.empty_cache()
