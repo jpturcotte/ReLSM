@@ -2129,8 +2129,10 @@ def train(args):
                 difficulty_snapshot,
                 min_task_prob=min_task_prob,
             )
+        elif dag_state is not None:
+            weighting_fn = lambda _: 1.0
 
-    if dag_state is not None and not args.disable_dynamic_task_weighting:
+    if dag_state is not None:
         weighting_adjust_fn = DagWeightingAdjuster(
             dag_gate_snapshot,
             dag_frontier_snapshot,
@@ -2883,7 +2885,12 @@ def train(args):
                 active_tasks = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
                 progress_ratio = min(curriculum.tokens_seen / max(args.alg_tokens, 1), 1.0)
                 if dag_state is not None:
-                    base_weights = [weights_snapshot.get(task, 1.0) for task in active_tasks]
+                    if args.disable_dynamic_task_weighting:
+                        base_weights = [1.0] * len(active_tasks)
+                    else:
+                        base_weights = [
+                            weights_snapshot.get(task, 1.0) for task in active_tasks
+                        ]
                     final_weights, final_probs, gated_weights = compute_dag_weighting(
                         active_tasks,
                         base_weights,
@@ -2981,7 +2988,12 @@ def train(args):
                 active_tasks = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
                 progress_ratio = min(curriculum.tokens_seen / max(args.alg_tokens, 1), 1.0)
                 if dag_state is not None:
-                    base_weights = [weights_snapshot.get(task, 1.0) for task in active_tasks]
+                    if args.disable_dynamic_task_weighting:
+                        base_weights = [1.0] * len(active_tasks)
+                    else:
+                        base_weights = [
+                            weights_snapshot.get(task, 1.0) for task in active_tasks
+                        ]
                     _, eval_task_probs, eval_gated_weights = compute_dag_weighting(
                         active_tasks,
                         base_weights,
