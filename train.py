@@ -1999,6 +1999,11 @@ def train(args):
     
     log_print("\nLoading datasets...")
 
+    if args.disable_dynamic_task_weighting:
+        if args.task_weighting != "uniform":
+            log_print("Dynamic task weighting disabled; using uniform task sampling.")
+        args.task_weighting = "uniform"
+
     task_curriculum = None
     difficulty_fn = None
     eval_difficulty_fn = None
@@ -2118,11 +2123,14 @@ def train(args):
 
         min_task_prob = 0.05
 
-        weighting_fn = CurriculumWeightingSampler(weights_snapshot)
-        weighting_adjust_fn = CurriculumWeightingAdjuster(
-            difficulty_snapshot,
-            min_task_prob=min_task_prob,
-        )
+        if not args.disable_dynamic_task_weighting:
+            weighting_fn = CurriculumWeightingSampler(weights_snapshot)
+            weighting_adjust_fn = CurriculumWeightingAdjuster(
+                difficulty_snapshot,
+                min_task_prob=min_task_prob,
+            )
+        elif dag_state is not None:
+            weighting_fn = lambda _: 1.0
 
     if dag_state is not None:
         weighting_adjust_fn = DagWeightingAdjuster(
@@ -2877,7 +2885,12 @@ def train(args):
                 active_tasks = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
                 progress_ratio = min(curriculum.tokens_seen / max(args.alg_tokens, 1), 1.0)
                 if dag_state is not None:
-                    base_weights = [weights_snapshot.get(task, 1.0) for task in active_tasks]
+                    if args.disable_dynamic_task_weighting:
+                        base_weights = [1.0] * len(active_tasks)
+                    else:
+                        base_weights = [
+                            weights_snapshot.get(task, 1.0) for task in active_tasks
+                        ]
                     final_weights, final_probs, gated_weights = compute_dag_weighting(
                         active_tasks,
                         base_weights,
@@ -2975,7 +2988,12 @@ def train(args):
                 active_tasks = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
                 progress_ratio = min(curriculum.tokens_seen / max(args.alg_tokens, 1), 1.0)
                 if dag_state is not None:
-                    base_weights = [weights_snapshot.get(task, 1.0) for task in active_tasks]
+                    if args.disable_dynamic_task_weighting:
+                        base_weights = [1.0] * len(active_tasks)
+                    else:
+                        base_weights = [
+                            weights_snapshot.get(task, 1.0) for task in active_tasks
+                        ]
                     _, eval_task_probs, eval_gated_weights = compute_dag_weighting(
                         active_tasks,
                         base_weights,
@@ -3781,6 +3799,11 @@ def main():
         default="adaptive",
         choices=["uniform", "adaptive"],
         help="Task sampling weights",
+    )
+    parser.add_argument(
+        "--disable_dynamic_task_weighting",
+        action="store_true",
+        help="Disable dynamic task weighting and use uniform task sampling.",
     )
     parser.add_argument(
         "--use_task_curriculum",
