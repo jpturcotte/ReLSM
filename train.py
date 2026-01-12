@@ -89,7 +89,17 @@ def _create_shared_list(manager: Optional[Manager], initial: Optional[List[float
 
 
 def _set_frontier_snapshot(snapshot: Any, frontier: Set[str]) -> None:
-    snapshot.clear()
+    if hasattr(snapshot, "clear"):
+        snapshot.clear()
+    else:
+        try:
+            snapshot[:] = []
+        except TypeError:
+            try:
+                del snapshot[:]
+            except TypeError:
+                while len(snapshot):
+                    snapshot.pop()
     if hasattr(snapshot, "extend") and not hasattr(snapshot, "update"):
         snapshot.extend(sorted(frontier))
     else:
