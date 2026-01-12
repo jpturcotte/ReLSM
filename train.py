@@ -72,6 +72,39 @@ from utils import (
 
 plt.switch_backend("Agg")
 
+def _uniform_weighting(_: str) -> float:
+    return 1.0
+
+def _create_shared_dict(manager: Optional[Manager]) -> Dict[str, float]:
+    if manager is None:
+        return {}
+    return manager.dict()
+
+
+def _create_shared_list(manager: Optional[Manager], initial: Optional[List[float]] = None) -> List[float]:
+    if manager is None:
+        return initial or []
+    shared = manager.list(initial or [])
+    return shared
+
+
+def _set_frontier_snapshot(snapshot: Any, frontier: Set[str]) -> None:
+    if hasattr(snapshot, "clear"):
+        snapshot.clear()
+    else:
+        try:
+            snapshot[:] = []
+        except TypeError:
+            try:
+                del snapshot[:]
+            except TypeError:
+                while len(snapshot):
+                    snapshot.pop()
+    if hasattr(snapshot, "extend") and not hasattr(snapshot, "update"):
+        snapshot.extend(sorted(frontier))
+    else:
+        snapshot.update(frontier)
+
 def compute_dag_weighting(
     tasks: Sequence[str],
     weights: Sequence[float],
@@ -2046,9 +2079,9 @@ def train(args):
             min_task_evals=args.curriculum_min_task_evals,
         )
 
-        dag_gate_snapshot: Dict[str, float] = {}
-        dag_frontier_snapshot: Set[str] = set()
-        dag_replay_ratio_snapshot: List[float] = [0.0]
+        dag_gate_snapshot = _create_shared_dict(manager)
+        dag_frontier_snapshot = _create_shared_list(manager)
+        dag_replay_ratio_snapshot = _create_shared_list(manager, [0.0])
         dag_unlocked_snapshot: Set[str] = set()
         dag_prob_snapshot: Dict[str, float] = {}
         dag_gated_weight_snapshot: Dict[str, float] = {}
@@ -2088,8 +2121,8 @@ def train(args):
                 mastery_margin=args.dag_mastery_margin,
             )
 
-        difficulty_snapshot: Dict[str, float] = {}
-        weights_snapshot: Dict[str, float] = {}
+        difficulty_snapshot = _create_shared_dict(manager)
+        weights_snapshot = _create_shared_dict(manager)
 
         def refresh_curriculum_snapshots() -> None:
             nonlocal difficulty_snapshot, weights_snapshot
@@ -2102,8 +2135,7 @@ def train(args):
         if dag_state is not None:
             dag_gate_snapshot.clear()
             dag_gate_snapshot.update(dag_state.get_gate_snapshot())
-            dag_frontier_snapshot.clear()
-            dag_frontier_snapshot.update(dag_state.compute_frontier({}))
+            _set_frontier_snapshot(dag_frontier_snapshot, dag_state.compute_frontier({}))
             dag_replay_ratio_snapshot[0] = dag_state.compute_replay_ratio({})
             dag_unlocked_snapshot.clear()
             dag_unlocked_snapshot.update(
@@ -2130,7 +2162,7 @@ def train(args):
                 min_task_prob=min_task_prob,
             )
         elif dag_state is not None:
-            weighting_fn = lambda _: 1.0
+            weighting_fn = _uniform_weighting
 
     if dag_state is not None:
         weighting_adjust_fn = DagWeightingAdjuster(
@@ -3468,9 +3500,9 @@ def train(args):
                             dag_state.update_from_ema(ema_snapshot)
                             dag_gate_snapshot.clear()
                             dag_gate_snapshot.update(dag_state.get_gate_snapshot())
-                            dag_frontier_snapshot.clear()
-                            dag_frontier_snapshot.update(
-                                dag_state.compute_frontier(ema_snapshot)
+                            _set_frontier_snapshot(
+                                dag_frontier_snapshot,
+                                dag_state.compute_frontier(ema_snapshot),
                             )
                             dag_replay_ratio_snapshot[0] = dag_state.compute_replay_ratio(
                                 ema_snapshot
