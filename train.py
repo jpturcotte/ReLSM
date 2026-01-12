@@ -3187,12 +3187,6 @@ def train(args):
                         f"eval/acc/distance/{task}": dist
                         for task, dist in per_task_distance.items()
                     }
-                    flat_per_task_mae = {
-                        f"eval/numeric/mae/{task}": mae
-                        for task, mae in per_task_mae.items()
-                        if mae is not None
-                    }
-
                     logger.log(
                         step=global_step,
                         phase="eval",
@@ -3201,7 +3195,6 @@ def train(args):
                             "eval/acc/token": overall_token_accuracy,
                             "eval/acc/distance": overall_distance,
                             "eval/acc/prefix": overall_prefix_accuracy,
-                            "eval/numeric/mae": overall_mae,
                             "eval/curriculum/difficulty": difficulty_logged,
                             "eval/samples": alg_results.get("sampled_examples_by_task", {}),
                         },
@@ -3209,7 +3202,6 @@ def train(args):
                         **flat_per_task_token_accuracy,
                         **flat_per_task_prefix_accuracy,
                         **flat_per_task_distance,
-                        **flat_per_task_mae,
                         **flat_eval_diagnostics,
                         **eval_task_metrics,
                     )
@@ -3366,7 +3358,6 @@ def train(args):
                             "eval_ood/acc/token": overall_token_accuracy,
                             "eval_ood/acc/distance": overall_distance,
                             "eval_ood/acc/prefix": overall_prefix_accuracy,
-                            "eval_ood/numeric/mae": overall_mae,
                             "eval_ood/curriculum/difficulty": difficulty_logged,
                             "eval_ood/samples": ood_results.get("sampled_examples_by_task", {}),
                         },
@@ -3385,11 +3376,6 @@ def train(args):
                         **{
                             f"eval_ood/acc/distance/{task}": dist
                             for task, dist in per_task_distance.items()
-                        },
-                        **{
-                            f"eval_ood/numeric/mae/{task}": mae
-                            for task, mae in per_task_mae.items()
-                            if mae is not None
                         },
                         **_flatten_eval_diagnostics(
                             "eval_ood", ood_results.get("diagnostics", {})
@@ -3617,7 +3603,6 @@ def train(args):
                             "train_eval/acc/token": train_acc,
                             "train_eval/loss/ce": train_loss_eval,
                             "train_eval/acc/exact_match": overall_task_acc,
-                            "train_eval/numeric/mae": overall_task_mae,
                             "train_eval/acc/token": task_eval.get("overall_token_accuracy"),
                             "train_eval/acc/distance": task_eval.get("overall_distance"),
                             "train_eval/acc/prefix": task_eval.get("overall_prefix_accuracy"),
@@ -3639,11 +3624,6 @@ def train(args):
                         **{
                             f"train_eval/acc/distance/{task}": dist
                             for task, dist in per_task_distance.items()
-                        },
-                        **{
-                            f"train_eval/numeric/mae/{task}": mae
-                            for task, mae in per_task_mae.items()
-                            if mae is not None
                         },
                         **_flatten_eval_diagnostics(
                             "train_eval", task_eval.get("diagnostics", {})
