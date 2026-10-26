@@ -15,9 +15,12 @@
 | [#142](https://github.com/jpturcotte/ReLSM/issues/142) | P1 | eval | Eval ignores max_new_tokens override; 7 of 21 OOD conditions impossible at 32 |
 | [#143](https://github.com/jpturcotte/ReLSM/issues/143) | P1 | eval | Training-time eval reseeds the global RNGs at every eval interval |
 | [#144](https://github.com/jpturcotte/ReLSM/issues/144) | P1 | eval | Add an oracle-model eval regression test (a perfect answerer scores 0.779 today) |
+| [#184](https://github.com/jpturcotte/ReLSM/issues/184) | P1 | meta | Add a CPU invariant test suite that runs on every change |
 | [#145](https://github.com/jpturcotte/ReLSM/issues/145) | P2 | model | create_model overrides raise TypeError; shared_loop depth is not configurable |
 | [#146](https://github.com/jpturcotte/ReLSM/issues/146) | P2 | model | SSM generation cache is never created; every decode step recomputes the prefix |
 | [#147](https://github.com/jpturcotte/ReLSM/issues/147) | P2 | model | Model-wide _init_weights overwrites the SSM dt_proj initialisation |
+| [#185](https://github.com/jpturcotte/ReLSM/issues/185) | P2 | training | Crashes leave no crash checkpoint; Ctrl-C is saved as a finished run |
+| [#186](https://github.com/jpturcotte/ReLSM/issues/186) | P2 | training | Token embeddings and lm_head are excluded from weight decay, with no switch |
 | [#148](https://github.com/jpturcotte/ReLSM/issues/148) | P2 | training | Final partial accumulation is dropped; mid-accumulation checkpoints lose grads |
 | [#149](https://github.com/jpturcotte/ReLSM/issues/149) | P2 | training | Gradient and update telemetry windows are misaligned and mislabelled (F26, F27) |
 | [#150](https://github.com/jpturcotte/ReLSM/issues/150) | P2 | training | MetricsLogger wipes metrics.json history on resume |
@@ -25,6 +28,7 @@
 | [#152](https://github.com/jpturcotte/ReLSM/issues/152) | P2 | training | Weight-norm logging concatenates every parameter into one device tensor per log |
 | [#153](https://github.com/jpturcotte/ReLSM/issues/153) | P2 | training | eval/loss/ppl exponentiates a loss that includes the ACT ponder term |
 | [#154](https://github.com/jpturcotte/ReLSM/issues/154) | P2 | training | Resume replays the data stream from the start and drops RNG and Grokfast state |
+| [#187](https://github.com/jpturcotte/ReLSM/issues/187) | P2 | training | Run arguments and code version are not saved with the checkpoint |
 | [#155](https://github.com/jpturcotte/ReLSM/issues/155) | P2 | data | Addition 'OOD' 6-digit condition overlaps the final training phase (3-6 digits) |
 | [#156](https://github.com/jpturcotte/ReLSM/issues/156) | P2 | data | Compare '=' answers are never supervised: 'Answer:' + '=' tokenizes to ':=' |
 | [#157](https://github.com/jpturcotte/ReLSM/issues/157) | P2 | data | DAG gating fragile: EMA snap, gates above controller band, untimed pause |
@@ -41,12 +45,19 @@
 | [#168](https://github.com/jpturcotte/ReLSM/issues/168) | P2 | docs | requirements.txt: mamba-ssm hard-required, pytest missing, no lock file |
 | [#169](https://github.com/jpturcotte/ReLSM/issues/169) | P2 | docs | README claims about data, results and the IID grid are untested or wrong |
 | [#170](https://github.com/jpturcotte/ReLSM/issues/170) | P2 | docs | README preset parameter counts and shared_loop depth are wrong |
+| [#188](https://github.com/jpturcotte/ReLSM/issues/188) | P2 | meta | Add CI and a locked environment for pytest, invariants and a CPU smoke run |
+| [#189](https://github.com/jpturcotte/ReLSM/issues/189) | P2 | meta | Experiment hygiene: self-contained run records, a run log, and agent rules |
 | [#171](https://github.com/jpturcotte/ReLSM/issues/171) | P3 | model | generate() calls self.eval() and never restores the previous training mode |
+| [#190](https://github.com/jpturcotte/ReLSM/issues/190) | P3 | model | GQA head counts are not validated; bad values fail late or are silently ignored |
 | [#172](https://github.com/jpturcotte/ReLSM/issues/172) | P3 | model | Cached decoding drops the padding mask for past tokens |
+| [#191](https://github.com/jpturcotte/ReLSM/issues/191) | P3 | training | --compile checkpoints save _orig_mod. keys and cannot be loaded by eval |
 | [#173](https://github.com/jpturcotte/ReLSM/issues/173) | P3 | training | Cosine LR divides by zero at warmup == total; wsd/plateau jump past 40% warmup |
 | [#174](https://github.com/jpturcotte/ReLSM/issues/174) | P3 | training | Loss under gradient accumulation weights micro-batch means equally, not tokens |
 | [#175](https://github.com/jpturcotte/ReLSM/issues/175) | P3 | training | metrics.json is rewritten in full at every log, so I/O grows quadratically |
+| [#192](https://github.com/jpturcotte/ReLSM/issues/192) | P3 | data | Manager-proxy curriculum snapshots slow per-example sampling by 5 to 7 times |
 | [#176](https://github.com/jpturcotte/ReLSM/issues/176) | P3 | data | Dyck invalid strings are detectable by counting; compare rarely emits '=' |
+| [#193](https://github.com/jpturcotte/ReLSM/issues/193) | P3 | eval | Eval generation autocasts in fp16 on CUDA while training autocasts in bf16 |
+| [#194](https://github.com/jpturcotte/ReLSM/issues/194) | P3 | eval | Eval metadata records the current directory's git commit and no dirty flag |
 | [#177](https://github.com/jpturcotte/ReLSM/issues/177) | P3 | eval | eval/self_test.py determinism assert compares payloads that include timestamps |
 | [#178](https://github.com/jpturcotte/ReLSM/issues/178) | P3 | eval | Soft metrics encode standalone strings, so the SentencePiece prefix biases them |
 | [#179](https://github.com/jpturcotte/ReLSM/issues/179) | P3 | eval | test_model_import_optional.py leaks sys.modules and sys.path after it runs |
