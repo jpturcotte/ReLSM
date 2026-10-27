@@ -55,9 +55,11 @@
 | [#174](https://github.com/jpturcotte/ReLSM/issues/174) | P3 | training | Loss under gradient accumulation weights micro-batch means equally, not tokens |
 | [#175](https://github.com/jpturcotte/ReLSM/issues/175) | P3 | training | metrics.json is rewritten in full at every log, so I/O grows quadratically |
 | [#192](https://github.com/jpturcotte/ReLSM/issues/192) | P3 | data | Manager-proxy curriculum snapshots slow per-example sampling by 5 to 7 times |
+| [#197](https://github.com/jpturcotte/ReLSM/issues/197) | P3 | data | Curriculum snapshot refresh is not atomic: DataLoader workers can see unlocked tasks as locked |
 | [#176](https://github.com/jpturcotte/ReLSM/issues/176) | P3 | data | Dyck invalid strings are detectable by counting; compare rarely emits '=' |
 | [#193](https://github.com/jpturcotte/ReLSM/issues/193) | P3 | eval | Eval generation autocasts in fp16 on CUDA while training autocasts in bf16 |
 | [#194](https://github.com/jpturcotte/ReLSM/issues/194) | P3 | eval | Eval metadata records the current directory's git commit and no dirty flag |
+| [#198](https://github.com/jpturcotte/ReLSM/issues/198) | P3 | eval | Logged MAE is 0.0 for tasks with no numeric measurement since the Jan 11 duplicate-key fix |
 | [#177](https://github.com/jpturcotte/ReLSM/issues/177) | P3 | eval | eval/self_test.py determinism assert compares payloads that include timestamps |
 | [#178](https://github.com/jpturcotte/ReLSM/issues/178) | P3 | eval | Soft metrics encode standalone strings, so the SentencePiece prefix biases them |
 | [#179](https://github.com/jpturcotte/ReLSM/issues/179) | P3 | eval | test_model_import_optional.py leaks sys.modules and sys.path after it runs |
