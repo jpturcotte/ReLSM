@@ -124,10 +124,19 @@ def extract_integer_token(text: str, *, prefer_separator: bool = True) -> Option
                 idx, sep = max(separator_positions, key=lambda item: item[0])
                 cleaned = cleaned[idx + len(sep) :]
 
-    matches = list(re.finditer(r"[+-]?\d+", cleaned))
+    # Match whole numbers, decimals included, so a decimal is never split into fragments
+    # ("42.0" used to give "0"; #165). An integer-valued decimal ("42.0") counts as that
+    # integer; any other decimal ("42.5") is not an integer answer and returns None.
+    matches = list(re.finditer(r"[+-]?\d+(?:\.\d+)?", cleaned))
     if not matches:
         return None
-    return matches[-1].group(0)
+    token = matches[-1].group(0)
+    if "." in token:
+        whole, frac = token.split(".", 1)
+        if frac.strip("0"):
+            return None
+        token = whole
+    return token
 
 
 def extract_numeric_answer(task: str, text: str) -> Optional[str]:

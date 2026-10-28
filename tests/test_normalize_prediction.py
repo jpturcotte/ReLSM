@@ -42,6 +42,15 @@ def test_normalize_prediction_extracts_numeric_token():
     assert normalize_prediction("chain", "Result: -3 apples") == "-3"
 
 
+def test_decimals_are_not_split_into_fragments():
+    # #165: "42.0" used to give "0" (the digits after the point). Integer-valued decimals
+    # count as the integer; other decimals are not integer answers.
+    assert normalize_prediction("addition", "42.0") == "42"
+    assert normalize_prediction("addition", "Answer: -7.00") == "-7"
+    assert normalize_prediction("addition", "42.5") == ""
+    assert normalize_prediction("addition", "the answer is 3.14") == ""
+
+
 def test_normalize_prediction_uses_last_number():
     assert normalize_prediction("addition", "3+4=7") == "7"
     assert normalize_prediction("addition", "I think 3 + 4 = 7") == "7"
