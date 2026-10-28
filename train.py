@@ -1792,6 +1792,36 @@ def _print_prompt_format_stats(label: str, prompt_format: Dict[str, Any]) -> Non
                 )
 
 
+ARCHITECTURE_FIELDS = ("d_model", "n_layers", "n_heads", "n_kv_heads", "d_ff", "tie_weights",
+                       "vocab_size", "variant", "bias")
+
+
+def check_resume_architecture(saved_config: Any, model_config: Any) -> None:
+    """Refuse to resume into a model whose architecture differs from the checkpoint's.
+
+    The model defaults changed on 2026-10-28 (docs/model-defaults.md). Without this check, a
+    checkpoint trained with the old defaults would fail on a shape mismatch (d_ff), or load
+    silently and train untied a model that was tied (tie_weights). Dropout is reported too.
+    """
+    if saved_config is None:
+        return
+    diffs = []
+    for name in ARCHITECTURE_FIELDS:
+        old, new = getattr(saved_config, name, None), getattr(model_config, name, None)
+        if old is not None and old != new:
+            diffs.append(f"{name}: checkpoint {old!r}, current {new!r}")
+    old_drop, new_drop = getattr(saved_config, "dropout", None), getattr(model_config, "dropout", None)
+    if old_drop is not None and old_drop != new_drop:
+        diffs.append(f"dropout: checkpoint {old_drop!r}, current {new_drop!r}")
+    if diffs:
+        raise ValueError(
+            "The checkpoint's model settings differ from this run's: " + "; ".join(diffs)
+            + ". Checkpoints from before 2026-10-28 used the old defaults: resume them with "
+            "--legacy_model_defaults (or --tie_embeddings --dropout 0.1 --ffn_rule 4x). "
+            "See docs/model-defaults.md."
+        )
+
+
 def build_optimizer(
     model: torch.nn.Module,
     lr: float,
@@ -1967,12 +1997,21 @@ def train(args):
     elif size == "1B-16k":
         extra_kwargs["max_seq_len"] = 16384
         extra_kwargs["use_gqa"] = True
+    # Model defaults follow the Llama reference since 2026-10-28 (docs/model-defaults.md).
+    # These flags override them; --legacy_model_defaults restores the previous setup.
+    if args.tie_embeddings is not None:
+        extra_kwargs["tie_weights"] = args.tie_embeddings
+    if args.dropout is not None:
+        extra_kwargs["dropout"] = args.dropout
+    if args.ffn_rule is not None:
+        extra_kwargs["ffn_rule"] = args.ffn_rule
 
     model = create_model(
         size=size,
         variant=args.variant,
         vocab_size=tokenizer.vocab_size,
         pad_token_id=tokenizer.pad_token_id,
+        legacy_defaults=args.legacy_model_defaults,
         K=args.K,
         min_K=args.min_K,
         max_K=args.max_K,
@@ -2499,6 +2538,7 @@ def train(args):
 
     def load_checkpoint_state(checkpoint_path: str) -> Tuple[int, int, float]:
         checkpoint = torch.load(checkpoint_path, map_location=device)
+        check_resume_architecture(checkpoint.get("config"), getattr(model, "_orig_mod", model).config)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer_state = checkpoint.get("optimizer_state_dict")
         if optimizer_state is not None:
@@ -3772,6 +3812,20 @@ def main():
                        choices=["nano", "50M", "125M", "300M", "350M", "760M", "1B", "1B-16k"])
     parser.add_argument("--variant", type=str, default="baseline",
                        choices=["baseline", "shared_loop", "latent", "act", "ssm", "ssm_mem"])
+    tie = parser.add_mutually_exclusive_group()
+    tie.add_argument("--tie_embeddings", dest="tie_embeddings", action="store_true", default=None,
+                     help="Share the token embedding with the output head (the default before 2026-10-28)")
+    tie.add_argument("--untie_embeddings", dest="tie_embeddings", action="store_false",
+                     help="Separate output head (the default since 2026-10-28, as in Llama)")
+    parser.add_argument("--dropout", type=float, default=None,
+                        help="Model dropout. Default 0.0 since 2026-10-28 (was 0.1)")
+    parser.add_argument("--ffn_rule", type=str, default=None, choices=["llama", "4x"],
+                        help="SwiGLU width when the preset does not fix it: 'llama' (8/3 x d_model, "
+                             "rounded up to 256; default since 2026-10-28) or '4x' (previous default)")
+    parser.add_argument("--legacy_model_defaults", action="store_true",
+                        help="Rebuild the pre-2026-10-28 model setup: tied head, dropout 0.1, 4x FFN, "
+                             "and the old per-preset values (see docs/model-defaults.md). "
+                             "The flags above still override it.")
     parser.add_argument("--tokenizer", type=str, default=DEFAULT_TOKENIZER_NAME)
     parser.add_argument("--K", type=int, default=4, help="Fixed inner steps for latent/ssm")
     parser.add_argument("--min_K", type=int, default=2, help="Minimum ACT steps")

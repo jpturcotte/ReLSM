@@ -100,6 +100,27 @@ def ssm_scan_jit(
 # CONFIG
 # =============================================================================
 
+def ffn_dim(d_model: int, rule: str = "llama", multiple_of: int = 256) -> int:
+    """SwiGLU hidden width.
+
+    "llama": Meta's Llama rule, int(2 * 4 * d_model / 3) rounded up to a multiple of 256
+    (4096 -> 11008, 512 -> 1536, 128 -> 512). "4x": 4 * d_model, the default before 2026-10-28.
+    """
+    if rule == "4x":
+        return 4 * d_model
+    if rule != "llama":
+        raise ValueError(f"unknown ffn_rule {rule!r}; use 'llama' or '4x'")
+    hidden = int(2 * (4 * d_model) / 3)
+    return multiple_of * ((hidden + multiple_of - 1) // multiple_of)
+
+
+# The model defaults before 2026-10-28. They came in with the initial commit (6ba960e) and the
+# pasted ladder model of PR #1 (31356c1), both 2025-12-09; no record says why. Every training run
+# before that date used them. Pass them as overrides to rebuild an old setup, e.g.
+# create_model("nano", **LEGACY_DEFAULTS) or train.py --legacy_model_defaults.
+LEGACY_DEFAULTS = {"tie_weights": True, "dropout": 0.1, "ffn_rule": "4x"}
+
+
 @dataclass
 class TransformerConfig:
     # Tokenization / sequence
@@ -111,11 +132,14 @@ class TransformerConfig:
     d_model: int = 768
     n_layers: int = 12
     n_heads: int = 12
-    d_ff: Optional[int] = None          # Defaults to 4 * d_model (SwiGLU uses 3 mats)
-    dropout: float = 0.1
+    # Defaults follow the Llama reference since 2026-10-28; the previous values are kept in
+    # LEGACY_DEFAULTS and documented in docs/model-defaults.md (their origin is unrecorded).
+    d_ff: Optional[int] = None          # None: set by ffn_rule
+    ffn_rule: str = "llama"             # "llama": 256 * ceil((8/3) * d_model / 256); "4x": 4 * d_model (legacy)
+    dropout: float = 0.0                # legacy default 0.1
     bias: bool = False
     rope_base: int = 10000
-    tie_weights: bool = True
+    tie_weights: bool = False           # legacy default True
 
     # Attention variant
     use_gqa: bool = False
@@ -148,7 +172,7 @@ class TransformerConfig:
 
     def __post_init__(self):
         if self.d_ff is None:
-            self.d_ff = 4 * self.d_model
+            self.d_ff = ffn_dim(self.d_model, self.ffn_rule)
         assert self.d_model % self.n_heads == 0
         self.d_head = self.d_model // self.n_heads
 
@@ -1008,10 +1032,16 @@ def create_model(
     use_gqa: bool = False,
     variant: str = "baseline",
     pad_token_id: Optional[int] = None,
+    legacy_defaults: bool = False,
     **kwargs,
 ) -> BaselineTransformer:
     """
     Factory for baseline + ladder variants.
+
+    Only the requested preset is built. Keyword arguments override the preset's values
+    (so create_model("1B", dropout=0.0, d_ff=1024) works for every size; #145).
+    legacy_defaults=True rebuilds the pre-2026-10-28 setup: LEGACY_DEFAULTS plus the old
+    per-preset values in LEGACY_PRESET_VALUES (see docs/model-defaults.md).
 
     Sizes:
       - nano (ReLSM-Nano compatible quick runs)
@@ -1023,41 +1053,46 @@ def create_model(
     Variant:
       baseline | shared_loop | latent | act | ssm | ssm_mem
     """
-    base = dict(
+    if size not in PRESETS:
+        raise ValueError(f"Unknown size '{size}'. Choose from: {list(PRESETS.keys())}")
+
+    values = dict(PRESETS[size])
+    if legacy_defaults:
+        values.update(LEGACY_DEFAULTS)
+        values.update(LEGACY_PRESET_VALUES.get(size, {}))
+    values.update(
         vocab_size=vocab_size,
-        max_seq_len=max_seq_len,
-        use_gqa=use_gqa,
+        max_seq_len=values.pop("max_seq_len", max_seq_len),
+        use_gqa=values.pop("use_gqa", use_gqa),
         variant=variant,
         pad_token_id=pad_token_id,
     )
-    base.update(kwargs)
+    values.update(kwargs)  # explicit arguments win over the preset
+    return BaselineTransformer(TransformerConfig(**values))
 
-    configs = {
-        "nano": TransformerConfig(d_model=512,  n_layers=6,  n_heads=8,  **base),
-        "50M":  TransformerConfig(d_model=512,  n_layers=8,  n_heads=8,  **base),
-        "125M": TransformerConfig(d_model=768,  n_layers=12, n_heads=12, **base),
-        "350M": TransformerConfig(d_model=1024, n_layers=24, n_heads=16, **base),
-        "760M": TransformerConfig(d_model=1280, n_layers=36, n_heads=20, **base),
 
-        # Ladder-friendly defaults
-        "300M": TransformerConfig(d_model=1024, n_layers=24, n_heads=16, d_ff=4096, dropout=0.05, **base),
+# Size presets. Values not listed come from TransformerConfig's defaults.
+PRESETS: Dict[str, Dict[str, Any]] = {
+    "nano": dict(d_model=512, n_layers=6, n_heads=8),
+    "50M": dict(d_model=512, n_layers=8, n_heads=8),
+    "125M": dict(d_model=768, n_layers=12, n_heads=12),
+    "350M": dict(d_model=1024, n_layers=24, n_heads=16),
+    "760M": dict(d_model=1280, n_layers=36, n_heads=20),
+    # Ladder iteration size
+    "300M": dict(d_model=1024, n_layers=24, n_heads=16),
+    # ~1B control (adjust vocab_size to your tokenizer). d_ff 5504 is the Llama rule with
+    # multiple_of 64 (2/3 * 4 * 2048 = 5461 -> 5504); kept as it was.
+    "1B": dict(d_model=2048, n_layers=18, n_heads=16, d_ff=5504),
+    "1B-16k": dict(d_model=2048, n_layers=18, n_heads=16, d_ff=5504, max_seq_len=16384, use_gqa=True),
+}
 
-        # ~1B control (adjust vocab_size to your tokenizer; with 50k vocab this is ~1B-ish)
-        "1B":   TransformerConfig(d_model=2048, n_layers=18, n_heads=16, d_ff=5504, dropout=0.05, **base),
-        "1B-16k": TransformerConfig(
-            d_model=2048,
-            n_layers=18,
-            n_heads=16,
-            d_ff=5504,
-            dropout=0.05,
-            **{**base, "max_seq_len": 16384, "use_gqa": True},
-        ),
-    }
-
-    if size not in configs:
-        raise ValueError(f"Unknown size '{size}'. Choose from: {list(configs.keys())}")
-
-    return BaselineTransformer(configs[size])
+# Per-preset values that differed from the old defaults before 2026-10-28 (origin unrecorded,
+# PR #1, 31356c1). Applied only with legacy_defaults=True.
+LEGACY_PRESET_VALUES: Dict[str, Dict[str, Any]] = {
+    "300M": {"d_ff": 4096, "dropout": 0.05},
+    "1B": {"dropout": 0.05},
+    "1B-16k": {"dropout": 0.05},
+}
 
 
 if __name__ == "__main__":
