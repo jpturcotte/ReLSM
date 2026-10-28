@@ -1817,7 +1817,7 @@ def check_resume_architecture(saved_config: Any, model_config: Any) -> None:
         raise ValueError(
             "The checkpoint's model settings differ from this run's: " + "; ".join(diffs)
             + ". Checkpoints from before 2026-10-28 used the old defaults: resume them with "
-            "--legacy_model_defaults (or --tie_embeddings --dropout 0.1 --ffn_rule 4x). "
+            "--legacy_model_defaults (or --dropout 0.1 --ffn_rule 4x). "
             "See docs/model-defaults.md."
         )
 
@@ -3814,9 +3814,9 @@ def main():
                        choices=["baseline", "shared_loop", "latent", "act", "ssm", "ssm_mem"])
     tie = parser.add_mutually_exclusive_group()
     tie.add_argument("--tie_embeddings", dest="tie_embeddings", action="store_true", default=None,
-                     help="Share the token embedding with the output head (the default before 2026-10-28)")
+                     help="Share the token embedding with the output head (the default)")
     tie.add_argument("--untie_embeddings", dest="tie_embeddings", action="store_false",
-                     help="Separate output head (the default since 2026-10-28, as in Llama)")
+                     help="Separate output head (as in Power 2022 / Nanda 2023 and large Llamas)")
     parser.add_argument("--dropout", type=float, default=None,
                         help="Model dropout. Default 0.0 since 2026-10-28 (was 0.1)")
     parser.add_argument("--ffn_rule", type=str, default=None, choices=["llama", "4x"],

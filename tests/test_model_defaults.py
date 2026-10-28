@@ -1,4 +1,5 @@
-"""Model defaults (changed 2026-10-28 to the Llama reference) and the legacy path.
+"""Model defaults (changed 2026-10-28: dropout 0 and Llama's width rule; the head stays tied) and
+the legacy path.
 
 See docs/model-defaults.md. The legacy table below is the pre-change factory, copied from
 model.py at be08cde, so legacy_defaults=True must reproduce it exactly.
@@ -31,9 +32,9 @@ def config_only(monkeypatch):
     monkeypatch.setattr(model_module, "BaselineTransformer", lambda cfg: cfg)
 
 
-def test_config_defaults_follow_llama():
+def test_config_defaults():
     cfg = TransformerConfig()
-    assert cfg.tie_weights is False
+    assert cfg.tie_weights is True  # tied, as in small Llamas, Qwen3 <= 4B, Gemma 3, MobileLLM
     assert cfg.dropout == 0.0
     assert cfg.ffn_rule == "llama"
     assert cfg.d_ff == ffn_dim(cfg.d_model)
@@ -65,7 +66,7 @@ def test_legacy_defaults_reproduce_the_old_factory(size, config_only):
 @pytest.mark.parametrize("size", list(OLD_FACTORY))
 def test_new_defaults_per_preset(size, config_only):
     cfg = create_model(size)
-    assert cfg.tie_weights is False and cfg.dropout == 0.0
+    assert cfg.tie_weights is True and cfg.dropout == 0.0
     expected_dff = 5504 if size.startswith("1B") else ffn_dim(OLD_FACTORY[size][0])
     assert cfg.d_ff == expected_dff
 
@@ -73,16 +74,16 @@ def test_new_defaults_per_preset(size, config_only):
 @pytest.mark.parametrize("size", list(OLD_FACTORY))
 def test_overrides_work_for_every_size(size, config_only):
     """#145: create_model(size, dropout=..., d_ff=...) used to raise TypeError for every size."""
-    cfg = create_model(size, dropout=0.0, d_ff=1024, tie_weights=True)
-    assert (cfg.dropout, cfg.d_ff, cfg.tie_weights) == (0.0, 1024, True)
+    cfg = create_model(size, dropout=0.0, d_ff=1024, tie_weights=False)
+    assert (cfg.dropout, cfg.d_ff, cfg.tie_weights) == (0.0, 1024, False)
     cfg = create_model(size, legacy_defaults=True, dropout=0.0)  # explicit beats legacy
     assert cfg.dropout == 0.0 and cfg.tie_weights is True
 
 
 def test_tying_flag_shares_or_separates_the_head():
     small = dict(vocab_size=50, max_seq_len=8, d_model=32, n_layers=1, n_heads=2)
-    untied = BaselineTransformer(TransformerConfig(**small))
-    tied = BaselineTransformer(TransformerConfig(**small, tie_weights=True))
+    untied = BaselineTransformer(TransformerConfig(**small, tie_weights=False))
+    tied = BaselineTransformer(TransformerConfig(**small))
     assert untied.lm_head.weight.data_ptr() != untied.tok_emb.weight.data_ptr()
     assert tied.lm_head.weight.data_ptr() == tied.tok_emb.weight.data_ptr()
 

@@ -114,9 +114,10 @@ def ffn_dim(d_model: int, rule: str = "llama", multiple_of: int = 256) -> int:
     return multiple_of * ((hidden + multiple_of - 1) // multiple_of)
 
 
-# The model defaults before 2026-10-28. They came in with the initial commit (6ba960e) and the
-# pasted ladder model of PR #1 (31356c1), both 2025-12-09; no record says why. Every training run
-# before that date used them. Pass them as overrides to rebuild an old setup, e.g.
+# The model defaults before 2026-10-28. They came in on 2025-12-09 with the initial commit
+# (6ba960e, Claude's ladder) and PR #1 (31356c1, ChatGPT's model_updated.py), as small-model
+# advice from those chats; docs/model-defaults.md has the sources. Every training run before
+# 2026-10-28 used them. Pass them as overrides to rebuild an old setup, e.g.
 # create_model("nano", **LEGACY_DEFAULTS) or train.py --legacy_model_defaults.
 LEGACY_DEFAULTS = {"tie_weights": True, "dropout": 0.1, "ffn_rule": "4x"}
 
@@ -132,14 +133,15 @@ class TransformerConfig:
     d_model: int = 768
     n_layers: int = 12
     n_heads: int = 12
-    # Defaults follow the Llama reference since 2026-10-28; the previous values are kept in
-    # LEGACY_DEFAULTS and documented in docs/model-defaults.md (their origin is unrecorded).
+    # Defaults since 2026-10-28 (docs/model-defaults.md): dropout 0 and Llama's SwiGLU width rule;
+    # the head stays tied, as in small Llamas (3.2 1B/3B), Qwen3 up to 4B, Gemma 3 and MobileLLM.
+    # The previous values are kept in LEGACY_DEFAULTS.
     d_ff: Optional[int] = None          # None: set by ffn_rule
     ffn_rule: str = "llama"             # "llama": 256 * ceil((8/3) * d_model / 256); "4x": 4 * d_model (legacy)
     dropout: float = 0.0                # legacy default 0.1
     bias: bool = False
     rope_base: int = 10000
-    tie_weights: bool = False           # legacy default True
+    tie_weights: bool = True            # tied head (unchanged); tie_weights=False unties it
 
     # Attention variant
     use_gqa: bool = False
