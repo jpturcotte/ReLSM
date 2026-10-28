@@ -47,8 +47,9 @@ def test_batch_generate_skips_padding_tokens():
     )
 
     # Completion is the final prompt token; padding would change this for the
-    # shorter prompt if pad tokens were appended.
-    assert outputs == ["5", "6"]
+    # shorter prompt if pad tokens were appended. "a much longer prompt" encodes as
+    # 5 6 7 8, so its completion is "8" (the old expectation "6" was wrong from the start, #166).
+    assert outputs == ["5", "8"]
 
     for call in model.calls:
         assert torch.all(call != tokenizer.pad_token_id)

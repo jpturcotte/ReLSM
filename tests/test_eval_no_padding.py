@@ -70,10 +70,12 @@ def test_generate_batch_avoids_padding_and_tracks_lengths():
     )
 
     assert pair_preds[0] == solo_preds[0]
-    assert pair_lengths == [2, 2]
-    assert solo_lengths == [2]
+    # Lengths exclude EOS: extract_prediction_from_generate cuts the continuation at EOS,
+    # so [last_token, EOS] counts as 1 token (the test predated that convention, #166).
+    assert pair_lengths == [1, 1]
+    assert solo_lengths == [1]
 
     total_generated_tokens = sum(pair_lengths)
     avg_gen_len = total_generated_tokens / len(prompts)
-    assert total_generated_tokens == 4
-    assert avg_gen_len == 2
+    assert total_generated_tokens == 2
+    assert avg_gen_len == 1
