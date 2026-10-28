@@ -1,0 +1,44 @@
+{
+  "question": "What does French-, German-, Chinese-, Japanese- and Korean-language work (papers, theses, proceedings, blogs, re-implementations, community discussion) add to the grokking picture as of October 2026, for algorithmic grokking: mechanisms, the finite-set recipe, acceleration (Grokfast, StableMax / softmax collapse, weight decay, schedules) and failure modes?",
+  "tier": "standard",
+  "profile": "report",
+  "date": "2026-10-28",
+  "as_of": "2026-10-28",
+  "scope": "Non-English sources only; the English core literature is handled separately (audit session lit notes, issue #259). Focus 2024 to Oct 2026; older only if foundational in that language community.",
+  "decision": "Which grokking recipe and fixes ReLSM should adopt before its first finite-set grokking run (#249, #214), and which failure modes to guard against.",
+  "assumptions": [
+    "English arXiv papers by Chinese-, Japanese- or Korean-speaking authors count only when native-language discussion adds something (replication, critique, detail).",
+    "Search: SearXNG (once Docker is up) plus built-in web search and direct site fetches."
+  ],
+  "orchestration": "coordinator-worker",
+  "required_workers": {
+    "research": 6,
+    "verifier": 0
+  },
+  "status": "complete-with-gaps",
+  "completed_at": "2026-10-28",
+  "outputs": {
+    "report": "report.md",
+    "sources": "sources.jsonl",
+    "claims": "claims.jsonl"
+  },
+  "gaps": [
+    "No exact-recipe replication with embedding exemption, 32k tied vocab or final RMSNorm",
+    "Thin peer-reviewed native-language coverage in all five lanes",
+    "Zhihu/CSDN URLs fail automated citation checks (bot protection); read via browser pane",
+    "English delta lane read mostly at abstract level; 5 of its decision-relevant claims re-checked in synthesis"
+  ],
+  "validation": {
+    "validate_report": "PASS (1 warning: answer-section word-count heuristic misfires)",
+    "verify_citations": "PASSED (69/73 URLs reachable; 4 Zhihu/CSDN bot-blocked)",
+    "source_register_audit": "PASS (160 visited, 95 evidence-bearing, 68 clusters)"
+  },
+  "merged_lanes": [
+    "zh",
+    "ja",
+    "ko",
+    "fr",
+    "de",
+    "en-delta"
+  ]
+}
