@@ -458,6 +458,20 @@ def _ensure_2d_tensor(value: Any) -> torch.Tensor:
     return tensor
 
 
+def load_checkpoint_payload(
+    checkpoint_path: Union[str, Path],
+    *,
+    map_location: Union[str, torch.device],
+) -> Dict[str, Any]:
+    """Load a training checkpoint with a scoped allowlist for its model config.
+
+    Checkpoints created by this project include a TransformerConfig. PyTorch's
+    weights-only loader rejects that project-owned class unless it is allowlisted.
+    Keep the allowlist local to this load so unrelated loads in the process are not broadened.
+    """
+    with torch.serialization.safe_globals([TransformerConfig]):
+        return torch.load(checkpoint_path, map_location=map_location, weights_only=True)
+
 @torch.no_grad()
 def load_model_and_tokenizer(
     checkpoint_path: str,
@@ -475,8 +489,7 @@ def load_model_and_tokenizer(
     tokenizer : PreTrainedTokenizer
         Tokenizer ready for generation with a defined pad token.
     """
-    torch.serialization.add_safe_globals([TransformerConfig])
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    checkpoint = load_checkpoint_payload(checkpoint_path, map_location=device)
     if "config" not in checkpoint or "model_state_dict" not in checkpoint:
         raise ValueError(f"Invalid checkpoint format: {checkpoint_path}")
     config = checkpoint["config"]
