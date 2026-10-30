@@ -10,7 +10,7 @@ from typing import Any, Dict
 import torch
 
 from model import BaselineTransformer, TransformerConfig
-from utils import DEFAULT_TOKENIZER_NAME, generate_batch, seed_all
+from utils import DEFAULT_TOKENIZER_NAME, generate_batch, load_checkpoint_payload, seed_all
 
 
 def run_self_test_suite(
@@ -73,7 +73,7 @@ def run_self_checks() -> None:
         tokenizer = prepare_tokenizer(DEFAULT_TOKENIZER_NAME)
         vocab_size = getattr(tokenizer, "vocab_size", None) or len(tokenizer)
         ckpt = _make_tiny_checkpoint(tmp_path, vocab_size)
-        checkpoint = torch.load(ckpt, map_location="cpu")
+        checkpoint = load_checkpoint_payload(ckpt, map_location="cpu")
         model = BaselineTransformer(checkpoint["config"])
         model.load_state_dict(checkpoint["model_state_dict"])
         payload = run_eval_suite(
