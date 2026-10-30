@@ -3,6 +3,10 @@
 See docs/model-defaults.md. The legacy table below is the pre-change factory, copied from
 model.py at be08cde, so legacy_defaults=True must reproduce it exactly.
 """
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -11,6 +15,7 @@ import model as model_module  # noqa: E402
 from model import (  # noqa: E402
     LEGACY_DEFAULTS, PRESETS, BaselineTransformer, TransformerConfig, create_model, ffn_dim,
 )
+from utils import load_checkpoint_payload  # noqa: E402
 
 # size -> (d_model, d_ff, dropout, tie_weights) under the factory at be08cde (before the change)
 OLD_FACTORY = {
@@ -117,3 +122,27 @@ def test_resume_guard_refuses_a_changed_architecture():
         train.check_resume_architecture(old_cfg, new_cfg)
     train.check_resume_architecture(old_cfg, TransformerConfig(**small, **LEGACY_DEFAULTS))
     train.check_resume_architecture(None, new_cfg)  # checkpoints without a config are not checked
+
+
+def test_checkpoint_payload_loads_in_a_fresh_process(tmp_path):
+    """Resume must accept the project's config with PyTorch's weights-only default in a clean interpreter."""
+    config = TransformerConfig(
+        vocab_size=50,
+        max_seq_len=8,
+        d_model=32,
+        n_layers=1,
+        n_heads=2,
+    )
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save({"config": config}, checkpoint_path)
+
+    script = (
+        "import sys; from utils import load_checkpoint_payload; "
+        "payload = load_checkpoint_payload(sys.argv[1], map_location='cpu'); "
+        "assert payload['config'].d_model == 32"
+    )
+    subprocess.run(
+        [sys.executable, "-c", script, str(checkpoint_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+    )
