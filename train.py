@@ -50,6 +50,7 @@ from curriculum import DagUnlockState, TaskCurriculumState
 from data import get_task_weight, make_collate_fn
 from utils import (
     DEFAULT_TOKENIZER_NAME,
+    load_checkpoint_payload,
     aggregate,
     compute_repetition_metrics,
     compute_attention_probs,
@@ -2537,7 +2538,7 @@ def train(args):
         )
 
     def load_checkpoint_state(checkpoint_path: str) -> Tuple[int, int, float]:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = load_checkpoint_payload(checkpoint_path, map_location=device)
         check_resume_architecture(checkpoint.get("config"), getattr(model, "_orig_mod", model).config)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer_state = checkpoint.get("optimizer_state_dict")
