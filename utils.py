@@ -472,6 +472,7 @@ def load_checkpoint_payload(
     with torch.serialization.safe_globals([TransformerConfig]):
         return torch.load(checkpoint_path, map_location=map_location, weights_only=True)
 
+
 @torch.no_grad()
 def load_model_and_tokenizer(
     checkpoint_path: str,
