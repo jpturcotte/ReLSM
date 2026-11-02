@@ -3,6 +3,7 @@
 T1 split, T2 decay groups and decoupled decay, T3 harness overfit smoke (not #256, which tests
 train.py), T5 measured update norm, T6 same seed -> same metrics. Threads are pinned to 1.
 """
+import argparse
 import json
 import math
 import os
@@ -241,6 +242,34 @@ def test_summary_reads_the_trace_not_the_last_line():
     assert s["first_update_unseen_ge_0.99"] == 200
     assert s["frac_last10pct_evals_unseen_ge_0.99"] == pytest.approx(1 / 2)
     assert gl.summarize([(100, None)], 1000)["first_update_unseen_ge_0.99"] is None
+    assert "first_update_unseen_offdiag_ge_0.99" not in s  # two-column history: no off-diagonal keys
+
+
+def test_summary_reports_offdiag_timing_apart_from_diagonals():
+    # the diagonals hold "unseen" under 0.99 long after the off-diagonal pairs are learned
+    hist = [(100, 0.5, 0.6), (200, 0.97, 0.995), (900, 0.98, 0.999), (1000, 0.995, 1.0)]
+    s = gl.summarize(hist, 1000)
+    assert s["first_update_unseen_ge_0.99"] == 1000 and s["first_update_unseen_offdiag_ge_0.99"] == 200
+    assert s["frac_last10pct_evals_unseen_offdiag_ge_0.99"] == 1.0
+    assert gl.summarize([(100, 0.5, None)], 1000)["first_update_unseen_offdiag_ge_0.99"] is None
+
+
+def test_add2b_task_answers_and_run(tmp_path):
+    p = 23
+    ids = torch.tensor([0, 5 * p + 5, 3 * p + 22, 22 * p + 3])
+    for operands in ("shared", "separate"):
+        x, y = gl.encode(ids, p, operands, "add2b")
+        assert y.tolist() == [0, 15, (3 + 44) % p, (22 + 6) % p]
+        assert torch.equal(x, gl.encode(ids, p, operands)[0])  # the inputs do not depend on the task
+    assert gl.encode(ids, p)[1].tolist() == [0, 10, 2, 2]  # default task unchanged: a + b
+    assert gl.task_of(argparse.Namespace()) == "add"  # old run records
+    last = gl.run(args_for(tmp_path, "--p", str(p), "--task", "add2b", "--updates", "20", "--eval_every", "10",
+                           "--ckpt_every", "0"))
+    err = json.loads((tmp_path / "final_errors.json").read_text())
+    assert all(t == (a + 2 * b) % p for a, b, t, *_ in err["train"] + err["test"])
+    rec = json.loads((tmp_path / "run_record.json").read_text())
+    assert rec["args"]["task"] == "add2b" and math.isfinite(last["test_loss"])
+    assert "first_update_unseen_offdiag_ge_0.99" in rec
 
 
 def test_wsd_matches_train_py_get_lr(tmp_path):
@@ -374,6 +403,129 @@ def test_diagonal_and_offdiag_unseen_accuracy(tmp_path):
     prec = json.loads((tmp_path / "paired" / "run_record.json").read_text())
     assert prec["n_test_transpose_seen"] == 0
     assert prec["n_test_unseen_offdiag"] == prec["n_test"] - prec["n_test_diagonal"]
+
+
+@pytest.mark.parametrize("pairs", ["ordered", "paired"])
+def test_diagonals_flag_moves_only_the_diagonals(pairs):
+    p = 23
+    base = set(gl.make_split(p, 0.5, 0, pairs)[0].tolist())
+    assert base == set(gl.make_split(p, 0.5, 0, pairs, "split")[0].tolist())  # default unchanged
+    diag = {a * p + a for a in range(p)}
+    for side in ("train", "test"):
+        train, test, seen = gl.make_split(p, 0.5, 0, pairs, side)
+        tr = set(train.tolist())
+        assert (diag <= tr) if side == "train" else not (diag & tr)
+        assert tr - diag == base - diag  # every other pair stays where the split put it
+        assert tr.isdisjoint(test.tolist()) and len(tr) + len(test) == p * p
+        for i, s in zip(test.tolist(), seen.tolist()):
+            a, b = divmod(i, p)
+            assert s == (b * p + a in tr)
+    with pytest.raises(ValueError):
+        gl.make_split(p, 0.5, 0, pairs, "nowhere")
+
+
+def test_separate_operands_encoding(tmp_path):
+    p = 23
+    ids = torch.tensor([0, 5 * p + 5, 3 * p + 22])
+    x, y = gl.encode(ids, p, "separate")
+    assert x.tolist() == [[0, 46, 23, 47], [5, 46, 28, 47], [3, 46, 45, 47]] and y.tolist() == [0, 10, 2]
+    assert torch.equal(gl.encode(ids, p)[1], y) and gl.encode(ids, p)[0][1].tolist() == [5, 23, 5, 24]
+    a = args_for(tmp_path, "--p", str(p), "--operands", "separate")
+    assert gl.vocab_size(a) == 2 * p + 2 and gl.build_model(a).tok_emb.weight.shape[0] == 2 * p + 2
+    xa, xb = gl.operands_of(x, a)
+    assert xa.tolist() == [0, 5, 3] and xb.tolist() == [0, 5, 22]
+    old = argparse.Namespace(**{k: v for k, v in vars(args_for(tmp_path, "--p", str(p))).items() if k != "operands"})
+    assert gl.vocab_size(old) == p + 2  # run records from before the flag read as shared
+
+
+def test_separate_operands_and_test_diagonals_run(tmp_path):
+    p = 23
+    last = gl.run(args_for(tmp_path, "--p", str(p), "--updates", "20", "--eval_every", "10", "--ckpt_every", "0",
+                           "--operands", "separate", "--diagonals", "test"))
+    rec = json.loads((tmp_path / "run_record.json").read_text())
+    err = json.loads((tmp_path / "final_errors.json").read_text())
+    assert rec["n_train_diagonal"] == 0 and rec["n_test_diagonal"] == p
+    assert rec["model_config"]["vocab_size"] == 2 * p + 2
+    test_ids = set(gl.make_split(p, 0.5, 0, "ordered", "test")[1].tolist())
+    for a, b, t, q, s, m in err["test"]:  # columns hold the numbers, not the offset tokens
+        assert 0 <= a < p and 0 <= b < p and t == (a + b) % p and a * p + b in test_ids
+    n_wrong_diag = sum(r[0] == r[1] for r in err["test"])
+    assert rec["n_wrong_final"]["test_diagonal"] == n_wrong_diag
+    assert last["test_acc_diagonal"] == pytest.approx(1 - n_wrong_diag / p, abs=1e-6)
+
+
+def test_holdout_line_moves_both_lines_to_test():
+    p, k = 23, 1
+    base = set(gl.make_split(p, 0.5, 0)[0].tolist())
+    train, test, seen = gl.make_split(p, 0.5, 0, holdout_line=k)
+    tr = set(train.tolist())
+    line = {a * p + (a + k) % p for a in range(p)} | {a * p + (a - k) % p for a in range(p)}
+    assert len(line) == 2 * p and not (line & tr) and tr == base - line
+    in_line = gl.line_mask(test // p, test % p, p, k)
+    assert int(in_line.sum()) == 2 * p and not seen[in_line].any()  # their transposes are held out too
+    for bad in (0, p, 23 * 2):
+        with pytest.raises(ValueError):
+            gl.make_split(p, 0.5, 0, holdout_line=bad)
+
+
+def test_separate_operands_keep_the_same_answer_classes(tmp_path):
+    p = 23
+    a = args_for(tmp_path, "--p", str(p), "--operands", "separate")
+    torch.manual_seed(0)
+    model = gl.build_model(a)
+    x, _ = gl.encode(gl.make_split(p, 0.5, 0)[0][:5], p, "separate")
+    z = gl.answer_logits(model, x, a)
+    with torch.no_grad():
+        full = model(x)[0][:, -1, :]
+    assert z.shape == (5, p + 2)  # answers 0..p-1, then op and '=', as with shared operands
+    assert torch.equal(z[:, :p], full[:, :p]) and torch.equal(z[:, p:], full[:, 2 * p:])
+    loss = gl.loss_of(z, torch.zeros(5, dtype=torch.long), a)
+    loss.backward()
+    g = model.tok_emb.weight.grad
+    # second-operand rows get gradient only as inputs: rows of tokens absent from x get none at all
+    unused = sorted(set(range(p, 2 * p)) - set(x[:, 2].tolist()))
+    assert unused and g[unused].abs().max().item() == 0.0
+
+
+def test_test_margins_by_group_and_holdout_line_run(tmp_path):
+    p = 23
+    last = gl.run(args_for(tmp_path, "--p", str(p), "--updates", "20", "--eval_every", "10", "--ckpt_every", "0",
+                           "--holdout_line", "3"))
+    rec = json.loads((tmp_path / "run_record.json").read_text())
+    assert rec["n_test_line"] == 2 * p and 0 <= last["test_acc_line"] <= 1
+    # the record's count is the metric's group: unseen, off-diagonal, off the held-out line
+    train, test, seen = gl.make_split(p, 0.5, 0, holdout_line=3)
+    a, b = test // p, test % p
+    off = ~seen & (a != b) & ~gl.line_mask(a, b, p, 3)
+    assert rec["n_test_unseen_offdiag"] == int(off.sum()) < int((~seen & (a != b)).sum())
+    assert rec["n_test_unseen"] == rec["n_test_diagonal"] + rec["n_test_unseen_offdiag"] + rec["n_test_line"]
+    for g in ("diagonal", "unseen_offdiag", "seen"):
+        assert math.isfinite(last[f"test_margin_mean_{g}"]) and math.isfinite(last[f"test_margin_p5_{g}"])
+    for g in ("diagonal", "offdiag"):
+        assert math.isfinite(last[f"train_margin_mean_{g}"]) and math.isfinite(last[f"train_margin_p5_{g}"])
+    model = gl.build_model(gl.parse_args(["--out", str(tmp_path), "--p", str(p)]))
+    model.load_state_dict(torch.load(tmp_path / "final.pt")["model"])
+    model.eval()
+    _, test, seen = gl.make_split(p, 0.5, 0, holdout_line=3)
+    x, y = gl.encode(test, p)
+    with torch.no_grad():
+        m = gl.margins(model(x)[0][:, -1, :].double(), y)
+    diag = (test // p) == (test % p)
+    assert last["test_margin_mean_diagonal"] == pytest.approx(m[diag].mean().item(), abs=1e-5)
+    line = gl.line_mask(test // p, test % p, p, 3)
+    assert last["test_margin_mean_line"] == pytest.approx(m[line].mean().item(), abs=1e-5)
+    off = ~seen & ~diag & ~line  # the held-out lines are not in the comparison group
+    assert last["test_margin_mean_unseen_offdiag"] == pytest.approx(m[off].mean().item(), abs=1e-5)
+    train = gl.make_split(p, 0.5, 0, holdout_line=3)[0]
+    xt, yt = gl.encode(train, p)
+    with torch.no_grad():
+        mt = gl.margins(model(xt)[0][:, -1, :].double(), yt)
+    tdiag = (train // p) == (train % p)
+    assert last["train_margin_mean_diagonal"] == pytest.approx(mt[tdiag].mean().item(), abs=1e-5)
+    assert last["train_margin_mean_offdiag"] == pytest.approx(mt[~tdiag].mean().item(), abs=1e-5)
+    paired = gl.run(args_for(tmp_path / "paired", "--p", str(p), "--pairs", "paired", "--updates", "10",
+                             "--eval_every", "10", "--ckpt_every", "0"))
+    assert paired["test_margin_mean_seen"] is None and "test_acc_line" not in paired  # paired: no seen pairs
 
 
 # T6 ---------------------------------------------------------------------------------------

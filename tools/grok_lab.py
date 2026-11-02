@@ -3,8 +3,19 @@
 PR 2 of docs/research/grokking-fix-plan-2026-10-28.md (arm A1-H of #249). It builds the repo's
 model directly and uses nothing from data.py or train.py.
 
-- Task: the enumerated a + b mod p table, one token per number. Input [a, op, b, =]; the
-  answer is predicted at the last position. Vocabulary p + 2.
+- Task: the enumerated a + b mod p table (or a + 2b with --task add2b, which is not commutative),
+  one token per number. Input [a, op, b, =]; the
+  answer is predicted at the last position. Vocabulary p + 2 (2p + 2 with --operands separate,
+  where the second operand has its own tokens). --diagonals train|test moves every pair (a, a)
+  to one side of the split; --holdout_line k moves the lines b = a +- k to test as its positive
+  control. These exist to test why diagonals are weak: the model marks position only through
+  RoPE, so two identical operand tokens pass identical value vectors. Under --operands separate
+  the outputs keep the same p + 2 classes (the second operand's tokens are inputs only), and
+  (a, b) and (b, a) share no tokens, so the transpose leak is gone: read that arm on the gap
+  between diagonal and unseen off-diagonal pairs, not on accuracy against the control.
+  Evals log margins per group: test_margin_mean_/p5_ for diagonal, unseen_offdiag and seen, and
+  train_margin_mean_/p5_ for diagonal and offdiag. With --holdout_line, unseen_offdiag excludes
+  the held-out lines too (test_acc_line and test_margin_mean_line report them).
 - Split: seeded, at --frac. `ordered` splits the p^2 ordered pairs (Power 2022); `paired`
   keeps (a, b) and (b, a) on the same side. Each test pair is tagged "transpose seen" when
   (b, a) is in train; a diagonal pair (a, a) is its own transpose, so it is never seen.
@@ -77,8 +88,13 @@ CLIFF_BF16 = math.log(2.0 ** 8)  # 5.55: the same for --loss ce_rounded with bf1
 ROUND_DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16}
 
 
-def make_split(p, frac, seed, pairs="ordered"):
-    """Return (train ids, test ids, seen) over pair ids a*p + b. seen[i]: (b, a) of test pair i is in train."""
+def make_split(p, frac, seed, pairs="ordered", diagonals="split", holdout_line=None):
+    """Return (train ids, test ids, seen) over pair ids a*p + b. seen[i]: (b, a) of test pair i is in train.
+    diagonals: "split" leaves the pairs (a, a) where the seeded split put them; "train" or "test" then moves
+    all p of them to that side (at frac 0.5 the train set grows or shrinks by about p / 2).
+    holdout_line k: also move every pair on the lines b = a + k and b = a - k (mod p) to test, 2p pairs that
+    are each other's transposes. It is the positive control for --diagonals test: a held-out line other than
+    the diagonal, so a weak diagonal can be told apart from a weak held-out line."""
     g = torch.Generator().manual_seed(seed)
     n, n_train = p * p, int(round(frac * p * p))
     in_train = torch.zeros(n, dtype=torch.bool)
@@ -93,20 +109,55 @@ def make_split(p, frac, seed, pairs="ordered"):
                 taken += len(groups[k])
     else:
         raise ValueError(f"unknown --pairs {pairs!r}")
+    if diagonals in ("train", "test"):
+        in_train[torch.arange(p) * (p + 1)] = diagonals == "train"
+    elif diagonals != "split":
+        raise ValueError(f"unknown --diagonals {diagonals!r}")
+    if holdout_line is not None:
+        if not 0 < holdout_line < p or (2 * holdout_line) % p == 0:
+            raise ValueError(f"--holdout_line {holdout_line} must be in 1..{p - 1} with 2k != 0 mod p")
+        a = torch.arange(p)
+        in_train[torch.cat([a * p + (a + holdout_line) % p, a * p + (a - holdout_line) % p])] = False
     train, test = in_train.nonzero().squeeze(1), (~in_train).nonzero().squeeze(1)
     seen = in_train[(test % p) * p + test // p]
     return train, test, seen
 
 
-def encode(ids, p):
-    """Pair ids -> inputs [a, op, b, =] (op = p, '=' = p + 1) and answers (a + b) mod p."""
+TASKS = {"add": (1, 1), "add2b": (1, 2)}  # answer = (ca * a + cb * b) mod p
+
+
+def encode(ids, p, operands="shared", task="add"):
+    """Pair ids -> inputs [a, op, b, =] and answers (a + b) mod p, or (a + 2b) mod p for task add2b (not
+    commutative: (a, b) and (b, a) have different answers, so a symmetry of the input no longer matches one of
+    the answer). shared: one token per number for both operands (op = p, '=' = p + 1). separate: the second
+    operand uses its own tokens p + b, so (a, a) is no longer two identical tokens (op = 2p, '=' = 2p + 1);
+    answers stay tokens 0..p-1."""
     a, b = ids // p, ids % p
-    x = torch.stack([a, torch.full_like(a, p), b, torch.full_like(a, p + 1)], dim=1)
-    return x, (a + b) % p
+    k = p if operands == "separate" else 0
+    ca, cb = TASKS[task]
+    x = torch.stack([a, torch.full_like(a, p + k), b + k, torch.full_like(a, p + k + 1)], dim=1)
+    return x, (ca * a + cb * b) % p
+
+
+def task_of(args):
+    return getattr(args, "task", "add")  # run records from before the flag: add
+
+
+def separate_operands(args):
+    return getattr(args, "operands", "shared") == "separate"  # run records from before the flag: shared
+
+
+def vocab_size(args):
+    return 2 * args.p + 2 if separate_operands(args) else args.p + 2
+
+
+def operands_of(x, args):
+    """The numbers (a, b) behind encoded inputs x."""
+    return x[:, 0], x[:, 2] - (args.p if separate_operands(args) else 0)
 
 
 def build_model(args):
-    cfg = TransformerConfig(vocab_size=args.p + 2, max_seq_len=4, d_model=128, n_layers=2, n_heads=4,
+    cfg = TransformerConfig(vocab_size=vocab_size(args), max_seq_len=4, d_model=128, n_layers=2, n_heads=4,
                             dropout=args.dropout, tie_weights=not args.untie)
     with contextlib.redirect_stdout(sys.stderr):  # keep stdout pure JSONL
         model = BaselineTransformer(cfg)
@@ -193,8 +244,21 @@ def bf16_ctx(args, device):
 
 
 def answer_logits(model, x, args):
+    """Logits at '=' over the answer classes. Under --operands separate the second operand's p tokens are
+    dropped from the outputs, so the classes are the same p + 2 as with shared operands (answers 0..p-1, then
+    op and '='): those rows of the tied table stay pure inputs, never pushed down as wrong answers."""
     with bf16_ctx(args, x.device):
-        return model(x)[0][:, -1, :]
+        z = model(x)[0][:, -1, :]
+    if separate_operands(args):
+        p = args.p
+        z = torch.cat([z[:, :p], z[:, 2 * p:]], dim=1)
+    return z
+
+
+def line_mask(xa, xb, p, k):
+    """Pairs on the lines b = a + k or b = a - k (mod p)."""
+    d = (xb - xa) % p
+    return (d == k) | (d == (p - k) % p)
 
 
 def loss_of(z, y, args):
@@ -292,12 +356,27 @@ def evaluate(model, opt, data, args):
             out["test_acc_unseen"] = correct[~seen].float().mean().item() if (~seen).any() else None
             out["test_loss_unseen"] = F.cross_entropy(z[~seen].double(), y[~seen]).item() if (~seen).any() else None
             x = data["test_x"]
-            diag = x[:, 0] == x[:, 2]  # (a, a): no transpose partner, so always inside "unseen"
-            off = ~seen & ~diag
+            xa, xb = operands_of(x, args)
+            diag = xa == xb  # (a, a): no transpose partner, so always inside "unseen"
+            k = getattr(args, "holdout_line", None)
+            line = line_mask(xa, xb, args.p, k) if k is not None else torch.zeros_like(diag)
+            off = ~seen & ~diag & ~line  # the comparison group: random unseen pairs, no held-out family
             out["test_acc_diagonal"] = correct[diag].float().mean().item() if diag.any() else None
             out["test_acc_unseen_offdiag"] = correct[off].float().mean().item() if off.any() else None
+            m = margins(z.double(), y)  # per group: a continuous readout, where accuracy counts a few pairs
+            for g, mask in (("diagonal", diag), ("unseen_offdiag", off), ("seen", seen)):
+                out[f"test_margin_mean_{g}"] = m[mask].mean().item() if mask.any() else None
+                out[f"test_margin_p5_{g}"] = torch.quantile(m[mask], 0.05).item() if mask.any() else None
+            if k is not None:
+                out["test_acc_line"] = correct[line].float().mean().item()
+                out["test_margin_mean_line"] = m[line].mean().item()
         else:
             out.update(margin_stats(z, y, args))
+            xa, xb = operands_of(data["train_x"], args)  # memorized (a, a) vs other train pairs
+            m = margins(z.double(), y)
+            for g, mask in (("diagonal", xa == xb), ("offdiag", xa != xb)):
+                out[f"train_margin_mean_{g}"] = m[mask].mean().item() if mask.any() else None
+                out[f"train_margin_p5_{g}"] = torch.quantile(m[mask], 0.05).item() if mask.any() else None
     out["norm_total"] = global_norm(model.parameters())  # at init, mostly the RMSNorm gains (sqrt(640) = 25.3)
     out["norm_gains"] = global_norm([q for n, q in model.named_parameters() if "norm" in n])
     out["norm_matrices"] = global_norm([q for n, q in model.named_parameters() if "norm" not in n])
@@ -328,9 +407,10 @@ def wrong_pairs(model, data, args, update):
         z = answer_logits(model, x, args)
         pred, m = z.argmax(1), margins(z.double(), y)
         bad = (pred != y).nonzero().squeeze(1)
+        xa, xb = operands_of(x, args)
         seen = data["test_seen"][bad].tolist() if split == "test" else [None] * len(bad)
         out[split] = [[a, b, t, q, s, round(mm, 4)] for a, b, t, q, s, mm in
-                      zip(x[bad, 0].tolist(), x[bad, 2].tolist(), y[bad].tolist(), pred[bad].tolist(), seen,
+                      zip(xa[bad].tolist(), xb[bad].tolist(), y[bad].tolist(), pred[bad].tolist(), seen,
                           m[bad].tolist())]
     return out
 
@@ -364,12 +444,19 @@ def save_atomic(obj, path):
 
 
 def summarize(history, updates, level=0.99):
-    """Grokking read from the whole trace, not the last line: an eval can land inside a loss spike."""
-    ok = [(u, a) for u, a in history if a is not None]
-    first = next((u for u, a in ok if a >= level), None)
-    tail = [a for u, a in ok if u > 0.9 * updates]
-    return {"first_update_unseen_ge_0.99": first,
-            "frac_last10pct_evals_unseen_ge_0.99": sum(a >= level for a in tail) / len(tail) if tail else None}
+    """Grokking read from the whole trace, not the last line: an eval can land inside a loss spike.
+    history: (update, unseen acc) or (update, unseen acc, unseen off-diagonal acc). "unseen" includes the
+    diagonal pairs, which can lag far behind (with --diagonals test, by over 10,000 updates), so the
+    off-diagonal timing is reported as well."""
+    out = {}
+    for col, name in ((1, "unseen"), (2, "unseen_offdiag")):
+        ok = [(h[0], h[col]) for h in history if len(h) > col and h[col] is not None]
+        if col == 2 and not any(len(h) > 2 for h in history):
+            continue
+        tail = [a for u, a in ok if u > 0.9 * updates]
+        out[f"first_update_{name}_ge_0.99"] = next((u for u, a in ok if a >= level), None)
+        out[f"frac_last10pct_evals_{name}_ge_0.99"] = sum(a >= level for a in tail) / len(tail) if tail else None
+    return out
 
 
 def git(*cmd):
@@ -395,8 +482,8 @@ def run(args):
             f.replace(aside / f.name)
 
     split_seed = args.seed if args.split_seed is None else args.split_seed
-    train, test, seen = make_split(args.p, args.frac, split_seed, args.pairs)
-    (xtr, ytr), (xte, yte) = encode(train, args.p), encode(test, args.p)
+    train, test, seen = make_split(args.p, args.frac, split_seed, args.pairs, args.diagonals, args.holdout_line)
+    (xtr, ytr), (xte, yte) = (encode(ids, args.p, args.operands, args.task) for ids in (train, test))
     missing = sorted(set(range(args.p)) - set(ytr.tolist()))
     if missing and not args.allow_missing_residues:
         raise ValueError(f"residues never seen as a train answer: {missing}")
@@ -420,7 +507,12 @@ def run(args):
                            "deterministic; same-seed GPU reruns can drift apart, most visibly after a loss spike.",
         "n_train": len(train), "n_test": len(test), "n_test_transpose_seen": int(seen.sum()),
         "n_test_unseen": int((~seen).sum()), "n_test_diagonal": int(((test // args.p) == (test % args.p)).sum()),
-        "n_test_unseen_offdiag": int((~seen & ((test // args.p) != (test % args.p))).sum()),
+        "n_train_diagonal": int(((train // args.p) == (train % args.p)).sum()),
+        "n_test_line": None if args.holdout_line is None else int(line_mask(test // args.p, test % args.p, args.p, args.holdout_line).sum()),
+        # the same group as the test_*_unseen_offdiag metrics: unseen, not diagonal, not on the held-out line
+        "n_test_unseen_offdiag": int((~seen & ((test // args.p) != (test % args.p)) & ~(
+            line_mask(test // args.p, test % args.p, args.p, args.holdout_line) if args.holdout_line is not None
+            else torch.zeros(len(test), dtype=torch.bool))).sum()),
         "missing_residues": missing, "examples_per_update": args.batch or len(train), "updates": args.updates,
         "full_batch": not args.batch,
         "n_params": sum(q.numel() for q in model.parameters()),
@@ -467,7 +559,7 @@ def run(args):
                                 **stats, "spikes": spikes.count, "spike_events": events,
                                 "nonfinite": sum(not math.isfinite(v) for v in losses),
                                 "train_obj_trace": losses})  # every update's loss since the last line
-                    history.append((u + 1, last.get("test_acc_unseen")))
+                    history.append((u + 1, last.get("test_acc_unseen"), last.get("test_acc_unseen_offdiag")))
                     if not all(math.isfinite(v) for v in losses):
                         raise FloatingPointError(f"non-finite training loss by update {u + 1}")
                 if args.ckpt_every and (u + 1) % args.ckpt_every == 0 and u + 1 < args.updates:
@@ -498,6 +590,14 @@ def parse_args(argv=None):
     ap.add_argument("--pairs", choices=["ordered", "paired"], default="ordered")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--split_seed", type=int, default=None, help="default: --seed")
+    ap.add_argument("--diagonals", choices=["split", "train", "test"], default="split",
+                    help="where the pairs (a, a) go: as the seeded split puts them, or all in train or all in test")
+    ap.add_argument("--holdout_line", type=int, default=None,
+                    help="move the lines b = a +- k (mod p) to test: positive control for --diagonals test")
+    ap.add_argument("--operands", choices=["shared", "separate"], default="shared",
+                    help="separate: the second operand gets its own p tokens (vocabulary 2p + 2)")
+    ap.add_argument("--task", choices=sorted(TASKS), default="add",
+                    help="add: (a + b) mod p; add2b: (a + 2b) mod p, not commutative")
     ap.add_argument("--allow_missing_residues", action="store_true", help="for small smoke sets only")
     ap.add_argument("--untie", action="store_true", help="separate output head (default: tied to the embedding)")
     ap.add_argument("--no_final_norm", action="store_true")
