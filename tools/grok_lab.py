@@ -8,11 +8,18 @@ model directly and uses nothing from data.py or train.py.
 - Split: seeded, at --frac. `ordered` splits the p^2 ordered pairs (Power 2022); `paired`
   keeps (a, b) and (b, a) on the same side. Each test pair is tagged "transpose seen" when
   (b, a) is in train; a diagonal pair (a, a) is its own transpose, so it is never seen.
+  Diagonals are about 2% of the unseen test pairs (ordered split, frac 0.5; about 1% under
+  paired, where every test pair is unseen), but they held 13 of the 15 late test errors in the
+  long stack runs (2026-11-01), so evals also log test_acc_diagonal and test_acc_unseen_offdiag
+  (unseen without the diagonals). test_acc_unseen still includes them, as before.
 - Model: d 128, 2 layers, 4 heads, dropout 0, head tied to the embedding (ReLSM's model and the
   owner's primary arm). --untie gives a separate head (Power 2022, Nanda 2023); --no_final_norm
   removes the final RMSNorm. The head is set here explicitly, not taken from the model defaults.
 - Optimizer: AdamW, betas (0.9, --beta2), --eps, weight decay --wd on the --wd_scope set.
-  Linear warmup over --warmup updates, then constant LR. No early stopping. By default: no
+  Linear warmup over --warmup updates, then constant LR; --lr_schedule wsd copies train.py's
+  default instead (hold until 40% of the run, then linear decay to --min_lr at the last update;
+  train.py's own LR is --lr 6e-4). Progress is read in updates; train.py reads it in answer
+  tokens (#217), which for this task is close to proportional. No early stopping. By default: no
   clipping, full batch, fp32. To step toward train.py's setup one setting at a time: --clip,
   --batch (epoch-shuffled minibatches), --bf16 autocast (model and loss under bf16 autocast, as
   train.py runs on CUDA; autocast keeps the cross-entropy in fp32).
@@ -23,8 +30,9 @@ model directly and uses nothing from data.py or train.py.
   bf16 log_softmax kernel does; the CUDA kernel keeps the sum in fp32 and has no such cliff.
 
 Outputs in --out: metrics.jsonl (append-only, one line per eval, also printed to stdout),
-run_record.json, ckpt_<update>.pt (weights) and final.pt (weights + optimizer). Files from an
-earlier run in the same --out are moved to old_<time>/ first.
+run_record.json, ckpt_<update>.pt (weights), final.pt (weights + optimizer) and final_errors.json
+(every train and test pair the final model gets wrong, in eval mode). Files from an earlier run
+in the same --out are moved to old_<time>/ first.
 
 Reading metrics.jsonl: train_loss, test_loss and the margins are fp64 readouts of the logits
 after update `update` (bf16-rounded logits under --bf16); train_obj_pre is the training
@@ -33,7 +41,15 @@ minibatches, so they are noisier and not comparable with full-batch arms. Under 
 ce_rounded, train_obj_* is quantized (per-example steps of log(1 + k 2^-7) for bf16) and reads
 exactly 0 once every train example is past the cliff, while the fp64 train_loss stays nonzero.
 Evals run in eval mode, so with --dropout > 0 the margin and zero-gradient readouts are of the
-model without dropout, not of the gradient training saw.
+model without dropout, not of the gradient training saw. With --dropout > 0 each eval also
+logs the same readouts from one train-mode pass over the train set (keys ending _trainmode;
+None without dropout): one dropout draw per train example, which under full batch are exactly
+the masks of the next update. That pass draws from a forked RNG, so it leaves the training
+run's random stream unchanged.
+margin_frac_cliff counts margins past the nominal fp32 cliff ln 2^24 = 16.6. The fp32 kernels
+zero the target gradient somewhat earlier (about 14.5-16.6, depending on the kernel and on how
+the other logits are spread), so for the share of examples that get no target gradient, quote
+zero_tgt_grad_frac: it is measured with the arm's own loss on the arm's own device.
 
     python tools/grok_lab.py --out runs/grok/std_s0 --seed 0
 """
@@ -119,6 +135,21 @@ def build_optimizer(model, args):
     if exempt:
         groups.append({"params": exempt, "weight_decay": 0.0})
     return torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, args.beta2), eps=args.eps)
+
+
+WSD_STABLE_END = 0.4  # train.py get_lr: hold max LR until 40% of the run
+
+
+def lr_at(u, args):
+    """LR for update u (0-based). Progress is read before the update, as train.py reads
+    tokens_seen. wsd copies train.py get_lr: max LR until 40%, then linear to --min_lr."""
+    warm = min(1.0, (u + 1) / args.warmup) if args.warmup > 0 else 1.0
+    if warm < 1.0 or args.lr_schedule == "constant":
+        return args.lr * warm
+    progress = u / args.updates
+    if progress < WSD_STABLE_END:
+        return args.lr
+    return args.lr - (args.lr - args.min_lr) * min((progress - WSD_STABLE_END) / (1 - WSD_STABLE_END), 1.0)
 
 
 def margins(z, y):
@@ -217,10 +248,38 @@ def train_step(model, opt, x, y, args, lr, measure=False):
                            "grad_norm": grad_norm, "top_param": named[k][0], "top_param_rel_update": rel[k]}
 
 
+MARGIN_KEYS = ("margin_min", "margin_mean", "margin_p5", "margin_frac_cliff", "margin_frac_bf16_cliff",
+               "zero_tgt_grad_frac")
+
+
+def margin_stats(z, y, args):
+    """Train-set margin readouts from answer logits z (in the arm's precision)."""
+    m = margins(z.double(), y)
+    with torch.enable_grad():  # the target gradient the arm's own loss produces
+        leaf = z.detach().requires_grad_()
+        (g,) = torch.autograd.grad(loss_of(leaf, y, args), leaf)
+    return dict(zip(MARGIN_KEYS, (m.min().item(), m.mean().item(), torch.quantile(m, 0.05).item(),
+                                  (m > CLIFF_FP32).float().mean().item(), (m > CLIFF_BF16).float().mean().item(),
+                                  (g.gather(1, y[:, None]) == 0).float().mean().item())))
+
+
+def rng_devices(device):
+    return [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+
+
 @torch.no_grad()
 def evaluate(model, opt, data, args):
     model.eval()
     out = {}
+    trainmode = None
+    if args.dropout > 0:  # one pass with dropout on, as training sees it; forked RNG keeps the run's stream
+        with torch.random.fork_rng(devices=rng_devices(data["train_x"].device)):
+            model.train()
+            try:
+                trainmode = margin_stats(answer_logits(model, data["train_x"], args), data["train_y"], args)
+            finally:
+                model.eval()
+    out.update({k + "_trainmode": None if trainmode is None else trainmode[k] for k in MARGIN_KEYS})
     for split in ("train", "test"):
         y = data[split + "_y"]
         z = answer_logits(model, data[split + "_x"], args)  # in the arm's precision
@@ -232,17 +291,13 @@ def evaluate(model, opt, data, args):
             out["test_acc_seen"] = correct[seen].float().mean().item() if seen.any() else None
             out["test_acc_unseen"] = correct[~seen].float().mean().item() if (~seen).any() else None
             out["test_loss_unseen"] = F.cross_entropy(z[~seen].double(), y[~seen]).item() if (~seen).any() else None
+            x = data["test_x"]
+            diag = x[:, 0] == x[:, 2]  # (a, a): no transpose partner, so always inside "unseen"
+            off = ~seen & ~diag
+            out["test_acc_diagonal"] = correct[diag].float().mean().item() if diag.any() else None
+            out["test_acc_unseen_offdiag"] = correct[off].float().mean().item() if off.any() else None
         else:
-            m = margins(z.double(), y)
-            out["margin_min"] = m.min().item()
-            out["margin_mean"] = m.mean().item()
-            out["margin_p5"] = torch.quantile(m, 0.05).item()
-            out["margin_frac_cliff"] = (m > CLIFF_FP32).float().mean().item()
-            out["margin_frac_bf16_cliff"] = (m > CLIFF_BF16).float().mean().item()
-            with torch.enable_grad():  # the target gradient the arm's own loss produces
-                leaf = z.detach().requires_grad_()
-                (g,) = torch.autograd.grad(loss_of(leaf, y, args), leaf)
-            out["zero_tgt_grad_frac"] = (g.gather(1, y[:, None]) == 0).float().mean().item()
+            out.update(margin_stats(z, y, args))
     out["norm_total"] = global_norm(model.parameters())  # at init, mostly the RMSNorm gains (sqrt(640) = 25.3)
     out["norm_gains"] = global_norm([q for n, q in model.named_parameters() if "norm" in n])
     out["norm_matrices"] = global_norm([q for n, q in model.named_parameters() if "norm" not in n])
@@ -257,6 +312,26 @@ def evaluate(model, opt, data, args):
         out["adam_v_min"] = v.min().item()
         out["adam_v_median"] = v.median().item()
         out["adam_v_frac_sqrt_below_eps"] = (v.sqrt() < args.eps).float().mean().item()
+    return out
+
+
+WRONG_COLUMNS = ["a", "b", "answer", "pred", "transpose_seen", "margin"]
+
+
+@torch.no_grad()
+def wrong_pairs(model, data, args, update):
+    """Every train and test pair the model gets wrong, in eval mode. transpose_seen is None for train pairs."""
+    model.eval()
+    out = {"update": update, "columns": WRONG_COLUMNS}
+    for split in ("train", "test"):
+        x, y = data[split + "_x"], data[split + "_y"]
+        z = answer_logits(model, x, args)
+        pred, m = z.argmax(1), margins(z.double(), y)
+        bad = (pred != y).nonzero().squeeze(1)
+        seen = data["test_seen"][bad].tolist() if split == "test" else [None] * len(bad)
+        out[split] = [[a, b, t, q, s, round(mm, 4)] for a, b, t, q, s, mm in
+                      zip(x[bad, 0].tolist(), x[bad, 2].tolist(), y[bad].tolist(), pred[bad].tolist(), seen,
+                          m[bad].tolist())]
     return out
 
 
@@ -345,6 +420,7 @@ def run(args):
                            "deterministic; same-seed GPU reruns can drift apart, most visibly after a loss spike.",
         "n_train": len(train), "n_test": len(test), "n_test_transpose_seen": int(seen.sum()),
         "n_test_unseen": int((~seen).sum()), "n_test_diagonal": int(((test // args.p) == (test % args.p)).sum()),
+        "n_test_unseen_offdiag": int((~seen & ((test // args.p) != (test % args.p))).sum()),
         "missing_residues": missing, "examples_per_update": args.batch or len(train), "updates": args.updates,
         "full_batch": not args.batch,
         "n_params": sum(q.numel() for q in model.parameters()),
@@ -373,7 +449,7 @@ def run(args):
         try:
             log(0, {"lr": 0.0})
             for u in range(args.updates):
-                lr = args.lr * min(1.0, (u + 1) / args.warmup) if args.warmup > 0 else args.lr
+                lr = lr_at(u, args)
                 at_log = (u + 1) % args.eval_every == 0 or u + 1 == args.updates
                 if sampler is None:
                     bx, by = data["train_x"], data["train_y"]
@@ -396,6 +472,11 @@ def run(args):
                         raise FloatingPointError(f"non-finite training loss by update {u + 1}")
                 if args.ckpt_every and (u + 1) % args.ckpt_every == 0 and u + 1 < args.updates:
                     save_atomic({"model": model.state_dict(), "update": u + 1}, out / f"ckpt_{u + 1:06d}.pt")
+            wrong = wrong_pairs(model, data, args, args.updates)
+            save_atomic(json.dumps(wrong), out / "final_errors.json")
+            record["n_wrong_final"] = {"train": len(wrong["train"]), "test": len(wrong["test"]),
+                                       "test_unseen": sum(not r[4] for r in wrong["test"]),
+                                       "test_diagonal": sum(r[0] == r[1] for r in wrong["test"])}
             save_atomic({"model": model.state_dict(), "optimizer": opt.state_dict(), "update": args.updates,
                          "args": vars(args)}, out / "final.pt")
             record["status"] = "finished"
@@ -427,6 +508,9 @@ def parse_args(argv=None):
     ap.add_argument("--beta2", type=float, default=0.98)
     ap.add_argument("--eps", type=float, default=1e-8)
     ap.add_argument("--warmup", type=int, default=10, help="linear warmup, in updates")
+    ap.add_argument("--lr_schedule", choices=["constant", "wsd"], default="constant",
+                    help="wsd: train.py's default (max LR until 40%% of the run, then linear to --min_lr)")
+    ap.add_argument("--min_lr", type=float, default=None, help="--lr_schedule wsd only; default 1.5e-4 (train.py's)")
     ap.add_argument("--loss", choices=["ce", "margin", "ce_rounded"], default="ce")
     ap.add_argument("--round_dtype", choices=sorted(ROUND_DTYPES), default=None,
                     help="--loss ce_rounded only: the dtype the softmax sum is rounded to "
@@ -450,6 +534,15 @@ def parse_args(argv=None):
         ap.error("--round_dtype applies only to --loss ce_rounded")
     if args.loss == "ce_rounded" and args.round_dtype is None:
         args.round_dtype = "bfloat16"
+    if args.min_lr is not None and args.lr_schedule != "wsd":
+        ap.error("--min_lr applies only to --lr_schedule wsd")
+    if args.lr_schedule == "wsd" and args.min_lr is None:
+        args.min_lr = 1.5e-4
+    if args.lr_schedule == "wsd" and args.min_lr > args.lr:
+        ap.error(f"--min_lr {args.min_lr} is above --lr {args.lr}: wsd would decay upward")
+    if args.lr_schedule == "wsd" and args.warmup >= WSD_STABLE_END * args.updates:
+        ap.error("--lr_schedule wsd needs --warmup below 40%% of --updates "
+                 "(train.py would jump from the ramp into mid-decay, #173)")
     return args
 
 
