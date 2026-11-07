@@ -6,8 +6,11 @@ and metadata recording so that all evaluation paths share consistent
 behavior and output schemas.
 """
 
+import hashlib
 import json
 import math
+import numbers
+import operator
 import os
 import platform
 import random
@@ -778,6 +781,7 @@ class EvalResult:
     format_stats: Dict[str, Dict[str, int]]
     numeric_length_mismatch_count: int
     numeric_length_total: int
+    dataset_sha256: str = ""
 
 
 def _base_normalize(text: str) -> str:
@@ -961,6 +965,39 @@ def aggregate(task: str, results: List[Dict[str, float]]) -> AggregatedMetrics:
     )
 
 
+def stable_seed(*parts: Union[int, str]) -> int:
+    """Return a 31-bit seed derived from ``parts`` that is the same in every process.
+
+    Built-in ``hash()`` of anything holding a ``str`` is salted per process
+    (``PYTHONHASHSEED``), so it must not seed draws that have to repeat across
+    runs (#160). Parts must be ints or strs. They are reduced to exact ``int`` /
+    ``str`` (so a NumPy integer or a ``str`` subclass gives the same seed as the
+    plain value) and encoded as ASCII-only JSON, which does not depend on
+    ``repr`` or on the Python version's Unicode tables.
+    """
+
+    canonical: List[Union[int, str]] = []
+    for part in parts:
+        if isinstance(part, str):
+            canonical.append(str.__str__(part))
+        elif isinstance(part, numbers.Integral) and not isinstance(part, bool):
+            canonical.append(int(operator.index(part)))
+        else:
+            raise TypeError(f"stable_seed parts must be int or str, got {type(part).__name__}")
+    payload = json.dumps(canonical, ensure_ascii=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode("ascii")).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFFFFFF
+
+
+def dataset_sha256(examples: Sequence[Dict[str, Any]]) -> str:
+    """Content hash of an eval set, so results can name the exact examples they used."""
+
+    payload = json.dumps(
+        list(examples), sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def build_dataset(
     task: str,
     n: int,
@@ -974,7 +1011,7 @@ def build_dataset(
     gen_fn = AlgorithmicGenerator._get_generators()[task]
 
     for i in range(n):
-        example_seed = hash((seed, task, i)) & 0x7FFFFFFF
+        example_seed = stable_seed(seed, task, i)
         rng = random.Random(example_seed)
         kwargs = dict(params)
         if task == "dyck":
@@ -1137,6 +1174,7 @@ def evaluate_condition(
 
     seed_all(seed)
     dataset = build_dataset(task, n, params, seed, difficulty=difficulty)
+    dataset_digest = dataset_sha256(dataset)
     use_autocast = device.type == "cuda"
 
     total_correct = 0
@@ -1371,6 +1409,7 @@ def evaluate_condition(
         format_stats=format_stats,
         numeric_length_mismatch_count=numeric_length_mismatch_count,
         numeric_length_total=numeric_length_total,
+        dataset_sha256=dataset_digest,
     )
 
 

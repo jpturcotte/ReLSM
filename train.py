@@ -68,6 +68,7 @@ from utils import (
     PROMPT_FORMAT_KEYS,
     resolve_diagnostic_modules,
     safe_parse_number,
+    stable_seed,
 )
 
 plt.switch_backend("Agg")
@@ -1408,7 +1409,7 @@ def evaluate_task_accuracy(
         if sample_count_per_task > 0:
             rng = sample_rngs.get(task)
             if rng is None:
-                rng = random.Random(hash((sample_seed, task)))
+                rng = random.Random(stable_seed(sample_seed, task))
                 sample_rngs[task] = rng
             sample_item = {
                 "prompt": prompt,

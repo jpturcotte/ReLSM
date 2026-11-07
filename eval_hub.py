@@ -142,6 +142,7 @@ def _algorithmic_results_to_dict(results: List[EvalResult]) -> Dict[str, Any]:
                 "tokens_per_sec": res.tokens_per_sec,
                 "tokens_generated": res.tokens_generated,
                 "elapsed_seconds": res.elapsed,
+                "dataset_sha256": res.dataset_sha256,
                 "examples": res.examples,
                 "sampled_examples": res.sampled_examples,
             }
