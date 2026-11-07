@@ -34,6 +34,7 @@
 | [#157](https://github.com/jpturcotte/ReLSM/issues/157) | P2 | data | DAG gating fragile: EMA snap, gates above controller band, untimed pause |
 | [#158](https://github.com/jpturcotte/ReLSM/issues/158) | P2 | data | lang_loader aliasing replays the alg stream; language PPL uses training data |
 | [#159](https://github.com/jpturcotte/ReLSM/issues/159) | P2 | data | Language pipeline prototype: head truncation, seed 42, silent source drops |
+| [#282](https://github.com/jpturcotte/ReLSM/issues/282) | P2 | data | Language streams are split by worker twice: with 4 workers most of each source never loads |
 | [#160](https://github.com/jpturcotte/ReLSM/issues/160) | P2 | eval | Eval sets differ per process: build_dataset seeds examples with salted hash() |
 | [#161](https://github.com/jpturcotte/ReLSM/issues/161) | P2 | eval | Eval JSON keeps only normalized predictions; raw outputs and token IDs are lost |
 | [#162](https://github.com/jpturcotte/ReLSM/issues/162) | P2 | eval | "IID" grid is not the training distribution; dyck OOD depth 5/6 is a no-op |
