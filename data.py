@@ -1418,6 +1418,25 @@ LANGUAGE_CONFIGS = {
 }
 
 
+class _EmptyLanguageSource:
+    """An empty stream standing in for a language source that has no data on this worker.
+
+    ``failed`` is True when the source could not be loaded and False when this worker skips
+    it on purpose. ``reason`` keeps the text, so LanguageDataset can report why it got no data.
+    """
+
+    def __init__(self, name: str, reason: str, *, failed: bool):
+        self.name = name
+        self.reason = reason
+        self.failed = failed
+
+    def __iter__(self) -> "_EmptyLanguageSource":
+        return self
+
+    def __next__(self) -> Dict[str, str]:
+        raise StopIteration
+
+
 def load_language_dataset(
     config: LanguageDataConfig,
     tokenizer,
@@ -1453,7 +1472,9 @@ def load_language_dataset(
     except Exception as e:
         if log:
             print(f"  Failed: {e}")
-        return iter(())
+        return _EmptyLanguageSource(
+            config.name, f"failed to load: {type(e).__name__}: {e}", failed=True
+        )
 
     num_shards = max(1, num_shards)
     shard_index = min(max(shard_index, 0), num_shards - 1)
@@ -1479,7 +1500,11 @@ def load_language_dataset(
                 f"  Skipping worker {requested_shard_index} "
                 f"for {config.name} (no sharding support)"
             )
-        return iter(())
+        return _EmptyLanguageSource(
+            config.name,
+            f"skipped on worker {requested_shard_index} (no sharding support)",
+            failed=False,
+        )
 
     if not shardable and config.max_samples is not None:
         effective_max_samples = config.max_samples
@@ -1555,17 +1580,64 @@ class LanguageDataset(IterableDataset):
                 streams.append((config, iter(stream)))
             return streams
 
+        worker_tag = f" (worker {worker_id} of {num_workers})" if num_workers > 1 else ""
+        warned_sources = set()
+
+        def _start_pass(streams) -> None:
+            # A pass is one build of the streams, until all of them are used up. A pass that
+            # ends without one example means every source failed or was empty. Rebuilding
+            # used to loop on that with no limit, so the check at the end of the pass stops.
+            nonlocal pass_yielded, pass_reasons, pass_all_skipped
+            pass_yielded = False
+            pass_reasons = []
+            pass_all_skipped = bool(streams) and all(
+                isinstance(s, _EmptyLanguageSource) and not s.failed for _, s in streams
+            )
+            for config, s in streams:
+                if isinstance(s, _EmptyLanguageSource) and s.failed:
+                    _warn_once(config, s.reason)
+
+        def _warn_once(config: LanguageDataConfig, reason: str) -> None:
+            key = (config.name, config.subset, config.split)
+            if key not in warned_sources:
+                warned_sources.add(key)
+                print(
+                    f"Warning: language source {config.name} {reason}{worker_tag}; "
+                    "continuing without it, so the language mix changes."
+                )
+
+        pass_yielded = False
+        pass_reasons: List[str] = []
+        pass_all_skipped = False
+
         active_streams = _build_streams()
+        _start_pass(active_streams)
         rebuild_count = 0
 
         while True:
             if not active_streams:
+                if not pass_yielded and pass_reasons:
+                    if pass_all_skipped:
+                        print(
+                            f"Language streams{worker_tag}: every source is skipped on this "
+                            "worker; stopping."
+                        )
+                        return
+                    which = "first pass" if rebuild_count == 0 else f"pass after rebuild {rebuild_count}"
+                    details = "\n".join(f"  - {r}" for r in pass_reasons)
+                    raise RuntimeError(
+                        f"LanguageDataset{worker_tag}: the {which} over the language sources "
+                        "yielded no example; stopping instead of rebuilding again. Sources:\n"
+                        f"{details}\n"
+                        "Check the network or the HF offline settings, and LANGUAGE_CONFIGS."
+                    )
                 rebuild_count += 1
                 print(
                     "Warning: language streams exhausted; rebuilding streams "
                     f"(count={rebuild_count})."
                 )
                 active_streams = _build_streams()
+                _start_pass(active_streams)
                 if not active_streams:
                     print("Warning: language stream rebuild produced no streams; stopping.")
                     return
@@ -1588,10 +1660,18 @@ class LanguageDataset(IterableDataset):
                 example = next(stream)
             except StopIteration:
                 active_streams.pop(chosen_index)
+                if isinstance(stream, _EmptyLanguageSource):
+                    pass_reasons.append(f"{config.name}: {stream.reason}")
+                else:
+                    pass_reasons.append(f"{config.name}: stream ended with no example")
                 continue
-            except Exception:
+            except Exception as exc:
                 active_streams.pop(chosen_index)
+                reason = f"raised while streaming: {type(exc).__name__}: {exc}"
+                pass_reasons.append(f"{config.name}: {reason}")
+                _warn_once(config, reason)
                 continue
+            pass_yielded = True
 
             tokens = self.tokenizer.encode(example["text"], add_special_tokens=True)
             if len(tokens) > self.max_seq_len:
