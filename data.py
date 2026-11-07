@@ -1388,6 +1388,8 @@ class LanguageDataConfig:
     text_field: str
     weight: float
     max_samples: Optional[int]
+    # Hub commit to load; None means the latest. A pin keeps the data fixed across runs.
+    revision: Optional[str] = None
 
 
 LANGUAGE_CONFIGS = {
@@ -1399,13 +1401,16 @@ LANGUAGE_CONFIGS = {
         weight=0.5,
         max_samples=500_000,
     ),
+    # Simple English Wikipedia from FineWiki (parquet, ~2025 snapshot, 265k articles). It
+    # replaces "wikipedia" 20220301.simple, a script dataset that datasets>=4.0 cannot load.
     "wikipedia": LanguageDataConfig(
-        name="wikipedia",
-        subset="20220301.simple",  # Simple English for efficiency
+        name="HuggingFaceFW/finewiki",
+        subset="simple",
         split="train",
         text_field="text",
         weight=0.3,
         max_samples=200_000,
+        revision="8bd13e72e6a002407649b3e898535f42ceb1aeb9",
     ),
     "minipile": LanguageDataConfig(
         name="JeanKaddour/minipile",
@@ -1434,6 +1439,9 @@ def load_language_dataset(
     if log:
         print(f"Loading {config.name}...")
 
+    # No trust_remote_code: datasets>=4.0 ignores it, and on older versions it would run
+    # any loading script found in a source's repo.
+    extra = {"revision": config.revision} if config.revision else {}
     try:
         if config.subset:
             ds = load_dataset(
@@ -1441,14 +1449,14 @@ def load_language_dataset(
                 config.subset,
                 split=config.split,
                 streaming=True,
-                trust_remote_code=True,
+                **extra,
             )
         else:
             ds = load_dataset(
                 config.name,
                 split=config.split,
                 streaming=True,
-                trust_remote_code=True,
+                **extra,
             )
     except Exception as e:
         if log:
@@ -1459,7 +1467,18 @@ def load_language_dataset(
     shard_index = min(max(shard_index, 0), num_shards - 1)
     requested_shard_index = shard_index
     shardable = True
-    if num_shards > 1:
+    n_files = getattr(ds, "num_shards", None)
+    if num_shards > 1 and isinstance(n_files, int) and n_files < num_shards:
+        # Fewer files than workers: datasets cannot give every worker a file (shard() raises
+        # IndexError on the ones left over), so worker 0 streams the source unsharded.
+        if log:
+            print(
+                f"  Warning: {config.name} has {n_files} file(s) for {num_shards} workers; "
+                "falling back to unsharded stream."
+            )
+        shardable = False
+        num_shards = 1
+    elif num_shards > 1:
         try:
             ds = ds.shard(num_shards=num_shards, index=shard_index, contiguous=True)
         except TypeError:
