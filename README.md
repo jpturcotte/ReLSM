@@ -86,6 +86,7 @@ Outputs are written to `--out_dir` with standardized filenames:
 
 - `results_algorithmic.json`, `results_longctx.json`, or `results_all.json` depending on the selected suite
 - Each JSON includes metadata (commit hash, seed, decoding parameters, grid version) and the relevant results payload
+- Each algorithmic condition's eval set is fixed by `--seed` and is the same in every process; its entry records `dataset_sha256`, a content hash of the examples. Before #160 was fixed, per-example seeds came from Python's salted `hash()`, so every process drew a different set: numbers from older runs were measured on different examples and are not directly comparable with newer ones.
 
 ### Training artifacts
 
