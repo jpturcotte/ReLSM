@@ -676,6 +676,30 @@ def evaluate_perplexity(model, val_loader, device, ctx, max_batches: int = 50) -
     return math.exp(min(avg_loss, 20))
 
 
+def build_train_eval_loader(
+    dataset,
+    train_eval_mode: str,
+    *,
+    batch_size: int,
+    num_workers: int,
+    collate_fn,
+) -> DataLoader:
+    """Loader for the training-split eval, in eval order (no shuffle).
+
+    The fixed set is map-style (one example per index), so it needs ordinary batching.
+    The procedural set already yields whole batches, so it takes batch_size=None.
+    """
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size if train_eval_mode == "fixed" else None,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+
+
 @torch.no_grad()
 def evaluate_training_split(
     model,
@@ -2333,12 +2357,11 @@ def train(args):
                 include_lengths=True,
             )
 
-        train_eval_loader = DataLoader(
+        train_eval_loader = build_train_eval_loader(
             base_dataset,
-            batch_size=None,
-            shuffle=False,
+            train_eval_mode,
+            batch_size=args.train_eval_batch_size,
             num_workers=args.num_workers,
-            pin_memory=True,
             collate_fn=collate_fn,
         )
 
