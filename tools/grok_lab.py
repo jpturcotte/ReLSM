@@ -22,7 +22,12 @@ model directly and uses nothing from data.py or train.py.
   Diagonals are about 2% of the unseen test pairs (ordered split, frac 0.5; about 1% under
   paired, where every test pair is unseen), but they held 13 of the 15 late test errors in the
   long stack runs (2026-11-01), so evals also log test_acc_diagonal and test_acc_unseen_offdiag
-  (unseen without the diagonals). test_acc_unseen still includes them, as before.
+  (unseen without the diagonals). test_acc_unseen still includes them, as before. On that same mask
+  evals log test_loss_unseen_offdiag (test_loss_unseen keeps the diagonals) and, for skewed tasks such
+  as gcd (metrics review 2026-11-07), per-class readouts from the same predictions: test_bal_acc_,
+  test_worst_class_recall_ with test_worst_class_ and test_worst_class_n_ (classes with >= 5 pairs),
+  test_majority_baseline_, test_kappa_ and test_pred_hist_ (predicted-class counts), all ending
+  unseen_offdiag. Training is unchanged: these read the eval's logits and draw no random numbers.
 - Model: d 128, 2 layers, 4 heads, dropout 0, head tied to the embedding (ReLSM's model and the
   owner's primary arm). --untie gives a separate head (Power 2022, Nanda 2023); --no_final_norm
   removes the final RMSNorm. The head is set here explicitly, not taken from the model defaults.
@@ -487,6 +492,36 @@ def rng_devices(device):
     return [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
 
 
+CLASS_KEYS = ("bal_acc", "worst_class_recall", "worst_class", "worst_class_n", "majority_baseline", "kappa",
+              "pred_hist")
+
+
+def class_metrics(pred, y, min_n=5):
+    """Per-class readouts of predictions pred against answers y (class indices), as in the 2026-11-07 metrics
+    review (curve_metrics.confusion_metrics): balanced accuracy (mean recall over the classes present in y),
+    the worst recall over classes with >= min_n examples (lowest class index on ties) with that class and its
+    size, the majority baseline (the share of y's most common class), Cohen's kappa (agreement against the
+    histograms of y and pred; None when every example is one class predicted as such, where it is undefined)
+    and pred's histogram as {class: count}, nonzero counts only. Counts are exact integers on the CPU; reads
+    tensors only, so it draws no random numbers."""
+    pred, y = pred.cpu(), y.cpu()
+    if len(y) == 0:
+        return dict.fromkeys(CLASS_KEYS)
+    c = int(max(pred.max(), y.max())) + 1
+    n_true, n_pred = torch.bincount(y, minlength=c).tolist(), torch.bincount(pred, minlength=c).tolist()
+    tp = torch.bincount(y[pred == y], minlength=c).tolist()
+    n = len(y)
+    recalls = [tp[k] / n_true[k] for k in range(c) if n_true[k]]
+    big = [(tp[k] / n_true[k], k, n_true[k]) for k in range(c) if n_true[k] >= min_n]
+    worst = min(big) if big else (None, None, None)
+    acc = sum(tp) / n
+    pe = sum(a * b for a, b in zip(n_true, n_pred)) / n / n
+    return {"bal_acc": sum(recalls) / len(recalls), "worst_class_recall": worst[0], "worst_class": worst[1],
+            "worst_class_n": worst[2], "majority_baseline": max(n_true) / n,
+            "kappa": (acc - pe) / (1 - pe) if pe < 1 else None,
+            "pred_hist": {str(k): v for k, v in enumerate(n_pred) if v}}
+
+
 @torch.no_grad()
 def evaluate(model, opt, data, args, model_readouts=True):
     model.eval()
@@ -519,6 +554,10 @@ def evaluate(model, opt, data, args, model_readouts=True):
             off = ~seen & ~diag & ~line  # the comparison group: random unseen pairs, no held-out family
             out["test_acc_diagonal"] = correct[diag].float().mean().item() if diag.any() else None
             out["test_acc_unseen_offdiag"] = correct[off].float().mean().item() if off.any() else None
+            # on exactly the accuracy's mask (test_loss_unseen above keeps the diagonals and any held-out line)
+            out["test_loss_unseen_offdiag"] = F.cross_entropy(z[off].double(), y[off]).item() if off.any() else None
+            cm = class_metrics(z[off].argmax(1), y[off])  # the same argmax as correct: no extra forward pass
+            out.update({f"test_{k}_unseen_offdiag": v for k, v in cm.items()})
             m = margins(z.double(), y)  # per group: a continuous readout, where accuracy counts a few pairs
             for g, mask in (("diagonal", diag), ("unseen_offdiag", off), ("seen", seen)):
                 out[f"test_margin_mean_{g}"] = m[mask].mean().item() if mask.any() else None
@@ -891,7 +930,8 @@ def evaluate_tasks(model, opt, views, args):
     n = lambda key: [v.record[key] for v in views]  # noqa: E731
     pooled = {"train_loss": "n_train", "train_acc": "n_train", "test_loss": "n_test", "test_acc": "n_test",
               "test_acc_unseen": "n_test_unseen", "test_loss_unseen": "n_test_unseen",
-              "test_acc_diagonal": "n_test_diagonal", "test_acc_unseen_offdiag": "n_test_unseen_offdiag"}
+              "test_acc_diagonal": "n_test_diagonal", "test_acc_unseen_offdiag": "n_test_unseen_offdiag",
+              "test_loss_unseen_offdiag": "n_test_unseen_offdiag"}  # the class metrics are per task only
     for key, count in pooled.items():
         out[key] = _wmean(zip([r[key] for r in per], n(count)))
     out.update(model_stats(model, opt, args))

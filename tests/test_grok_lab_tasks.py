@@ -44,7 +44,7 @@ def test_tasks_add_is_the_single_task_run(tmp_path, extra):
     w2 = torch.load(tmp_path / "multi" / "final.pt")["model"]
     assert w1.keys() == w2.keys() and all(torch.equal(w1[k], w2[k]) for k in w1)
     pooled = {"train_loss", "train_acc", "test_loss", "test_acc", "test_acc_unseen", "test_loss_unseen",
-              "test_acc_diagonal", "test_acc_unseen_offdiag"}
+              "test_acc_diagonal", "test_acc_unseen_offdiag", "test_loss_unseen_offdiag"}
     for s, m in zip(lines(tmp_path / "single"), lines(tmp_path / "multi")):
         for k, v in s.items():
             if k in ("train_s", "elapsed_s"):
@@ -404,3 +404,55 @@ def test_schedule_with_no_active_task_refuses_to_start(tmp_path):
     with pytest.raises(ValueError, match="no task is active"):
         gl.run(args_for(tmp_path, "--p", "23", "--tasks", "add,sub", "--task_start", "sub=20", "--task_stop", "add=10",
                         *SHORT))
+
+
+@pytest.mark.parametrize("tasks,extra", [("add,gcd", ["--diagonals", "train"]), ("add,mul", [])])
+def test_class_metrics_logged_per_task_match_final_errors(tmp_path, tasks, extra):
+    """The per-eval class readouts at the last eval, rebuilt from final_errors.json the way the 2026-11-07
+    metrics review rebuilt them (curve_metrics.confusion_metrics), plus the pooled off-diagonal loss. gcd needs
+    its diagonals in train; add,mul keeps test diagonals, so the diagonal exclusion is exercised too."""
+    p = 23
+    common = ["--p", str(p), "--tasks", tasks, *extra, *SHORT]
+    gl.run(args_for(tmp_path, *common))
+    rows, rec = lines(tmp_path), json.loads((tmp_path / "run_record.json").read_text())
+    names = tasks.split(",")
+    evals = [r for r in rows if f"test_acc@{names[-1]}" in r]
+    keys = [f"test_{k}_unseen_offdiag" for k in gl.CLASS_KEYS] + ["test_loss_unseen_offdiag"]
+    assert len(evals) == 4 and all(f"{k}@{t}" in r for r in evals for k in keys for t in names)
+    assert all("test_loss_unseen_offdiag" in r for r in evals)  # pooled
+    if not extra:  # test diagonals present: the off-diagonal set is a strict subset of unseen
+        assert rec["n_test_unseen_offdiag"] < rec["n_test_unseen"]
+    last = evals[-1]
+    err = json.loads((tmp_path / "final_errors.json").read_text())
+    c = {k: err["columns"].index(k) for k in ("a", "b", "answer", "pred", "transpose_seen", "task")}
+    _, views, _ = gl.setup_tasks(args_for(tmp_path / "x", *common), torch.device("cpu"))
+    for v in views:
+        name, commutative = v.name, gl.TASK_SPECS[v.name].commutative
+        xa, xb = gl.operands_of(v.data["test_x"], v.args)
+        off = ~v.data["test_seen"] & (xa != xb)
+        assert v.record["n_test_unseen_offdiag"] == int(off.sum())
+        y = v.data["test_y"][off].tolist()
+        n_true = {k: y.count(k) for k in set(y)}
+        wrong = [r for r in err["test"] if r[c["task"]] == name and r[c["a"]] != r[c["b"]] and not r[c["transpose_seen"]]]
+        tp = dict(n_true)
+        n_pred = dict(n_true)
+        for r in wrong:
+            tp[r[c["answer"]]] -= 1
+            n_pred[r[c["answer"]]] -= 1
+            n_pred[r[c["pred"]]] = n_pred.get(r[c["pred"]], 0) + 1
+        n = len(y)
+        bal = sum(tp[k] / n_true[k] for k in n_true) / len(n_true)
+        acc = sum(tp.values()) / n
+        pe = sum(n_true[k] * n_pred.get(k, 0) for k in n_true) / n / n
+        assert last[f"test_bal_acc_unseen_offdiag@{name}"] == pytest.approx(bal, rel=1e-12)
+        assert last[f"test_acc_unseen_offdiag@{name}"] == pytest.approx(acc, abs=1e-6)
+        assert last[f"test_kappa_unseen_offdiag@{name}"] == pytest.approx((acc - pe) / (1 - pe), rel=1e-12)
+        assert last[f"test_majority_baseline_unseen_offdiag@{name}"] == pytest.approx(max(n_true.values()) / n)
+        assert last[f"test_pred_hist_unseen_offdiag@{name}"] == {str(k): v for k, v in sorted(n_pred.items()) if v}
+        big = sorted((tp[k] / n_true[k], k, n_true[k]) for k in n_true if n_true[k] >= 5)
+        got = tuple(last[f"test_{k}_unseen_offdiag@{name}"] for k in ("worst_class_recall", "worst_class", "worst_class_n"))
+        assert got == (tuple(big[0]) if big else (None, None, None))
+    pooled = sum(last[f"test_loss_unseen_offdiag@{t['task']}"] * t["n_test_unseen_offdiag"] for t in rec["tasks"])
+    assert last["test_loss_unseen_offdiag"] == pytest.approx(pooled / rec["n_test_unseen_offdiag"], rel=1e-12)
+    if "gcd" in names:
+        assert last["test_majority_baseline_unseen_offdiag@gcd"] > 0.2  # skewed, as in the review
