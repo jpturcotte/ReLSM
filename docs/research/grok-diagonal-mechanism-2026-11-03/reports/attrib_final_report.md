@@ -1,5 +1,20 @@
 # Route attribution (H10): final report, 2026-11-03
 
+> **Corrections (2026-11-03 consolidation):** the study-status table (exposure, layer-1 attention, size) and the "wrong content at layer 0" interpretation overstate. Marked below. Source: `grok_runs\consolidation_2026-11-03\CONSOLIDATED_REPORT.md`.
+
+> **Scope (added 2026-11-03):** these route shares were measured on models trained at lr 6e-4 (the E-series base), at 25k updates. At lr 1e-3 the mix is different. These are long-stack runs that differ from the 6e-4 control models only in lr, scored at 1e5 updates:
+> - **The operand route carries 103–131 % of the diagonal deficit, and the '=' route is negative (−3 to −31 %),** in 3/3 seeds. The registered prediction (K2b) is falsified; Codex agreed blind.
+> - **In 2 of those 3 seeds, the layer-1 MLP had decayed to zero.** lr and lr × wd are confounded in this comparison.
+> - **Even at 6e-4, by 1e5 updates** the '=' share is 48–70 %.
+> - **The routes cancel heavily from pair to pair,** so these shares are path averages, not a fixed circuit.
+> - **The lr difference doesn't depend on the method** (per-pair replay, RESULTS.md R; Codex agreed blind). An exact Shapley split, which uses no path, gives '=' shares of −82 % to −134 % at 1e-3 against 39–61 % at 6e-4. So '=' takes much more at 6e-4, but under Shapley it isn't the majority in 2/3 seeds.
+>   - The point shares do depend on the method: about 10 points at 6e-4, and 50–117 at 1e-3.
+>   - Per-pair signs often disagree between IG and Shapley.
+>   - At 6e-4, 2–8 % of pairs need more than 32 integration nodes; the means are unaffected.
+>   - The attribution has no gradient bug.
+>
+> Details: `grok_runs\checks_2026-11-03\RESULTS.md`, K2.
+
 **Bottom line.**
 - **The diagonal deficit splits between two routes into layer 1.** About two thirds goes through the '=' stream after layer 0 (60–85 % in 8 of 9 runs). About one third goes through layer 1's reads of the operand positions. The op position carries none.
 - **This is mixed by the registration:** 7 runs "unresolved", 2 "'=' account". The registered categories had no label for a stable two-route split, which is what 7 runs show.
@@ -42,6 +57,11 @@
 | Can it be localized by swapping parts? | no, the parts are tightly coupled (H9) |
 
 **Interpretation (inferred):** what (a, a) writes into '=' at layer 0 is the wrong content for the answer, not the wrong size, and the operand positions add a smaller share.
+
+> **Correction (2026-11-03 consolidation):**
+> - **Table:** exposure explains most of the gap at update 100 and 32–44 % at 200, fading by about 500 with a 5–15 % residual (CPU fp32 reruns, which act as new seeds). Layer-1 attention is registered MIXED: no diagonal-specific effect at final weights, not "not the limiter". Size (H8) is a minor factor at final weights, not "no".
+> - **Interpretation (inferred, path-averaged):** averaged along one integration path, about 2/3 of the deficit flows through the '=' state after layer 0. That state includes the layer-1 query and the '=' self K/V, so "layer-0 content" is not localized. It is not a per-pair mechanism, and "not the wrong size" overstates H8. Finer attribution is the test that would localize it.
+> - All 9 shared-token models are at lr 6e-4, `repo`, dropout 0.1.
 
 ## Next options (your call)
 1. **Finer attribution (Codex), no training, about a minute of GPU.** Split the '=' route into residual / query / self K-V, and the operand route into K / V. This tells "layer 1 reads the diagonal wrongly" apart from "layer 0 carries the wrong content".
