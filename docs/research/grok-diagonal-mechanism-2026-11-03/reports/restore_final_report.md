@@ -62,7 +62,7 @@ Both analyses agree on all three.
 ## What it means
 
 **Where both analyses agree:**
-1. **More operand attention gives a small, general gain** when the norm is held fixed (≤ 0.39, closing at most 7.8 % of a gap), about the same for diagonal and off-diagonal pairs. So diagonals' lower operand mass is not what costs them margin.
+1. **More operand attention gives a small, general gain** when the norm is held fixed (≤ 0.39 nats; the diagonal change alone closes at most 7.8 % of a gap, and net of the matched off-diagonal change −6.1 % to +0.4 %; corrected 2026-11-08, misread audit), about the same for diagonal and off-diagonal pairs. So diagonals' lower operand mass is not what costs them margin.
 
    > **Correction (2026-11-03 consolidation):** the supported reading is narrower: at final weights, raising operand mass gives no diagonal-specific gain (registered MIXED). That does not rule out a role for operand mass during training.
 2. **With the norm free, more operand attention hurts, and hurts diagonals more.** The extra content raises the residual norm, and the final RMSNorm shrinks every logit. That explains the first test's odd "more attention, worse diagonal" result, largely but not entirely: in control s0, the group-mean swap hurts even at fixed norm (−0.59).

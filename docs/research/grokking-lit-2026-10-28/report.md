@@ -25,7 +25,7 @@ What could change this answer: a seed-matched run showing that ReLSM's d = 128 s
 > **Correction (2026-11-03 consolidation):** the first of these runs exists. In the harness walk C1 (2026-10-29/30), the `--wd_scope repo` arm exempts the embedding, the tied head and the norm gains from decay. It grokked in 3/3 seeds, seed-matched (same init and split) with the decay-all arm, with the same final and late unseen accuracy. Its first crossing of unseen accuracy 0.99 came at 800/1,000/1,100 updates against 800/600/700. Setup: 2 layers, d 128, tied, p = 97, fraction 0.5, lr 1e-3, full batch, fp32, 1e4 updates. So recommendation 1's "decay must reach the embedding", rated high confidence, is contradicted as a requirement for first-crossing grokking there. The exemption still matters:
 > - it roughly doubles the logit scale (final-norm gain 16.9–19.1 vs 7.2–7.9);
 > - it put 18 % of train examples at zero target gradient in pure fp32 (one seed), where the decay-all arms stayed at 0;
-> - it makes the diagonal (a, a) margin deficit 2.0–5.2× larger (3/3 seeds).
+> - it makes the diagonal (a, a) margin deficit 2.0–5.2× larger in nats (3/3 seeds); as a share of the off-diagonal margin there is no consistent direction (0.53 / 1.10 / 1.93; corrected 2026-11-08, misread audit).
 >
 > And because `repo` also exempts the norm gains, C1 doesn't isolate the table. The live argument for decaying the table in the real model is now dead-row drift at the 32k vocabulary: in the DAG-v12 checkpoint, 31,879 rows share one direction and hold 98.7 % of the table's squared norm. Their drift over training and any harm are untested. Decay-all stays a reasonable recipe-parity choice, not a requirement. The Barron half of this sentence is unchanged.
 
