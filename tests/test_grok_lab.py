@@ -225,7 +225,9 @@ def test_ce_rounded_fp16_and_autocast(tmp_path):
 
 
 @pytest.mark.parametrize("extra", [["--bf16", "autocast"], ["--loss", "ce_rounded"],
-                                   ["--bf16", "autocast", "--loss", "ce_rounded"], ["--batch", "64", "--clip", "1"]])
+                                   ["--bf16", "autocast", "--loss", "ce_rounded"], ["--batch", "64", "--clip", "1"],
+                                   ["--lr", "6e-4", "--lr_schedule", "wsd", "--warmup", "2", "--dropout", "0.1",
+                                    "--bf16", "autocast"]])
 def test_train_py_like_flags_run(tmp_path, extra):
     last = gl.run(args_for(tmp_path, "--p", "23", "--updates", "20", "--eval_every", "10", "--ckpt_every", "0", *extra))
     assert last["update"] == 20 and math.isfinite(last["train_loss"])
@@ -239,6 +241,139 @@ def test_summary_reads_the_trace_not_the_last_line():
     assert s["first_update_unseen_ge_0.99"] == 200
     assert s["frac_last10pct_evals_unseen_ge_0.99"] == pytest.approx(1 / 2)
     assert gl.summarize([(100, None)], 1000)["first_update_unseen_ge_0.99"] is None
+
+
+def test_wsd_matches_train_py_get_lr(tmp_path):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from train import get_lr
+    updates, warmup = 1000, 10
+    a = args_for(tmp_path, "--lr", "6e-4", "--lr_schedule", "wsd", "--updates", str(updates), "--warmup", str(warmup))
+    assert a.min_lr == 1.5e-4
+    for u in list(range(0, 30)) + list(range(390, 420)) + list(range(980, 1000)) + [500, 700]:
+        ours = gl.lr_at(u, a)
+        if u >= warmup:  # warmup differs by one step: PR 2's harness reaches max LR at u = warmup - 1
+            assert ours == pytest.approx(get_lr(u, warmup, updates, 6e-4, 1.5e-4, "wsd"), rel=1e-12, abs=1e-15), u
+    assert gl.lr_at(399, a) == 6e-4 and gl.lr_at(400, a) == 6e-4  # decay starts at 40%
+    assert gl.lr_at(401, a) < 6e-4
+    assert gl.lr_at(999, a) == pytest.approx(1.5e-4 + 4.5e-4 / 600)  # one step short of min_lr at the last update
+    assert gl.lr_at(0, a) == pytest.approx(6e-5)
+
+
+def test_constant_schedule_is_unchanged(tmp_path):
+    a = args_for(tmp_path, "--lr", "1e-3", "--warmup", "10")
+    for u in range(0, 200):  # bit-identical to PR 2's inline formula, so C1 runs stay comparable
+        assert gl.lr_at(u, a) == 1e-3 * min(1.0, (u + 1) / 10)
+    assert gl.lr_at(5, args_for(tmp_path, "--warmup", "0")) == 1e-3
+    with pytest.raises(SystemExit):
+        args_for(tmp_path, "--min_lr", "1e-4")  # without --lr_schedule wsd
+    with pytest.raises(SystemExit):
+        args_for(tmp_path, "--lr_schedule", "wsd", "--lr", "1e-4")  # below the default min_lr: would decay upward
+    with pytest.raises(SystemExit):
+        args_for(tmp_path, "--lr_schedule", "wsd", "--updates", "100", "--warmup", "40")  # #173's jump
+    assert args_for(tmp_path, "--lr_schedule", "wsd", "--min_lr", "0").min_lr == 0.0
+
+
+def test_trainmode_readout_uses_dropout_and_keeps_the_rng_stream(tmp_path):
+    p = 23
+    train, test, seen = gl.make_split(p, 0.5, 0)
+    (xtr, ytr), (xte, yte) = gl.encode(train, p), gl.encode(test, p)
+    data = dict(train_x=xtr, train_y=ytr, test_x=xte, test_y=yte, test_seen=seen)
+    for dropout in ("0", "0.3"):
+        a = args_for(tmp_path, "--p", str(p), "--dropout", dropout)
+        torch.manual_seed(0)
+        model = gl.build_model(a)
+        opt = gl.build_optimizer(model, a)
+        state = torch.get_rng_state()
+        out = gl.evaluate(model, opt, data, a)
+        assert torch.equal(torch.get_rng_state(), state)  # the readout draws no numbers from the run's stream
+        assert not model.training
+        if dropout == "0":
+            assert all(out[k + "_trainmode"] is None for k in gl.MARGIN_KEYS)
+        else:
+            assert out["margin_mean_trainmode"] != out["margin_mean"]  # dropout was on
+            assert all(math.isfinite(out[k + "_trainmode"]) for k in gl.MARGIN_KEYS)
+            out2 = gl.evaluate(model, opt, data, a)
+            assert out2["margin_mean"] == out["margin_mean"]  # eval mode is deterministic
+            # the masks come from a copy of the run's RNG state: same state, same masks (training moves it on)
+            assert out2["margin_mean_trainmode"] == out["margin_mean_trainmode"]
+
+
+def test_dropout_run_matches_with_and_without_the_readout(tmp_path, monkeypatch):
+    """The train-mode pass must not change training: same seed, readout on and off, same weights.
+    A control run with the RNG fork removed must differ, or the test could not fail."""
+    import argparse
+    import contextlib
+    real_eval, real_fork = gl.evaluate, torch.random.fork_rng
+
+    def no_readout(model, opt, data, args):
+        return real_eval(model, opt, data, argparse.Namespace(**{**vars(args), "dropout": 0.0}))
+
+    finals = {}
+    for arm in ("readout", "no_readout", "unforked"):
+        monkeypatch.setattr(gl, "evaluate", no_readout if arm == "no_readout" else real_eval)
+        monkeypatch.setattr(torch.random, "fork_rng",
+                            (lambda **k: contextlib.nullcontext()) if arm == "unforked" else real_fork)
+        out = tmp_path / arm
+        gl.run(args_for(out, "--p", "23", "--updates", "30", "--eval_every", "10", "--ckpt_every", "0", "--dropout", "0.2"))
+        finals[arm] = torch.load(out / "final.pt")["model"]
+        line = json.loads((out / "metrics.jsonl").read_text().splitlines()[-1])
+        assert (line["margin_mean_trainmode"] is None) == (arm == "no_readout")
+    same = lambda x, y: all(torch.equal(finals[x][k], finals[y][k]) for k in finals[x])  # noqa: E731
+    assert same("readout", "no_readout")
+    assert not same("readout", "unforked")
+
+
+def test_final_errors_lists_exactly_the_wrong_pairs(tmp_path):
+    last = gl.run(args_for(tmp_path, "--p", "23", "--updates", "20", "--eval_every", "10", "--ckpt_every", "0"))
+    err = json.loads((tmp_path / "final_errors.json").read_text())
+    rec = json.loads((tmp_path / "run_record.json").read_text())
+    assert err["update"] == 20 and err["columns"] == gl.WRONG_COLUMNS
+    n_test, n_train = rec["n_test"], rec["n_train"]
+    assert len(err["test"]) == round((1 - last["test_acc"]) * n_test) > 0  # 20 updates: far from grokked
+    assert len(err["train"]) == round((1 - last["train_acc"]) * n_train)
+    assert rec["n_wrong_final"]["test_unseen"] == round((1 - last["test_acc_unseen"]) * rec["n_test_unseen"])
+    assert rec["n_wrong_final"]["test"] == len(err["test"]) and rec["n_wrong_final"]["train"] == len(err["train"])
+    model = gl.build_model(gl.parse_args(["--out", str(tmp_path), "--p", "23"]))
+    model.load_state_dict(torch.load(tmp_path / "final.pt")["model"])
+    model.eval()
+    rows = torch.tensor([[a, b] for a, b, *_ in err["test"]])
+    x, y = gl.encode(rows[:, 0] * 23 + rows[:, 1], 23)
+    with torch.no_grad():
+        m = gl.margins(model(x)[0][:, -1, :].double(), y)
+    assert m.tolist() == pytest.approx([r[5] for r in err["test"]], abs=1e-4)  # the margin column is margins()
+    train_ids = set(gl.make_split(23, 0.5, 0)[0].tolist())
+    for a, b, t, q, s, m in err["test"]:
+        assert t == (a + b) % 23 and q != t and m <= 0  # a wrong answer has a non-positive margin
+        assert a * 23 + b not in train_ids and s == (b * 23 + a in train_ids)
+    assert all(r[4] is None and r[0] * 23 + r[1] in train_ids for r in err["train"])
+
+
+def test_diagonal_and_offdiag_unseen_accuracy(tmp_path):
+    p = 23
+    last = gl.run(args_for(tmp_path, "--p", str(p), "--updates", "20", "--eval_every", "10", "--ckpt_every", "0"))
+    rec = json.loads((tmp_path / "run_record.json").read_text())
+    err = json.loads((tmp_path / "final_errors.json").read_text())
+    train, test, seen = gl.make_split(p, 0.5, 0)
+    a, b = test // p, test % p
+    diag, off = a == b, ~seen & (a != b)
+    assert rec["n_test_diagonal"] == int(diag.sum()) > 0 and rec["n_test_unseen_offdiag"] == int(off.sum()) > 0
+    assert not (seen & diag).any()  # a diagonal is never transpose-seen, so unseen = diagonals + off-diagonal
+    assert rec["n_test_unseen"] == rec["n_test_diagonal"] + rec["n_test_unseen_offdiag"]
+    wrong = {(r[0], r[1]) for r in err["test"]}
+    ids = list(zip(a.tolist(), b.tolist()))
+    acc = lambda mask: 1 - sum(ids[i] in wrong for i in mask.nonzero().squeeze(1).tolist()) / int(mask.sum())  # noqa: E731
+    assert last["test_acc_diagonal"] == pytest.approx(acc(diag), abs=1e-6)
+    assert last["test_acc_unseen_offdiag"] == pytest.approx(acc(off), abs=1e-6)
+    # the two parts recombine into the unseen accuracy
+    parts = last["test_acc_diagonal"] * diag.sum().item() + last["test_acc_unseen_offdiag"] * off.sum().item()
+    assert parts / rec["n_test_unseen"] == pytest.approx(last["test_acc_unseen"], abs=1e-6)
+    assert rec["n_wrong_final"]["test_diagonal"] == sum(ids[i] in wrong for i in diag.nonzero().squeeze(1).tolist())
+    paired = gl.run(args_for(tmp_path / "paired", "--p", str(p), "--pairs", "paired", "--updates", "10",
+                             "--eval_every", "10", "--ckpt_every", "0"))
+    assert paired["test_acc_unseen_offdiag"] is not None  # paired: every test pair is unseen
+    prec = json.loads((tmp_path / "paired" / "run_record.json").read_text())
+    assert prec["n_test_transpose_seen"] == 0
+    assert prec["n_test_unseen_offdiag"] == prec["n_test"] - prec["n_test_diagonal"]
 
 
 # T6 ---------------------------------------------------------------------------------------
