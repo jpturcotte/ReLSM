@@ -549,3 +549,76 @@ def test_t6_same_seed_same_metrics(tmp_path):
     assert rec["threads"] == 1 and rec["examples_per_update"] == rec["n_train"] and rec["updates"] == 30
     assert rec["commit"] is None or len(rec["commit"]) == 40
     assert (tmp_path / "0" / "ckpt_000020.pt").exists() and (tmp_path / "0" / "final.pt").exists()
+
+
+# Per-class readouts and the off-diagonal loss (metrics review 2026-11-07, do-now items 2 and 3) ------------
+
+def test_balanced_accuracy_is_plain_accuracy_on_balanced_classes():
+    g = torch.Generator().manual_seed(0)
+    y = torch.arange(5).repeat_interleave(8)  # 5 classes, 8 each
+    pred = torch.where(torch.rand(40, generator=g) < 0.6, y, torch.randint(0, 7, (40,), generator=g))
+    cm = gl.class_metrics(pred, y)
+    assert 0 < (pred == y).float().mean().item() < 1
+    assert cm["bal_acc"] == pytest.approx((pred == y).double().mean().item(), rel=1e-12)
+    assert cm["majority_baseline"] == pytest.approx(0.2)
+    assert sum(cm["pred_hist"].values()) == 40 and all(v > 0 for v in cm["pred_hist"].values())
+
+
+def test_class_metrics_on_skewed_classes_by_hand():
+    # class 0: 6 pairs, 6 right; class 1: 5 pairs, 2 right (3 predicted as 0); class 2: 1 pair, wrong (as 3)
+    y = torch.tensor([0] * 6 + [1] * 5 + [2])
+    pred = torch.tensor([0] * 6 + [1, 1, 0, 0, 0] + [3])
+    cm = gl.class_metrics(pred, y)
+    assert cm["bal_acc"] == pytest.approx((1 + 2 / 5 + 0) / 3)  # plain accuracy is 8 / 12
+    assert (cm["worst_class_recall"], cm["worst_class"], cm["worst_class_n"]) == (pytest.approx(0.4), 1, 5)
+    assert cm["majority_baseline"] == pytest.approx(6 / 12)
+    assert cm["pred_hist"] == {"0": 9, "1": 2, "3": 1}
+    pe = (6 * 9 + 5 * 2) / 144  # true x predicted histograms; class 3 is never a true class
+    assert cm["kappa"] == pytest.approx((8 / 12 - pe) / (1 - pe))
+    assert gl.class_metrics(pred[:3], y[:3])["worst_class"] is None  # no class reaches 5 pairs
+    assert gl.class_metrics(pred[:0], y[:0]) == dict.fromkeys(gl.CLASS_KEYS)
+
+
+def test_worst_class_ties_go_to_the_lowest_class():
+    y = torch.tensor([0] * 6 + [1] * 5 + [2] * 5 + [3] * 4)  # class 3 has under 5 pairs: never the worst class
+    pred = torch.tensor([0] * 6 + [1, 1, 1, 0, 0] + [2, 2, 2, 0, 0] + [0] * 4)
+    cm = gl.class_metrics(pred, y)
+    assert (cm["worst_class_recall"], cm["worst_class"], cm["worst_class_n"]) == (pytest.approx(0.6), 1, 5)
+
+
+@pytest.mark.parametrize("const", [0, 1, 4])  # the majority class, a minority class, a class never true
+def test_kappa_is_zero_for_a_constant_predictor(const):
+    y = torch.tensor([0] * 7 + [1] * 3 + [2] * 2)
+    cm = gl.class_metrics(torch.full_like(y, const), y)
+    assert cm["kappa"] == pytest.approx(0.0, abs=1e-15)
+    assert cm["pred_hist"] == {str(const): 12}
+    assert gl.class_metrics(torch.zeros(4, dtype=torch.long), torch.zeros(4, dtype=torch.long))["kappa"] is None
+
+
+def test_offdiag_loss_uses_the_accuracy_mask(tmp_path, monkeypatch):
+    p = 7
+    args = args_for(tmp_path, "--p", str(p))
+    train, test, seen = gl.make_split(p, 0.5, 0)
+    (xtr, ytr), (xte, yte) = gl.encode(train, p), gl.encode(test, p)
+    data = dict(train_x=xtr, train_y=ytr, test_x=xte, test_y=yte, test_seen=seen)
+    diag = (test // p) == (test % p)
+    off = ~seen & ~diag
+
+    def planted(model, x, a):  # right with margin 4 off the diagonal; diagonals flat (uniform)
+        y = ytr if x is xtr else yte
+        z = torch.zeros(len(x), p + 2)
+        z[torch.arange(len(x)), y] = 4.0
+        if x is xte:
+            z[diag] = 0.0
+        return z
+
+    monkeypatch.setattr(gl, "answer_logits", planted)
+    out = gl.evaluate(torch.nn.Identity(), None, data, args, model_readouts=False)
+    z = planted(None, xte, args).double()
+    want = torch.nn.functional.cross_entropy(z[off], yte[off]).item()
+    assert diag.any() and out["test_loss_unseen_offdiag"] == pytest.approx(want, rel=1e-12)
+    assert out["test_loss_unseen"] == pytest.approx(
+        torch.nn.functional.cross_entropy(z[~seen], yte[~seen]).item(), rel=1e-12)
+    assert out["test_loss_unseen"] > out["test_loss_unseen_offdiag"] + 0.1  # the flat diagonals lift only the old key
+    assert out["test_bal_acc_unseen_offdiag"] == 1.0 and out["test_kappa_unseen_offdiag"] == pytest.approx(1.0)
+    assert sum(out["test_pred_hist_unseen_offdiag"].values()) == int(off.sum())
