@@ -14,7 +14,7 @@ Where this report and `analysis.md` disagree, this report has the checked value.
 ## The answer in brief
 
 - **The earlier research still stands as logging advice.** Keep held-out loss and margin next to accuracy, the transpose-seen and diagonal splits, no early stopping, and weight norm as a description, never a trigger.
-- **Its decision rules need replacing.** The 0.99 first-crossing rule measures "generalised by the horizon", not grokking. It never checks that generalisation came after memorisation. 19 of the 33 runs it scores "groks" show no sign of a memorisation phase.
+- **Its decision rules need replacing.** The 0.99 first-crossing rule measures "generalised by the horizon", not grokking. It never checks that generalisation came after memorisation. 19 of the 33 runs it scores "groks" show no sign of a memorisation phase by the halfway test; 8 of those 19 still take at least 2× Tmem to reach 0.99 (corrected 2026-11-08, misread audit).
 - **Better metrics exist and are cheap:**
   - a threshold-free curve summary: late level, trend, timing, width and delay;
   - balanced accuracy for skewed tasks;
@@ -76,7 +76,7 @@ All accuracy numbers are held-out, unseen, off-diagonal, from one eval every 100
 
 ### 4.1 Most of the "groks" are not grokking
 
-- **19 of the 33 runs that the 0.99 rule scores "groks" show no memorisation phase.** The 33 are phase 1 plus the reused add runs. Examples: D_add, D_sub, D_add2b, TA_div, TA_sub and TA_sq.
+- **19 of the 33 runs that the 0.99 rule scores "groks" show no memorisation phase** by the halfway test (held-out accuracy at half its final level within 2× Tmem). 8 of the 19 still take at least 2× Tmem to reach 0.99 (TA_sq 8.5–10.5×, D_add 2.25–4×), so on a 0.99 delay it is about 11 of 33 (corrected 2026-11-08, misread audit). The 33 are phase 1 plus the reused add runs. Examples: D_add, D_sub, D_add2b, TA_div, TA_sub and TA_sq.
 - **The evidence is the loss hump.** Peak held-out loss over the starting loss is 1.00 in 13 of the 19, and 1.04–1.08 in TA_div and TA_sub.
 - **The delay ratio can't carry it on its own.** In 11 of the 19, training accuracy reaches 0.99 within 500 updates, so the ratio is censored. That loss also includes the diagonals.
 - **D_mul is the clearest delayed-generalisation run.** It is still rising at 25k.
@@ -106,6 +106,8 @@ For gcd, the plain and balanced metrics disagree:
 | Plain accuracy, final eval | | | D ahead, 2 of 3 (s1: TA 0.9800, D 0.9776) |
 | Plain accuracy, late median | | | D ahead, 3 of 3 |
 | Kappa | 0.96–0.975 | 0.96–0.975 | hides the gap |
+
+The balanced-accuracy gap (0.09 / 0.19 / 0.15) comes almost entirely from classes with 12 or fewer held-out examples (100–128 of about 4,560 per seed); the larger classes contribute 0.000–0.020. D makes fewer total errors than TA in s0 and s2. So "TA ahead 3 of 3" stands, but the cost of digits here is about 20 rare-gcd examples, and one example in a 2-example class moves balanced accuracy by about 0.013: report class sizes with it (corrected 2026-11-08, misread audit).
 
 - **Wrong examples are confidently wrong.** Their median margins are −2.9 to −6.2 nats, with 10th percentiles from −8 to −18.
 - **Near chance, kappa is the useful one.** It separates TA_cubeab (0.046–0.079) from D_cubeab (0.003–0.006).

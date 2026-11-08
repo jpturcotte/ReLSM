@@ -3,7 +3,7 @@
 > **Corrections (2026-11-03 consolidation):** the study-status table (exposure, layer-1 attention, size) and the "wrong content at layer 0" interpretation overstate. Marked below. Source: `grok_runs\consolidation_2026-11-03\CONSOLIDATED_REPORT.md`.
 
 > **Scope (added 2026-11-03):** these route shares were measured on models trained at lr 6e-4 (the E-series base), at 25k updates. At lr 1e-3 the mix is different. These are long-stack runs that differ from the 6e-4 control models only in lr, scored at 1e5 updates:
-> - **The operand route carries 103–131 % of the diagonal deficit, and the '=' route is negative (−3 to −31 %),** in 3/3 seeds. The registered prediction (K2b) is falsified; Codex agreed blind.
+> - **The operand route carries 103–131 % of the diagonal deficit, and the '=' route is negative (−3 to −31 %),** in 3/3 seeds, under path choice A. Under choice B the ranges are 116–174 % and −16 to −74 %, and s1 is rated coupled; both falsifiers fire 3/3 under either (corrected 2026-11-08, misread audit). The registered prediction (K2b) is falsified; Codex agreed blind.
 > - **In 2 of those 3 seeds, the layer-1 MLP had decayed to zero.** lr and lr × wd are confounded in this comparison.
 > - **Even at 6e-4, by 1e5 updates** the '=' share is 48–70 %.
 > - **The routes cancel heavily from pair to pair,** so these shares are path averages, not a fixed circuit.
