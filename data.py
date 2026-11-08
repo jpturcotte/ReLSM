@@ -21,7 +21,7 @@ Also includes:
 import random
 import math
 from functools import partial
-from typing import List, Dict, Optional, Tuple, Iterator, Callable, Iterable, Union, Sequence
+from typing import Any, List, Dict, Optional, Tuple, Iterator, Callable, Iterable, Union, Sequence
 from dataclasses import dataclass
 import torch
 from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
@@ -273,6 +273,15 @@ def get_task_weight(task: str, progress: float) -> float:
     return base
 
 
+# mod_add's prompt templates, in the order rng.choice picks from (shared with ModTableDataset)
+MOD_ADD_TEMPLATES = (
+    "Compute ({a} + {b}) mod {mod}. Answer:",
+    "What is ({a} + {b}) modulo {mod}? Answer:",
+    "Add {a} and {b}, then take mod {mod}. Answer:",
+    "({a} plus {b}) % {mod} equals. Answer:",
+)
+
+
 class AlgorithmicGenerator:
     """
     Generates synthetic algorithmic tasks for grokking.
@@ -367,12 +376,7 @@ class AlgorithmicGenerator:
 
         prompt = AlgorithmicGenerator._choose_prompt(
             rng,
-            [
-                "Compute ({a} + {b}) mod {mod}. Answer:",
-                "What is ({a} + {b}) modulo {mod}? Answer:",
-                "Add {a} and {b}, then take mod {mod}. Answer:",
-                "({a} plus {b}) % {mod} equals. Answer:",
-            ],
+            list(MOD_ADD_TEMPLATES),
             a=a,
             b=b,
             mod=mod_val,
@@ -1272,35 +1276,40 @@ class FixedAlgorithmicDataset(Dataset):
                 difficulty_schedule=self.difficulty_schedule,
                 task_weighting=self.task_weighting,
             )
-            prompt_tokens = self._encode_text(example["input"])
-            prompt_len = len(prompt_tokens)
-            tokens = self._encode_text(example["text"])
-            if self.tokenizer.eos_token_id is not None:
-                tokens.append(self.tokenizer.eos_token_id)
+            self.examples.append(self._encode_example(example))
 
-            if len(tokens) > self.max_seq_len:
-                tokens = tokens[: self.max_seq_len]
-            prompt_len = min(prompt_len, len(tokens))
+    def _encode_example(self, example: Dict[str, str]) -> Dict[str, torch.Tensor]:
+        """One example dict (text, input, target, task) -> the training payload: BOS + prompt + answer + EOS,
+        prompt positions masked to -100 in the labels. ModTableDataset uses this same method."""
+        prompt_tokens = self._encode_text(example["input"])
+        prompt_len = len(prompt_tokens)
+        tokens = self._encode_text(example["text"])
+        if self.tokenizer.eos_token_id is not None:
+            tokens.append(self.tokenizer.eos_token_id)
 
-            input_ids = torch.tensor(tokens, dtype=torch.long)
+        if len(tokens) > self.max_seq_len:
+            tokens = tokens[: self.max_seq_len]
+        prompt_len = min(prompt_len, len(tokens))
 
-            labels = input_ids.clone()
-            if prompt_len > 0:
-                labels[:prompt_len] = -100
+        input_ids = torch.tensor(tokens, dtype=torch.long)
 
-            payload = {
-                "input_ids": input_ids,
-                "labels": labels,
-                "task": example["task"],
-            }
-            if self.include_lengths:
-                payload["input_len_tokens"] = len(
-                    self.tokenizer.encode(example["input"], add_special_tokens=False)
-                )
-                payload["target_len_tokens"] = len(
-                    self.tokenizer.encode(example["target"], add_special_tokens=False)
-                )
-            self.examples.append(payload)
+        labels = input_ids.clone()
+        if prompt_len > 0:
+            labels[:prompt_len] = -100
+
+        payload = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "task": example["task"],
+        }
+        if self.include_lengths:
+            payload["input_len_tokens"] = len(
+                self.tokenizer.encode(example["input"], add_special_tokens=False)
+            )
+            payload["target_len_tokens"] = len(
+                self.tokenizer.encode(example["target"], add_special_tokens=False)
+            )
+        return payload
 
     def _encode_text(self, text: str) -> List[int]:
         return self.tokenizer.encode(text, add_special_tokens=True)
@@ -1748,6 +1757,12 @@ def make_collate_fn(tokenizer) -> Callable[[Sequence[Dict[str, torch.Tensor]]], 
 # CURRICULUM SAMPLER
 # =============================================================================
 
+def _generator_state(loader) -> Optional[torch.Tensor]:
+    """A copy of the loader's own shuffle generator state (None without one). Reading it draws nothing."""
+    gen = getattr(loader, "generator", None)
+    return None if gen is None else gen.get_state()
+
+
 class CurriculumSampler:
     """
     Flexible curriculum sampler that blends algorithmic, language, and optional
@@ -1765,6 +1780,7 @@ class CurriculumSampler:
         lexical_frac_phase1: float = 0.05,
         seed: int = 42,
         lex_loader: Optional[DataLoader] = None,
+        track_position: bool = False,
     ):
         if not 0.0 <= persistent_alg_frac <= 0.9:
             raise ValueError(
@@ -1774,6 +1790,15 @@ class CurriculumSampler:
         self.alg_loader = alg_loader
         self.lang_loader = lang_loader
         self.lex_loader = lex_loader
+
+        # Exact resume (train.py --mod_table_resume auto): the alg loader's position is the state of its shuffle
+        # generator just before the current alg iterator was made (the "anchor"), how that iterator was made, and
+        # how many batches it has given. Read-only bookkeeping: it never draws from any generator.
+        self.track_position = track_position
+        if track_position:
+            self._alg_anchor = _generator_state(self.alg_loader)
+            self._alg_anchor_kind = "init"  # made by this constructor, before lang_iter and lex_iter
+            self.alg_drawn = 0
 
         self.alg_iter = iter(self.alg_loader)
         self.lang_iter = iter(self.lang_loader)
@@ -1852,12 +1877,62 @@ class CurriculumSampler:
             loader, iter_attr = self.lex_loader, "lex_iter"
 
         iterator = getattr(self, iter_attr)
+        if self.track_position and which == "alg":
+            return self._next_alg_tracked(iterator)
         try:
             return next(iterator)
         except StopIteration:
             iterator = iter(loader)
             setattr(self, iter_attr, iterator)
             return next(iterator)
+
+    def _next_alg_tracked(self, iterator) -> Dict[str, torch.Tensor]:
+        """_next_from("alg") with the position bookkeeping; the same calls in the same order."""
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            # the exhausted sampler has already drawn its tail from the generator: the anchor comes after that
+            anchor = _generator_state(self.alg_loader)
+            self.alg_iter = iter(self.alg_loader)
+            batch = next(self.alg_iter)
+            self._alg_anchor, self._alg_anchor_kind, self.alg_drawn = anchor, "epoch", 0
+        self.alg_drawn += 1
+        return batch
+
+    def set_alg_loader(self, loader: DataLoader) -> None:
+        """Replace the alg loader and start a fresh iterator over it (what train.py's mod-table join does)."""
+        if self.track_position:
+            self._alg_anchor, self._alg_anchor_kind, self.alg_drawn = _generator_state(loader), "join", 0
+        self.alg_loader = loader
+        self.alg_iter = iter(self.alg_loader)
+
+    def alg_position(self) -> Dict[str, Any]:
+        if not self.track_position:
+            raise RuntimeError("CurriculumSampler(track_position=True) is needed for alg_position()")
+        return {"anchor": self._alg_anchor, "kind": self._alg_anchor_kind, "drawn": int(self.alg_drawn),
+                "generator_now": _generator_state(self.alg_loader)}
+
+    def restore_alg_position(self, pos: Dict[str, Any]) -> Optional[Dict[str, torch.Tensor]]:
+        """Put the alg iterator where alg_position() saw it. self.alg_loader must already be the loader that
+        position belongs to (same dataset, batch size, sampler), freshly built. Replays the same calls the original
+        run made since the anchor (iter(), plus the constructor's lang/lex iter() for an "init" anchor, then
+        `drawn` batches), checks the generator ends in the saved state, and returns the last replayed batch."""
+        gen = self.alg_loader.generator
+        if gen is None or pos["anchor"] is None:
+            raise RuntimeError("restore_alg_position needs an alg loader with its own torch.Generator")
+        gen.set_state(pos["anchor"].clone())
+        self.alg_iter = iter(self.alg_loader)
+        if pos["kind"] == "init":
+            self.lang_iter = iter(self.lang_loader)
+            self.lex_iter = iter(self.lex_loader) if self.lex_loader is not None else None
+        last = None
+        for _ in range(int(pos["drawn"])):
+            last = next(self.alg_iter)  # StopIteration here means the saved count is wrong: fail loudly
+        if not torch.equal(gen.get_state(), pos["generator_now"]):
+            raise RuntimeError("restore_alg_position: the alg generator does not end in the saved state")
+        self.track_position = True
+        self._alg_anchor, self._alg_anchor_kind, self.alg_drawn = pos["anchor"].clone(), pos["kind"], int(pos["drawn"])
+        return last
 
     def next_batch(self) -> Dict[str, torch.Tensor]:
         source = self._sample_source()

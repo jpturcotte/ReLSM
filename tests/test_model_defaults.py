@@ -49,8 +49,20 @@ def test_ffn_rule_values():
         ffn_dim(512, "8x")
 
 
+# presets added after be08cde: tools/grok_lab.py's model for the train.py bridge runs, and its 4-layer arm
+NEW_PRESETS = {"grok": (128, 2, 4), "grok4": (128, 4, 4)}  # size -> (d_model, n_layers, n_heads)
+
+
 def test_presets_cover_the_old_sizes():
-    assert set(PRESETS) == set(OLD_FACTORY)
+    assert set(OLD_FACTORY) <= set(PRESETS)
+    assert set(PRESETS) - set(OLD_FACTORY) == set(NEW_PRESETS)
+
+
+@pytest.mark.parametrize("size", list(NEW_PRESETS))
+def test_grok_presets(size, config_only):
+    cfg = create_model(size)
+    assert (cfg.d_model, cfg.n_layers, cfg.n_heads) == NEW_PRESETS[size]
+    assert cfg.d_ff == ffn_dim(128) == 512 and cfg.tie_weights is False and cfg.dropout == 0.0
 
 
 @pytest.mark.parametrize("size", list(OLD_FACTORY))

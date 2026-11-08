@@ -1996,7 +1996,56 @@ def train(args):
     
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+    resume_auto = args.mod_table_p is not None and args.mod_table_resume == "auto"
+    resume_state = None  # the resume.pt payload this run continues from (in place or --mod_table_init_from)
+    resume_kind = None  # "resume" (this output_dir's own resume.pt) or "extend" (another run's)
+    resume_fallback = args.mod_table_p is not None and args.mod_table_resume_fallback == "previous"
+    resume_picked, resume_rejected = None, []  # with the fallback: the file resumed from, and the ones passed over
+    if args.mod_table_p is not None:
+        from tools.grok_bridge import move_aside
+
+        if resume_auto:
+            from tools.grok_bridge import RESUME_FILE, load_resume
+
+            own = output_dir / RESUME_FILE
+            if resume_fallback:
+                from tools.grok_bridge import select_resume
+
+                picked = select_resume(output_dir)  # SystemExit when neither file is usable: never a fresh start
+                if picked is not None:
+                    resume_state, resume_picked, resume_rejected = picked
+                    resume_kind = "resume"
+            elif own.exists():
+                resume_state, resume_kind = load_resume(own), "resume"
+            if resume_kind is None and args.mod_table_init_from:
+                src0 = Path(args.mod_table_init_from)
+                if resume_fallback:
+                    from tools.grok_bridge import check_pair, sidecar
+
+                    why = check_pair(src0) if sidecar(src0).exists() else None
+                    if why is not None:  # a named source is never swapped for its own earlier checkpoint
+                        raise SystemExit(f"--mod_table_init_from: {src0}: {why}")
+                resume_state, resume_kind = load_resume(src0), "extend"
+                # An ordinary evaluation (--eval_interval) reads the run's horizon (phase, language perplexity,
+                # curriculum state), so its records in the source would differ from one long run's. --eval_interval
+                # must match, so a source without any has none before the extension point in the long run either.
+                # Checked here, before anything in the destination is moved aside or opened.
+                evals = sorted({r.get("step") for r in resume_state["logger"]["records"] if r.get("phase") == "eval"})
+                if evals:
+                    raise SystemExit(f"--mod_table_init_from: {args.mod_table_init_from} logged ordinary evaluations "
+                                     f"(micro-steps {evals[:5]}{'...' if len(evals) > 5 else ''}) against its own "
+                                     f"horizon; only a run with --eval_interval beyond its length can be extended")
+            stale = output_dir / (RESUME_FILE + ".tmp")
+            if resume_kind == "resume" and stale.exists():
+                stale.unlink()  # a write cut off before its os.replace; the resume.pt beside it is whole
+            if resume_kind == "resume" and resume_fallback:
+                from tools.grok_bridge import stale_resume_temps
+
+                for q in stale_resume_temps(output_dir):  # never part of a committed pair
+                    q.unlink()
+        if resume_kind != "resume":
+            move_aside(output_dir)  # before the logger opens metrics.json: a restart never shows an earlier attempt
+
     logger = MetricsLogger(output_dir)
     logger.set_hyperparameters(vars(args))
     
@@ -2239,7 +2288,43 @@ def train(args):
     collate_fn = make_collate_fn(tokenizer)
 
     # Phase 1: Algorithmic
-    if args.fixed_data:
+    if args.mod_table_p is not None:
+        from tools.grok_bridge import ModTableDataset, make_table_loader, parse_starts, parse_tasks
+
+        table_tasks = parse_tasks(args.mod_table_tasks)
+        table_starts = parse_starts(args.mod_table_start, table_tasks)
+        table_sets = {
+            t: ModTableDataset(
+                tokenizer,
+                p=args.mod_table_p,
+                frac=args.mod_table_frac,
+                split_seed=args.seed if args.mod_table_split_seed is None else args.mod_table_split_seed,
+                pairs=args.mod_table_pairs,
+                max_seq_len=args.alg_seq_len,
+                include_lengths=True,
+                task=t,
+                numbers=args.mod_table_numbers,
+                answer_format=args.mod_table_answer,
+                relabel=args.mod_table_relabel,
+                relabel_seed=args.mod_table_relabel_seed,
+            )
+            for t in table_tasks
+        }
+        alg_dataset = table_sets[table_tasks[0]]
+        for t in table_tasks:
+            log_print(f"  Mod table: {json.dumps(table_sets[t].split_record())}; trains from update {table_starts[t]}")
+        table_active = [t for t in table_tasks if table_starts[t] == 0]
+        # grok_lab's sampler: epoch shuffle, last partial batch dropped; its own generator, so no other consumer
+        # shifts it. --alg_batch_size sequences per active task per micro-batch.
+        alg_loader = make_table_loader([table_sets[t] for t in table_active], args.alg_batch_size, args.seed,
+                                       args.num_workers, collate_fn)
+        run_fingerprint = None
+        if resume_auto:  # a resume continues only the same code (eval_hub.py, eval/ too) on the same encoded data
+            from tools.grok_bridge import code_tree_sha256, dataset_sha256
+
+            run_fingerprint = {"code": code_tree_sha256(Path(__file__).resolve().parent),
+                               "data": {t: dataset_sha256(table_sets[t]) for t in table_tasks}}
+    elif args.fixed_data:
         alg_dataset = FixedAlgorithmicDataset(
             tokenizer=tokenizer,
             num_examples=args.fixed_data_size,
@@ -2402,8 +2487,9 @@ def train(args):
         lexical_frac_phase1=args.lexical_frac_phase1,
         seed=args.seed,
         lex_loader=None,
+        track_position=resume_auto,
     )
-    
+
     # =========================================================================
     # OPTIMIZER
     # =========================================================================
@@ -2460,6 +2546,96 @@ def train(args):
         )
     )
     
+    table_scorer = None
+    if args.mod_table_p is not None:
+        from tools.grok_bridge import TableScorer, provenance
+
+        # one scorer per task: add writes table_scores.jsonl (the one-task file), mul table_scores_mul.jsonl
+        table_scorers = {t: TableScorer(tokenizer, table_sets[t], device, ctx,
+                                        output_dir / ("table_scores.jsonl" if t == "add" else f"table_scores_{t}.jsonl"))
+                         for t in table_tasks}
+        table_scorer = table_scorers[table_tasks[0]]
+        if run_fingerprint is not None:  # a tokenizer change that touches only held-out pairs is caught here
+            from tools.grok_bridge import scorer_sha256, tokenizer_sha256
+
+            run_fingerprint["score"] = {t: scorer_sha256(table_scorers[t]) for t in table_tasks}
+            run_fingerprint["tokenizer"] = tokenizer_sha256(tokenizer)
+        table_joins = []
+        bridge_record = {
+            "status": "running", "argv": sys.argv, "args": vars(args),
+            "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "split": alg_dataset.split_record(),
+            "tasks": table_tasks, "starts": table_starts,
+            "splits": {t: table_sets[t].split_record() for t in table_tasks},
+            **provenance(tokenizer, alg_dataset, model),
+            "optimizer": {"betas": list(optimizer.param_groups[0].get("betas", ())),
+                          "eps": optimizer.param_groups[0].get("eps"),
+                          "groups": [{"weight_decay": g["weight_decay"], "n_params": sum(q.numel() for q in g["params"])}
+                                     for g in optimizer.param_groups]},
+            "n_params": sum(p.numel() for p in model.parameters()),
+            "tied": model.lm_head.weight is model.tok_emb.weight,
+            "dropout": float(model.drop.p), "torch": torch.__version__,
+            "device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+            "autocast_dtype": str(dtype) if device.type == "cuda" else None,
+        }
+        if resume_state is None:
+            (output_dir / "bridge_record.json").write_text(json.dumps(bridge_record, indent=1), encoding="utf-8")
+            for t in table_tasks:
+                table_scorers[t](model, 0, 0, extra={"lr": 0.0, "active": t in table_active})
+        else:
+            from tools.grok_bridge import (EXTEND_FREE_ARGS, RESUME_FREE_ARGS, arg_differences, atomic_write_bytes,
+                                           atomic_write_text, plain, record_differences)
+
+            src = (Path(args.mod_table_init_from) if resume_kind == "extend"
+                   else output_dir / (resume_picked or RESUME_FILE))  # the file actually resumed from
+            diffs = arg_differences(resume_state["args"], plain(vars(args)),
+                                    EXTEND_FREE_ARGS if resume_kind == "extend" else RESUME_FREE_ARGS)
+            rec_diffs = record_differences(resume_state["bridge_record"], plain(bridge_record))
+            if resume_state.get("fingerprint") != run_fingerprint:
+                rec_diffs.append("code/data fingerprint")
+            if diffs or rec_diffs:
+                raise SystemExit(f"--mod_table_resume: {src} does not belong to this run: arguments {diffs}, "
+                                 f"record fields {rec_diffs} differ (move it aside to start afresh)")
+            if resume_kind == "extend" and args.total_tokens <= resume_state["tokens_seen"]:
+                raise SystemExit(f"--mod_table_init_from: --total_tokens {args.total_tokens} does not exceed the "
+                                 f"{resume_state['tokens_seen']} tokens {src} has already trained on")
+            pos0 = resume_state["alg_position"]
+            entry = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "kind": resume_state["kind"],
+                     "update": resume_state["micro_steps"] // args.grad_accum_steps,
+                     "micro_steps": resume_state["micro_steps"], "tokens_seen": resume_state["tokens_seen"],
+                     "partial_accumulation": resume_state["micro_steps"] % args.grad_accum_steps,
+                     "saved_grads": sum(g is not None for g in resume_state["grads"]),
+                     "loader_anchor": pos0["kind"], "loader_drawn": pos0["drawn"], "argv": sys.argv}
+            if resume_fallback and resume_kind == "resume":
+                from tools.grok_bridge import RESUME_FILE as _cur, sidecar
+
+                entry["checkpoint"] = {
+                    "file": resume_picked, "fallback": resume_picked != _cur, "rejected": resume_rejected,
+                    "sidecar": json.loads(sidecar(output_dir / resume_picked).read_text(encoding="utf-8"))}
+                with open(output_dir / "resume_log.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps({k: entry[k] for k in ("at", "kind", "update", "micro_steps", "checkpoint")})
+                            + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            if resume_kind == "resume":
+                bridge_record = resume_state["bridge_record"]
+                bridge_record["status"] = "running"
+                bridge_record.setdefault("resumes", []).append(entry)
+            else:
+                import hashlib
+
+                bridge_record["init_from"] = {**entry, "path": str(src),
+                                              "sha256": hashlib.sha256(src.read_bytes()).hexdigest(),
+                                              "source_started": resume_state["bridge_record"].get("started"),
+                                              "source_argv": resume_state["bridge_record"].get("argv")}
+            # "running" is on disk before any output file is rewound: a crash in between never leaves a record that
+            # says finished beside rewound tables
+            atomic_write_text(output_dir / "bridge_record.json", json.dumps(bridge_record, indent=1))
+            # the table files exactly as they were at the checkpoint: earlier rows kept, later ones dropped (#150)
+            for t in table_tasks:
+                name = table_scorers[t].out_path.name
+                data = resume_state["table_files"].get(name)
+                atomic_write_bytes(table_scorers[t].out_path, b"" if data is None else data.numpy().tobytes())
+
     global_step = 0
     tokens_seen = 0
     start_time = time.time()
@@ -2628,6 +2804,12 @@ def train(args):
         warmup_source = f"{args.warmup_frac:.2f} of total tokens"
 
     warmup_tokens = min(max(warmup_tokens, 1), args.total_tokens)
+    if resume_state is not None and warmup_tokens != resume_state["warmup_tokens"]:
+        raise SystemExit(f"--mod_table_resume: warmup is {warmup_tokens} tokens here but "
+                         f"{resume_state['warmup_tokens']} in the checkpoint (pass the same --warmup_tokens)")
+    if table_scorer is not None:
+        bridge_record.update(warmup_tokens=warmup_tokens, warmup_source=warmup_source)
+        (output_dir / "bridge_record.json").write_text(json.dumps(bridge_record, indent=1), encoding="utf-8")
     warmup_display = f"{warmup_tokens} tokens ({warmup_source})"
 
     log_print(
@@ -2689,7 +2871,172 @@ def train(args):
             f"{task}={value:.3f}"
             for task, value in sorted(difficulty_by_task.items())
         )
-    
+
+    if resume_auto:
+        from tools.grok_bridge import (atomic_torch_save, batch_sha256, bytes_tensor, make_table_loader as _mtl,
+                                       numpy_rng_state, plain, set_numpy_rng_state, RESUME_FORMAT, RESUME_FILE)
+
+        # test hook (env-gated, resume tests only): RELSM_TEST_KILL="UPDATE:POINT" ends the process hard with
+        # os._exit at that update (UPDATE "*": any); POINT is step (right after the optimizer step), end (end of the
+        # iteration), save (inside the resume.pt write, before its os.replace) or final (after the final resume.pt,
+        # before the final scores); with --mod_table_resume_fallback previous also rotate (backup payload replaced,
+        # its sidecar not yet) and replaced (resume.pt replaced, its sidecar not yet). RELSM_TEST_KILL_MARKER=PATH
+        # makes it one-shot.
+        kill_spec = os.environ.get("RELSM_TEST_KILL", "")
+        kill_update, _, kill_point = kill_spec.partition(":")
+        kill_any = kill_update.strip() == "*"
+        kill_update = int(kill_update) if kill_update.strip() not in ("", "*") else None
+        kill_point = kill_point or "end"
+
+        def test_kill(update: int, point: str) -> None:
+            if (kill_update is None and not kill_any) or point != kill_point or (not kill_any and update != kill_update):
+                return
+            marker = os.environ.get("RELSM_TEST_KILL_MARKER")
+            if marker:
+                if Path(marker).exists():
+                    return
+                Path(marker).write_text(f"killed at update {update} ({point})\n", encoding="utf-8")
+            print(f"[test] RELSM_TEST_KILL: os._exit at update {update} ({point})", flush=True)
+            os._exit(86)
+
+        def save_resume(kind: str, last_batch) -> None:
+            """resume.pt: everything the loop carries from one iteration to the next, at an iteration's end."""
+            pos = curriculum.alg_position()
+            pos["last_batch_sha256"] = batch_sha256(last_batch) if pos["drawn"] > 0 else None
+            table_files = {}
+            for t in table_tasks:
+                path = table_scorers[t].out_path
+                table_files[path.name] = bytes_tensor(path.read_bytes() if path.exists() else b"")
+            state = {
+                "format": RESUME_FORMAT, "kind": kind, "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "micro_steps": global_step, "tokens_seen": tokens_seen,
+                "args": plain(vars(args)), "bridge_record": plain(bridge_record), "warmup_tokens": warmup_tokens,
+                "model": model.state_dict(), "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(),
+                "grads": [None if q.grad is None else q.grad.detach().clone() for q in model.parameters()],
+                "curriculum_tokens_seen": curriculum.tokens_seen, "curriculum_rng": curriculum.rng.getstate(),
+                "alg_position": pos, "table_active": list(table_active), "table_joins": plain(table_joins),
+                "table_files": table_files,
+                # after a join, lang_loader is still the first loader (the bridge's fallback, read by perplexity
+                # evaluations), no longer the alg loader that alg_position covers: keep its generator too
+                "lang_generator": (lang_loader.generator.get_state()
+                                   if lang_loader is not curriculum.alg_loader
+                                   and getattr(lang_loader, "generator", None) is not None else None),
+                "loop": plain({
+                    "running_loss": running_loss, "running_inner_steps": running_inner_steps,
+                    "running_ponder": running_ponder, "last_grad_norm": last_grad_norm,
+                    "last_token_accuracy": last_token_accuracy, "last_pct_masked_tokens": last_pct_masked_tokens,
+                    "flush_diagnostic_metrics": flush_diagnostic_metrics, "lr_mismatch_warned": lr_mismatch_warned,
+                    "task_window_counts": list(task_window_counts.items()),
+                    "task_window_input_len": list(task_window_input_len.items()),
+                    "task_window_target_len": list(task_window_target_len.items()),
+                    "last_log_tokens": last_log_tokens, "best_alg_acc": best_alg_acc,
+                    "checkpoint_paths": [str(q) for q in checkpoint_paths],
+                    "train_seconds": time.time() - start_time,
+                }),
+                "logger": plain({"records": logger.records, "task_accuracies": logger.task_accuracies,
+                                 "ood_task_accuracies": logger.ood_task_accuracies,
+                                 "train_eval_task_accuracies": logger.train_eval_task_accuracies}),
+                "fingerprint": run_fingerprint,
+                "rng": {"torch": torch.get_rng_state(),
+                        "cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
+                        "python": random.getstate(), "numpy": numpy_rng_state()},
+            }
+            if resume_fallback:
+                from tools.grok_bridge import publish_resume
+
+                publish_resume(state, output_dir, rotate=resume_rotate["ok"],
+                               kill=lambda point: test_kill(global_step // args.grad_accum_steps, point))
+                resume_rotate["ok"] = True
+            else:
+                atomic_torch_save(state, output_dir / RESUME_FILE,
+                                  before_replace=lambda: test_kill(global_step // args.grad_accum_steps, "save"))
+
+        # after a fallback, the first save keeps the backup it fell back to (the rejected current never replaces it)
+        resume_rotate = {"ok": resume_picked in (None, RESUME_FILE)}
+
+    if resume_auto:
+        batch = None  # the last batch drawn: save_resume() checks the restored data stream ends on it
+    if resume_state is not None:
+        # Restore = everything above built exactly as a fresh start built it, then the checkpoint's state on top
+        st = resume_state
+        model.load_state_dict(st["model"])
+        optimizer.load_state_dict(st["optimizer"])
+        scaler.load_state_dict(st["scaler"])  # a no-op for a disabled scaler (bf16 / CPU)
+        params = list(model.parameters())
+        if len(params) != len(st["grads"]):
+            raise SystemExit("--mod_table_resume: parameter count differs from the checkpoint")
+        for q, g in zip(params, st["grads"]):  # a run that ended part-way through an accumulation
+            q.grad = None if g is None else g.to(device=q.device, dtype=q.dtype).clone()
+        global_step = int(st["micro_steps"])
+        tokens_seen = int(st["tokens_seen"])
+        curriculum.tokens_seen = int(st["curriculum_tokens_seen"])
+        curriculum.rng.setstate(st["curriculum_rng"])
+        table_joins = st["table_joins"]
+        if st["table_active"] != table_active:  # a task joined before the checkpoint: its pooled loader
+            table_active = list(st["table_active"])
+            curriculum.alg_loader = _mtl([table_sets[t] for t in table_active], args.alg_batch_size, args.seed,
+                                         args.num_workers, collate_fn)
+        if st["lang_generator"] is not None:
+            if lang_loader is curriculum.alg_loader or getattr(lang_loader, "generator", None) is None:
+                raise SystemExit("--mod_table_resume: the checkpoint has a fallback-loader state this run cannot use")
+            lang_loader.generator.set_state(st["lang_generator"].clone())
+        batch = curriculum.restore_alg_position(st["alg_position"])
+        want = st["alg_position"]["last_batch_sha256"]
+        if want is not None and batch_sha256(batch) != want:
+            raise SystemExit("--mod_table_resume: the replayed data stream does not end at the checkpoint's batch")
+        lp = st["loop"]
+        running_loss, running_inner_steps = lp["running_loss"], lp["running_inner_steps"]
+        running_ponder, last_grad_norm = lp["running_ponder"], lp["last_grad_norm"]
+        last_token_accuracy, last_pct_masked_tokens = lp["last_token_accuracy"], lp["last_pct_masked_tokens"]
+        flush_diagnostic_metrics, lr_mismatch_warned = lp["flush_diagnostic_metrics"], lp["lr_mismatch_warned"]
+        task_window_counts = defaultdict(int, lp["task_window_counts"])
+        task_window_input_len = defaultdict(int, lp["task_window_input_len"])
+        task_window_target_len = defaultdict(int, lp["task_window_target_len"])
+        last_log_tokens, best_alg_acc = lp["last_log_tokens"], lp["best_alg_acc"]
+        # an extension never rotates (deletes) the source run's checkpoints
+        checkpoint_paths = [] if resume_kind == "extend" else [Path(q) for q in lp["checkpoint_paths"]]
+        start_time = time.time() - lp["train_seconds"]  # summary and record hours: training time, not downtime
+        last_log_time = time.time()
+        lg = st["logger"]
+        logger.records = lg["records"]
+        logger.task_accuracies = lg["task_accuracies"]
+        logger.ood_task_accuracies = lg["ood_task_accuracies"]
+        logger.train_eval_task_accuracies = lg["train_eval_task_accuracies"]
+        if resume_kind == "extend":
+            # The inherited records logged phase, difficulty and the task weight/prob against the source run's
+            # --alg_tokens. They are pure functions of tokens_seen and the horizon, never fed back into training: log
+            # them as this (longer) run logs them, so the history equals one long run's.
+            active_names = alg_tasks or list(AlgorithmicGenerator._get_generators().keys())
+            for r in logger.records:
+                t_seen = r.get("train/throughput/tokens_seen")
+                if r.get("phase") == "eval" or t_seen is None:
+                    continue
+                if t_seen < curriculum.alg_tokens - curriculum.mix_band_tokens:
+                    r["phase"] = "algorithmic"
+                elif t_seen < curriculum.alg_tokens + curriculum.mix_band_tokens:
+                    r["phase"] = "mix"
+                else:
+                    r["phase"] = "language"
+                if "train/curriculum/difficulty" in r:
+                    r["train/curriculum/difficulty"] = clamp_difficulty(
+                        difficulty_schedule(t_seen, args.alg_tokens, args.difficulty_schedule))
+                w_now, p_now = _compute_task_sampling(active_names, min(t_seen / max(args.alg_tokens, 1), 1.0),
+                                                      args.task_weighting)
+                for task_name in w_now:
+                    for key, val in ((f"train/curriculum/prob/{task_name}", p_now[task_name]),
+                                     (f"train/curriculum/weight/{task_name}", w_now[task_name])):
+                        if key in r:
+                            r[key] = val
+        logger.save()  # metrics.json as it was at the checkpoint (#150)
+        # the global RNGs last: building the run above drew from them
+        torch.set_rng_state(st["rng"]["torch"])
+        if st["rng"]["cuda"] is not None:
+            torch.cuda.set_rng_state(st["rng"]["cuda"], device)
+        random.setstate(st["rng"]["python"])
+        set_numpy_rng_state(st["rng"]["numpy"])
+        log_print(f"  Mod table: resumed ({resume_kind}) at micro-step {global_step}, tokens {tokens_seen}")
+        resume_state = st = lp = lg = None  # free the payload (CPU copies of weights and moments); nothing reads it
+
     try:
         while curriculum.tokens_seen < args.total_tokens:
             if difficulty_value is not None:
@@ -2778,6 +3125,8 @@ def train(args):
             # Backward
             scaler.scale(loss).backward()
             running_loss += loss.item() * args.grad_accum_steps
+            if table_scorer is not None and not math.isfinite(running_loss):
+                raise FloatingPointError(f"non-finite training loss at micro-step {global_step + 1}")  # #247
 
             if args.grokfast:
                 with torch.no_grad():
@@ -2810,8 +3159,29 @@ def train(args):
                 optimizer.zero_grad()
 
                 last_grad_norm = float(grad_norm)
-            
+
             global_step += 1
+            if resume_auto and global_step % args.grad_accum_steps == 0:
+                test_kill(global_step // args.grad_accum_steps, "step")
+
+            if (table_scorer is not None and global_step % args.grad_accum_steps == 0
+                    and (global_step // args.grad_accum_steps) % args.mod_table_eval_every == 0):
+                for t in table_tasks:
+                    table_scorers[t](model, global_step // args.grad_accum_steps, tokens_seen,
+                                     extra={"lr": lr, "train_loss_micro": loss.item() * args.grad_accum_steps,
+                                            "grad_norm": last_grad_norm, "active": t in table_active})
+            if table_scorer is not None and global_step % args.grad_accum_steps == 0:
+                update_now = global_step // args.grad_accum_steps
+                joining = [t for t in table_tasks if t not in table_active and table_starts[t] <= update_now]
+                if joining:
+                    # after the update-u score, before update u + 1: the pooled order restarts over the new set
+                    table_active = [t for t in table_tasks if t in table_active or t in joining]
+                    curriculum.set_alg_loader(make_table_loader([table_sets[t] for t in table_active],
+                                                                args.alg_batch_size, args.seed, args.num_workers,
+                                                                collate_fn))
+                    table_joins.append({"tasks": joining, "update": update_now, "micro_steps": global_step,
+                                        "tokens_seen": tokens_seen, "active": list(table_active)})
+                    log_print(f"  Mod table: {joining} join at update {update_now}; active {table_active}")
             
             # Logging
             if global_step % args.log_interval == 0:
@@ -3752,7 +4122,11 @@ def train(args):
 
                 # Perplexity (only in Phase 2)
                 if curriculum.phase == "language":
+                    keep_gen = getattr(lang_loader, "generator", None) if resume_auto else None
+                    keep_state = keep_gen.get_state() if keep_gen is not None else None
                     ppl = evaluate_perplexity(model, lang_loader, device, ctx)
+                    if keep_gen is not None:  # bridge: lang_loader IS the alg loader; its stream stays the run's
+                        keep_gen.set_state(keep_state)
                     if args.extended_logging:
                         log_print(f"  Language PPL: {ppl:.2f}")
                     logger.log(
@@ -3786,7 +4160,18 @@ def train(args):
                 if args.extended_logging:
                     log_print()
                 model.train()
+
+            # exact resume: at the end of an update's iteration (after its step, table score, join and log)
+            if resume_auto and global_step % args.grad_accum_steps == 0:
+                if (global_step // args.grad_accum_steps) % args.mod_table_resume_every == 0:
+                    save_resume("periodic", batch)
+                test_kill(global_step // args.grad_accum_steps, "end")
     except KeyboardInterrupt:
+        resume_auto = False  # an interrupt can land mid-iteration: keep the last periodic resume.pt
+        if table_scorer is not None:
+            bridge_record["status"] = "interrupted"  # never counted as a finished bridge run (#185)
+            (output_dir / "bridge_record.json").write_text(json.dumps(bridge_record, indent=1), encoding="utf-8")
+            table_scorer = None
         log_print("\nKeyboard interrupt detected. Saving checkpoint before exit.")
         interrupt_checkpoint = save_rotating_checkpoint(global_step, tokens_seen, tag="interrupt")
         if interrupt_checkpoint is not None:
@@ -3800,7 +4185,11 @@ def train(args):
     # =========================================================================
     
     total_time = time.time() - start_time
-    
+    if resume_auto:
+        # the end-of-loop state (possibly part-way through an accumulation): --mod_table_init_from extends from it
+        save_resume("final", batch)
+        test_kill(global_step // args.grad_accum_steps, "final")
+
     # Final save
     final_payload = build_checkpoint_payload(global_step, tokens_seen)
     torch.save(final_payload, output_dir / "final_model.pt")
@@ -3816,7 +4205,26 @@ def train(args):
     
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
-    
+
+    if table_scorer is not None:
+        final_update = global_step // args.grad_accum_steps
+        for t in table_tasks:
+            table_scorers[t](model, final_update, tokens_seen, final=True,
+                             extra={"final": True, "micro_steps": global_step, "active": t in table_active,
+                                    "partial_accumulation": global_step % args.grad_accum_steps})
+        bridge_record.update(status="finished" if tokens_seen >= args.total_tokens else "short", joins=table_joins,
+                             ended=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                             updates=final_update, micro_steps=global_step, tokens_seen=tokens_seen,
+                             train_hours=total_time / 3600)
+        if resume_auto:
+            from tools.grok_bridge import state_sha256
+
+            bridge_record.update(resume_every=args.mod_table_resume_every,
+                                 final_state_sha256=state_sha256(model, optimizer))
+        tmp = output_dir / "bridge_record.json.tmp"
+        tmp.write_text(json.dumps(bridge_record, indent=1), encoding="utf-8")
+        os.replace(tmp, output_dir / "bridge_record.json")
+
     log_print("\n" + "="*60)
     log_print("Training complete!")
     log_print(f"  Total time: {total_time/3600:.2f} hours")
@@ -3833,7 +4241,7 @@ def main():
     
     # Model
     parser.add_argument("--model_size", type=str, default="nano",
-                       choices=["nano", "50M", "125M", "300M", "350M", "760M", "1B", "1B-16k"])
+                       choices=["nano", "grok", "grok4", "50M", "125M", "300M", "350M", "760M", "1B", "1B-16k"])
     parser.add_argument("--variant", type=str, default="baseline",
                        choices=["baseline", "shared_loop", "latent", "act", "ssm", "ssm_mem"])
     tie = parser.add_mutually_exclusive_group()
@@ -4121,6 +4529,42 @@ def main():
         help="Print extended metrics beyond loss/LR to the console.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    # Bridge to tools/grok_lab.py (tools/grok_bridge.py): the a + b mod p table under train.py's own path
+    parser.add_argument("--mod_table_p", type=int, default=None,
+                        help="Train on every train pair of grok_lab's a + b mod p table (all 4 mod_add templates) "
+                             "instead of --fixed_data's random examples; needs --fixed_data and --alg_tasks mod_add")
+    parser.add_argument("--mod_table_frac", type=float, default=0.5, help="Train fraction of the p*p pairs")
+    parser.add_argument("--mod_table_pairs", choices=["ordered", "paired"], default="paired",
+                        help="grok_lab split: paired keeps (a, b) and (b, a) on the same side")
+    parser.add_argument("--mod_table_split_seed", type=int, default=None, help="Split seed (default --seed)")
+    parser.add_argument("--mod_table_eval_every", type=int, default=100,
+                        help="Score the whole table every N optimizer updates (and at update 0 and the end)")
+    parser.add_argument("--mod_table_tasks", default="add",
+                        help="Comma list of table tasks: add (a + b mod p), mul (a * b mod p, nonzero operands). "
+                             "--alg_batch_size is per active task, so two active tasks double the micro-batch")
+    parser.add_argument("--mod_table_start", default="",
+                        help="task=update entries: the task joins training after that update (default: all from 0)")
+    # task x format study (2026-11-07): number rendering and relabelling; the defaults are the original path
+    parser.add_argument("--mod_table_numbers", choices=["digits", "token"], default="digits",
+                        help="token: each operand is one surrogate id (llemma byte-fallback rows 3..99), not digits")
+    parser.add_argument("--mod_table_answer", choices=["digits", "token"], default="digits",
+                        help="token: the answer is one surrogate id (rows 100..196), then EOS")
+    parser.add_argument("--mod_table_relabel", choices=["none", "log", "perm"], default="none",
+                        help="write every number as its discrete log (mul) or a seeded random bijection (not div), in digits")
+    parser.add_argument("--mod_table_relabel_seed", type=int, default=20261107, help="seed of --mod_table_relabel perm")
+    # exact resume of a bridge run (2026-11-07); the default (off) is the original path, untouched
+    parser.add_argument("--mod_table_resume", choices=["off", "auto"], default="off",
+                        help="auto: write OUTPUT_DIR/resume.pt every --mod_table_resume_every updates and at the end; "
+                             "a run started on a directory that has one continues from it exactly")
+    parser.add_argument("--mod_table_resume_every", type=int, default=500, help="updates between resume.pt writes")
+    parser.add_argument("--mod_table_resume_fallback", choices=["off", "previous"], default="off",
+                        help="previous: also keep the last good resume.pt as resume.prev.pt, each with a sha256 "
+                             "sidecar; a damaged or missing resume.pt then resumes from resume.prev.pt (a mismatched "
+                             "one still stops). Costs one more resume-sized file")
+    parser.add_argument("--mod_table_init_from", default=None,
+                        help="another run's resume.pt: continue that run into this (new) --output_dir, to a larger "
+                             "--total_tokens/--alg_tokens; every other argument must match. Needs --mod_table_resume "
+                             "auto and --lr_schedule constant")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (recommended for Linux only)")
     parser.add_argument(
         "--compile_dynamic",
@@ -4132,6 +4576,49 @@ def main():
 
     if args.mix_band_tokens is None:
         args.mix_band_tokens = int(0.5 * args.alg_tokens)
+    if args.mod_table_p is None and (args.mod_table_resume != "off" or args.mod_table_init_from
+                                     or args.mod_table_resume_fallback != "off"):
+        parser.error("--mod_table_resume / --mod_table_init_from / --mod_table_resume_fallback need --mod_table_p")
+    if args.mod_table_p is not None:
+        problems = []
+        if not args.fixed_data:
+            problems.append("--fixed_data")
+        if list(args.alg_tasks or []) != ["mod_add"]:
+            problems.append("--alg_tasks mod_add")
+        if args.total_tokens != args.alg_tokens:
+            problems.append("--total_tokens equal to --alg_tokens (no language phase)")
+        if args.mix_band_tokens != 0:
+            problems.append("--mix_band_tokens 0")
+        if args.mod_table_eval_every < 1 or args.grad_accum_steps < 1:
+            problems.append("--mod_table_eval_every >= 1")
+        try:
+            from tools.grok_bridge import check_modulus, parse_starts, parse_tasks
+            parse_starts(args.mod_table_start, parse_tasks(args.mod_table_tasks))
+            for t in parse_tasks(args.mod_table_tasks):
+                check_modulus(t, args.mod_table_p)
+        except ValueError as e:
+            problems.append(str(e))
+        # issue_triage.md: curriculum and grokfast change the objective; warmup_steps is wrong (#248); resume is
+        # broken (#138) and would follow the bridge's update-0 score
+        for flag, on in (("--use_task_curriculum", args.use_task_curriculum), ("--grokfast", args.grokfast),
+                         ("--warmup_steps", args.warmup_steps is not None), ("--resume_from", bool(args.resume_from))):
+            if on:
+                problems.append(f"no {flag}")
+        if args.mod_table_resume == "auto":
+            if args.mod_table_resume_every < 1:
+                problems.append("--mod_table_resume_every >= 1")
+            if args.num_workers != 0:
+                problems.append("--num_workers 0 with --mod_table_resume auto")
+        if args.mod_table_resume_fallback != "off" and args.mod_table_resume != "auto":
+            problems.append("--mod_table_resume auto with --mod_table_resume_fallback")
+        if args.mod_table_init_from:
+            if args.mod_table_resume != "auto":
+                problems.append("--mod_table_resume auto with --mod_table_init_from")
+            if args.lr_schedule != "constant":
+                problems.append("--lr_schedule constant with --mod_table_init_from (other schedules depend on "
+                                "--total_tokens)")
+        if problems:
+            parser.error("--mod_table_p needs: " + "; ".join(problems))
     train(args)
 
 
