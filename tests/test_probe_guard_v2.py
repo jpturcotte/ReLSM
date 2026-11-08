@@ -26,7 +26,8 @@ RUNNER_GREP = ("shed", "GIVING UP", "FAILED", "REFUSED", "GUARD", "low disk")  #
 class FakeProc:
     """One job's tree: a venv-style launcher (4 MB) at pid, the interpreter at pid+1 (memory
     ramps to ws_gb / commit_gb over ramp_s), an optional child at pid+2 and an optional stray at
-    pid+3 that outlives the root by stray_s."""
+    pid+3 that outlives the root by stray_s. `kids` adds more children at pid+10+i, each
+    (start s, lifetime s, ws GB[, private GB]): short helpers or one-after-another workers."""
 
     def __init__(self, fs, pid, spec):
         self.peak_cache = {}
@@ -48,6 +49,9 @@ class FakeProc:
             out[self.pid + 2] = (a, self._cut(a + s.get("child_s", 10)))
         if "stray_s" in s:
             out[self.pid + 3] = (self.t0 + 1, self._cut(self.end() + s["stray_s"]))
+        for i, k in enumerate(s.get("kids", ())):
+            a = self.t0 + k[0]
+            out[self.pid + 10 + i] = (a, self._cut(a + k[1]))
         return out
 
     def alive(self, pid, t=None):
@@ -61,6 +65,13 @@ class FakeProc:
         if not self.alive(pid, t):
             return 0, 0
         s = self.spec
+        if pid >= self.pid + 10:
+            k = s["kids"][pid - self.pid - 10]
+            if len(k) > 4:  # k[2] shared pages (dropped at k[5]), k[3] private touched at k[4]
+                shared = 0 if len(k) > 5 and t >= self.t0 + k[0] + k[5] else k[2]
+                touched = t >= self.t0 + k[0] + k[4]
+                return int((shared + (k[3] if touched else 0)) * GB), int(k[3] * GB)
+            return int(k[2] * GB), int((k[3] if len(k) > 3 else k[2]) * GB)
         if pid == self.pid + 3 and "stray_gb" in s:
             return int(s["stray_gb"] * GB), int(s["stray_gb"] * GB)
         if pid == self.pid or pid == self.pid + 3:
@@ -71,6 +82,15 @@ class FakeProc:
             f = min(1.0, (t - self.t0) / max(s.get("ramp_s", 10), 1e-9))
             return int(s.get("ws_gb", 1.0) * f * GB), int(s.get("commit_gb", 1.0) * f * GB)
         return int(s["child_gb"] * GB), int(s["child_gb"] * GB)
+
+    def private_ws(self, pid):
+        """Resident private bytes now."""
+        ws, private = self.mem(pid)
+        if pid >= self.pid + 10:
+            k = self.spec["kids"][pid - self.pid - 10]
+            if len(k) > 4:  # private untouched until k[4]
+                return private if self.fs.t >= self.t0 + k[0] + k[4] else 0
+        return min(ws, private)
 
     def poll(self):
         if self.returncode is None:
@@ -147,16 +167,20 @@ class FakeSystem:
             raise OSError("fake spawn failure")
         Path(out_path).write_text("")
         proc = FakeProc(self, self.next_pid, spec)
-        self.next_pid += 10
+        self.next_pid += 1000
         self.procs.append(proc)
         job = FakeJob(proc)
         self.jobs.append(job)
         self.spawned.append((name, self.t))
+        if spec.get("spawn_delay"):  # the guard held up between resuming the job and measuring it
+            self.sleep(spec["spawn_delay"])
         return proc, job
 
     def open_job_process(self, pid, job):
         if self.open_fails:
             raise RuntimeError("fake open failure")
+        if job.proc.spec.get("kids_unopenable") and pid >= job.proc.pid + 10:
+            return None  # access refused
         return (job, pid) if job.proc.alive(pid) else None
 
     def close(self, h):
@@ -173,6 +197,7 @@ class FakeSystem:
         if bad is not None and self.t >= job.proc.t0 + bad:
             return None
         ws, private = job.proc.mem(pid)
+        pws = None if job.proc.spec.get("no_private_ws") else job.proc.private_ws(pid)
         p = job.proc
         # the OS peak: every 0.05 s since the process started (kept per pid, so it stays cheap)
         i, peak = p.peak_cache.get(pid, (0, 0))
@@ -180,7 +205,10 @@ class FakeSystem:
         for k in range(i, n):
             peak = max(peak, p.mem(pid, p.t0 + k * 0.05)[0])
         p.peak_cache[pid] = (max(i, n), peak)
-        return {"ws": ws, "peak_ws": max(peak, ws), "private": private}
+        out = {"ws": ws, "peak_ws": max(peak, ws), "private": private}
+        if pws is not None:
+            out["private_ws"] = pws
+        return out
 
     def job_pids(self, job):
         bad = job.proc.spec.get("pids_unreadable_after")
@@ -189,6 +217,9 @@ class FakeSystem:
         return [pid for pid in job.proc.intervals() if job.proc.alive(pid)]
 
     def job_total_processes(self, job):
+        bad = job.proc.spec.get("count_fails_at")
+        if bad is not None and abs(self.t - (job.proc.t0 + bad)) < 0.01:
+            return None
         return sum(1 for a, b in job.proc.intervals().values() if a <= self.t)
 
     def job_peak_commit(self, job):
@@ -456,16 +487,16 @@ def test_measures_the_whole_tree(tmp_path):
     assert has(logs, "GUARD MEM a ok: peak_ws_gb=2.00") and has(logs, "procs 3/3")
 
 
-def test_child_between_samples_marks_partial(tmp_path):
-    spec = {"duration": 40, "ws_gb": 1.0, "child_gb": 3.0, "child_start": 5.1, "child_s": 0.1}
+def test_child_between_samples_is_covered(tmp_path):
+    # A 0.4 GB child that lived 0.1 s between two reads (4 GB/s, what this machine fills at)
+    # is never read, but the bound for that stretch covers it.
+    spec = {"duration": 40, "ws_gb": 1.0, "ramp_s": 1, "child_gb": 0.4, "child_start": 5.1, "child_s": 0.1}
     fs = FakeSystem({"a": spec}, ram=8.0)
     code, logs, hist = run(tmp_path, [job("a")], fs)
     r = hist.rows[-1]
-    assert r["complete"] is False and r["nprocs_total"] == 3 and r["nprocs_sampled"] == 2
-    assert r["peak_commit_gb"] >= 3.5  # the Job Object still saw the child's commit
-    assert has(logs, "(partial measurement)")
-    # ...so it is only a lower bound for the next estimate.
-    assert hist.peak("peak_ws_gb", 5, key=r["key"]) is None
+    assert r["complete"] is True and r["nprocs_total"] == 3 and r["nprocs_sampled"] == 2
+    assert r["nprocs_missed"] == 1 and r["peak_ws_gb"] >= 1.4
+    assert hist.peak("peak_ws_gb", 5, key=r["key"]) >= 1.4
 
 
 def test_strays_are_ended(tmp_path):
@@ -1011,12 +1042,13 @@ def test_short_spike_just_before_exit_is_measured(tmp_path):
     code, _, hist = run(tmp_path, [job("a")], fs)
     row = [r for r in hist.rows if r["name"] == "a"][-1]
     assert code == 0 and row["peak_ws_gb"] >= 6.0
-    # reading only every TICK_S misses it: this is the case the finer reads are for
+    # Reading only every 2 s never sees the spike; the bound for the stretch in which the
+    # process ended still covers it.
     (tmp_path / "hist.jsonl").unlink()
     fs = FakeSystem({"a": dict(spec)}, ram=12.0)
     code, _, hist = run(tmp_path, [job("a")], fs, MEAS_TICK_S=2.0)
     row = [r for r in hist.rows if r["name"] == "a"][-1]
-    assert code == 0 and row["peak_ws_gb"] < 6.0
+    assert code == 0 and row["peak_ws_sampled_gb"] < 6.0 and row["peak_ws_gb"] >= 6.0
 
 
 def test_meas_tick_must_be_positive():
@@ -1165,6 +1197,153 @@ def test_state_in_use_by_a_live_guard_is_refused(tmp_path):
         holder.communicate("\n", timeout=10)
 
 
+# ---------------------------------------------------------------- measuring real-shaped jobs
+# Real jobs start helpers that live less than one read (a git call, `python -c`, a venv
+# launcher of a child), and some run many children one after another (pytest, comparisons).
+# Every run on the real machine was marked partial because of the first; the second made the
+# summed peak several times the real one. These tests use those shapes.
+
+HELPERS = [(3.08 + 7 * i, 0.1, 0.02) for i in range(5)]  # 20 MB, 0.1 s, between two reads
+
+
+def test_short_helpers_do_not_make_a_run_partial(tmp_path):
+    fs = FakeSystem({"a": {"duration": 40, "ws_gb": 2.0, "commit_gb": 2.0, "kids": HELPERS}}, ram=8.0)
+    code, _, hist = run(tmp_path, [job("a")], fs)
+    r = hist.rows[-1]
+    assert code == 0 and r["nprocs_sampled"] < r["nprocs_total"]  # the helpers were never read
+    assert r["complete"] is True, r
+    need = pg.estimate(job("a"), hist, make_cfg(tmp_path))
+    # each unread helper is charged MISSED_START_GB on top of the exact peak commit
+    assert need["ram_source"].startswith("history:") and 2.0 <= need["ram_gb"] <= (2.0 + 0.1) * 1.1
+
+
+def test_a_missed_child_is_covered(tmp_path):
+    fs = FakeSystem({"a": {"duration": 40, "ws_gb": 1.0, "commit_gb": 1.0, "kids": [(20.1, 0.1, 0.4)]}}, ram=8.0)
+    code, _, hist = run(tmp_path, [job("a")], fs)
+    r = hist.rows[-1]
+    assert code == 0 and r["complete"] is True and r["peak_ws_gb"] >= 1.4, r
+
+
+def test_a_missed_child_is_covered_after_a_large_commit_worker(tmp_path):
+    # An earlier worker committed 4 GB but held little of it. The job's peak commit then says
+    # nothing about a later child, so the bound for the later stretch must come from the fill
+    # rate. A run that held 0.7 GB at once must not record less.
+    kids = [(2.0, 3.0, 0.1, 4.0), (20.1, 0.1, 0.4)]
+    fs = FakeSystem({"a": {"duration": 40, "ws_gb": 0.3, "commit_gb": 0.3, "kids": kids}}, ram=8.0)
+    code, _, hist = run(tmp_path, [job("a")], fs)
+    r = hist.rows[-1]
+    assert code == 0 and r["complete"] is True and r["peak_ws_gb"] >= 0.7, r
+
+
+def test_a_stretch_with_a_missed_child_is_bounded_while_the_job_runs(tmp_path):
+    # Read mid-run, before anything has ended, so only the bound for the stretch with the
+    # missed child can cover it. A process that commits 4 GB but holds 0.1 GB makes the job's
+    # peak commit loose, so that bound has to come from the fill rate.
+    fs = FakeSystem({"a": {"duration": 60, "ws_gb": 1.0, "ramp_s": 1, "commit_gb": 1.0,
+                           "kids": [(0.5, 59.0, 0.1, 4.0), (20.1, 0.1, 0.4)]}})
+    proc, jobobj = fs.spawn_in_job(["x"], {}, str(tmp_path / "a.jsonl"), str(tmp_path / "a.err"))
+    m = pg.TreeMeter(fs, proc.pid, jobobj)
+    while fs.t < 30:
+        m.sample()
+        fs.sleep(0.25)
+    r = m.result()
+    assert r["nprocs_missed"] == 1 and r["peak_ws_sampled_gb"] < 1.2 and r["peak_ws_gb"] >= 1.5, r
+
+
+def test_a_failed_process_count_makes_the_run_partial(tmp_path):
+    # Without the count for one stretch, processes that started and ended in it are unknown.
+    kids = [(10.05, 0.1, 1.5), (10.06, 0.1, 1.5), (10.07, 0.1, 1.5)]
+    fs = FakeSystem({"a": {"duration": 20, "ws_gb": 0.3, "kids": kids, "count_fails_at": 10.25}}, ram=8.0)
+    code, _, hist = run(tmp_path, [job("a")], fs)
+    r = hist.rows[-1]
+    assert code == 0 and r["complete"] is False and r["read_errors"] >= 1, r
+
+
+def test_shared_pages_come_from_resident_private_memory(tmp_path):
+    # A holds 3 GB of shared pages and 1.5 GB of private memory it has not touched yet. Between
+    # two reads it touches that memory while B (3 GB) starts, then ends. Private commit (1.5 GB)
+    # would hide part of A's shared pages (3 - 1.5); the resident private size (0) does not.
+    kids = [(5.0, 5.2, 3.0, 1.5, 5.05), (10.1, 4.9, 3.0)]
+    for no_pws in (False, True):  # without the resident private size: all of ws counts as shared
+        fs = FakeSystem({"a": {"duration": 20, "ws_gb": 0.3, "commit_gb": 0.3, "kids": kids,
+                               "no_private_ws": no_pws}}, ram=12.0)
+        (tmp_path / str(no_pws)).mkdir()
+        code, _, hist = run(tmp_path / str(no_pws), [job("a")], fs)
+        r = hist.rows[-1]
+        assert code == 0 and r["complete"] is True and r["peak_ws_gb"] >= 7.8, (no_pws, r)
+
+
+def test_shared_pages_seen_at_the_last_read_are_kept(tmp_path):
+    # A, read at both ends, holds 3 GB of shared pages at the first read, touches 1.5 GB of
+    # private memory while B (3 GB) runs, then drops the shared pages before the next read.
+    # About 7.8 GB at once; the newer read alone says A has no shared pages.
+    kids = [(5.0, 10.0, 3.0, 1.5, 5.05, 5.2), (9.9, 0.25, 3.0)]
+    fs = FakeSystem({"a": {"duration": 20, "ws_gb": 0.3, "commit_gb": 0.3, "kids": kids}}, ram=12.0)
+    code, _, hist = run(tmp_path, [job("a")], fs)
+    r = hist.rows[-1]
+    assert code == 0 and r["complete"] is True and r["peak_ws_gb"] >= 7.8, r
+
+
+def test_processes_before_the_meter_starts_are_covered(tmp_path):
+    # The guard is held up for 1.5 s between resuming the job and making its meter; a 6 GB
+    # child runs and ends in that time, next to a parent still ramping up (about 6.04 GB at once).
+    fs = FakeSystem({"a": {"duration": 10, "ws_gb": 0.3, "commit_gb": 0.3, "kids": [(0.2, 1.0, 6.0)],
+                           "spawn_delay": 1.5}}, ram=12.0)
+    code, _, hist = run(tmp_path, [job("a")], fs)
+    r = hist.rows[-1]
+    assert code == 0 and r["complete"] is True and r["peak_ws_gb"] >= 6.0, r
+
+
+def test_workers_overlapping_between_reads_are_added(tmp_path):
+    # Two 3 GB workers overlap for 0.05 s, with no read in it: each read sees only one.
+    kids = [(5.0, 5.1, 3.0), (10.05, 4.95, 3.0)]
+    fs = FakeSystem({"a": {"duration": 20, "ws_gb": 0.3, "commit_gb": 0.3, "kids": kids}}, ram=8.0)
+    code, _, hist = run(tmp_path, [job("a")], fs)
+    r = hist.rows[-1]
+    assert code == 0 and r["complete"] is True and r["peak_ws_gb"] >= 6.3, r
+
+
+def test_peak_is_the_largest_concurrent_total_not_a_sum_of_lifetimes(tmp_path):
+    # 30 workers of 1.5 GB, one after another, next to a 0.3 GB parent: about 1.8 GB at once.
+    kids = [(1.0 + 2 * i, 1.5, 1.5) for i in range(30)]
+    fs = FakeSystem({"a": {"duration": 65, "ws_gb": 0.3, "commit_gb": 0.3, "kids": kids}}, ram=8.0)
+    code, _, hist = run(tmp_path, [job("a")], fs)
+    r = hist.rows[-1]
+    assert code == 0 and r["complete"] is True
+    assert 1.8 <= r["peak_ws_gb"] <= 1.9, r  # the old sum read 45 GB
+
+
+def test_back_to_back_workers_are_not_added(tmp_path):
+    # Each worker starts the moment the last one ends: a read sees one, then the next.
+    kids = [(1.0 + 1.5 * i, 1.5, 1.5) for i in range(20)]
+    fs = FakeSystem({"a": {"duration": 35, "ws_gb": 0.3, "commit_gb": 0.3, "kids": kids}}, ram=8.0)
+    code, _, hist = run(tmp_path, [job("a")], fs)
+    r = hist.rows[-1]
+    assert code == 0 and r["complete"] is True
+    assert 1.8 <= r["peak_ws_gb"] <= 1.9, r
+
+
+def test_a_child_alive_but_never_read_keeps_the_run_partial(tmp_path):
+    fs = FakeSystem({"a": {"duration": 20, "ws_gb": 0.3, "kids": [(5.0, 3.0, 1.0)],
+                           "kids_unopenable": True}}, ram=8.0)
+    code, _, hist = run(tmp_path, [job("a")], fs)
+    r = hist.rows[-1]
+    assert code == 0 and r["complete"] is False and "never read" in " ".join(r["partial_why"])
+
+
+def test_old_rows_keep_their_summed_peak_as_a_lower_bound(tmp_path):
+    # Before measure 2, peak_ws_gb summed lifetime peaks. That can be many times what a job held
+    # at once, but it can also be one process's real spike that no read saw; nothing in the
+    # row tells them apart, so it stays a lower bound. A study that wants to drop old rows
+    # starts a new history file.
+    rows = [{"name": "a", "key": "fake_job.py|a", "family": "fake_job.py", "outcome": "failed",
+             "complete": False, "peak_ws_gb": 10.1, "peak_ws_sampled_gb": 1.77, "peak_commit_gb": 4.4}]
+    (tmp_path / "hist.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    cfg = make_cfg(tmp_path)
+    need = pg.estimate(job("a"), pg.History(cfg.GUARD_MEM_HISTORY), cfg)
+    assert need["ram_gb"] == pytest.approx(10.1 * 1.1, abs=0.01)
+
+
 # ---------------------------------------------------------------- the real machine (Windows only)
 
 win = pytest.mark.skipif(os.name != "nt", reason="Windows Job Objects")
@@ -1173,6 +1352,31 @@ CHILD = ("import subprocess, sys, time\n"
          "x = b'\\x01' * (150 << 20)\n"
          "subprocess.run([sys.executable, '-c', \"y = b'\\\\x01' * (100 << 20); import time; time.sleep(2.5)\"])\n"
          "time.sleep(0.5)\n")
+
+
+@win
+def test_real_memory_read_falls_back_when_ex2_is_refused():
+    # On Windows without PROCESS_MEMORY_COUNTERS_EX2 the call fails for its size; the read must
+    # retry with the older size and report no resident private size, not raise.
+    w = pg.WinSystem()
+    real = w.k
+
+    class OnlyEx:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def K32GetProcessMemoryInfo(self, h, p, cb):
+            return 0 if cb == pg.ctypes.sizeof(pg._MemCounters) else real.K32GetProcessMemoryInfo(h, p, cb)
+
+    h = real.OpenProcess(w.QUERY | w.VM_READ, False, os.getpid())
+    try:
+        assert "private_ws" in w.process_memory(h)
+        w.k = OnlyEx()
+        m = w.process_memory(h)
+    finally:
+        w.k = real
+        real.CloseHandle(h)
+    assert m is not None and "private_ws" not in m and m["ws"] > 0 and m["private"] > 0
 
 
 @win
@@ -1229,6 +1433,32 @@ def test_real_plan_end_to_end(tmp_path):
     r = hist.rows[-1]
     assert r["outcome"] == "ok" and r["complete"] and r["peak_ws_gb"] >= 0.24, r
     assert json.loads((tmp_path / "hist.jsonl").read_text().splitlines()[-1])["name"] == "tiny"
+
+
+HELPER_CHILD = ("import subprocess, sys, time\n"
+                "x = b'\\x01' * (200 << 20)\n"
+                "for _ in range(4):\n"
+                "    subprocess.run([sys.executable, '-c', 'pass'])  # a quick helper, like a git call\n"
+                "time.sleep(1.5)\n")
+
+
+@win
+def test_real_job_with_quick_helpers_is_measured_and_used(tmp_path):
+    # What the real jobs do: start helpers that exit before the guard can read them. Two runs
+    # must give full measurements, and the next estimate must come from them, not the default.
+    cfg = make_cfg(tmp_path, ADMIT_RAM_FLOOR_GB=0.0, MIN_COMMIT_GB=0.0, MIN_DISK_GB=0.5, EMERG_COMMIT_GB=0.0,
+                   EMERG_RAM_GB=0.0, START_GAP_S=0.0, TICK_S=0.5, STRAY_WAIT_S=5.0)
+    hist = pg.History(cfg.GUARD_MEM_HISTORY)
+    plan = [{"name": "helpers", "cmd": ["-c", HELPER_CHILD]}]
+    for _ in range(2):
+        logs = []
+        assert pg.run_plan(plan, str(tmp_path / "out"), pg.WinSystem(), cfg, hist, logs.append) == 0, logs
+    rows = hist.rows[-2:]
+    assert all(r["outcome"] == "ok" and r["complete"] for r in rows), rows
+    assert any(r["nprocs_sampled"] < r["nprocs_total"] for r in rows), rows  # helpers were missed
+    need = pg.estimate(plan[0], hist, cfg)
+    assert need["ram_source"].startswith("history:"), need
+    assert 0.2 <= need["ram_gb"] < 1.0, need
 
 
 @win

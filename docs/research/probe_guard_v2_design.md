@@ -39,13 +39,19 @@ work happens in its child. Any per-job number must cover the whole process tree.
 
 For RAM (`peak_ws_gb`) and commit (`peak_commit_gb`) separately:
 
-1. **Measured base.** Full measurements are finished runs whose measurement saw every process
-   of the tree. Take the largest peak among the last `HISTORY_N` (5) full measurements for the
+1. **Measured base.** Full measurements are finished runs whose measurement covers the tree
+   (see "When a run counts as fully measured" below). Take the largest peak among the last `HISTORY_N` (5) full measurements for the
    job's key, else for its family, times `1 + NEED_MARGIN` (1.10).
 2. **Lower bounds.** Rows for the key from failed, shed or timed-out runs, and finished runs
    that were only partly measured, show at least that much was needed. All of them count,
    however old (a new `mem_key` starts afresh). They can raise the need and never lower it,
-   so a lone startup crash (tiny peak) leaves the default in place.
+   so a lone startup crash (tiny peak) leaves the default in place. Rows written before
+   `measure: 2` keep their `peak_ws_gb` as a lower bound, though it was then a sum of
+   lifetime peaks: it can be several times what was held at once, but it can also be one
+   process's real spike that no read saw, and nothing in the row tells the two apart. A
+   study that wants to drop such rows starts a new `GUARD_MEM_HISTORY` file.
+   A job with two or more recorded runs and no full measurement gets a `GUARD WARNING` that
+   names the last reason, so a need stuck on the default is visible in the log.
 3. **Declared.** Plan fields `ram_gb`, `commit_gb`. A declared value is used when it is at
    least everything measured for the job (full measurements and lower bounds, even a lower
    bound below the default). If it is lower, the undeclared estimate wins, with a warning,
@@ -131,18 +137,26 @@ write short; see "Chains and jobs that must not be retried" for how the next gua
 
 Every `MEAS_TICK_S` (0.25 s) the guard reads the Job Object's process list, opens each new process,
 checks on the open handle that it really is in the job (so a reused pid can't add a
-stranger), and reads `K32GetProcessMemoryInfo`. A failed open is retried while the pid is
-still listed. A read that fails while the process is alive counts as a read error. These reads
+stranger), and reads `K32GetProcessMemoryInfo` with `PROCESS_MEMORY_COUNTERS_EX2`: working
+set, peak working set, private commit and resident private size (`PrivateWorkingSetSize`).
+Where Windows rejects `_EX2` (older versions), it reads `PROCESS_MEMORY_COUNTERS_EX`
+without the resident private size, and the bound below then counts each process's whole
+working set as possibly shared, so `peak_ws_gb` comes out higher. A failed open is retried
+while the pid is still listed. A read that fails while the process is alive counts as a read error. These reads
 run between the decisions, which stay every `TICK_S` (2 s): peaks can only be read while a
 process is alive, and the jobs in "Why" spike for about 2 s right before they exit, which a
 read every 2 s can miss. Recorded per job:
 
 | field | meaning |
 |---|---|
-| `peak_ws_gb` | sum over the tree of each process's `PeakWorkingSetSize`, read while it was alive (the RAM need) |
+| `peak_ws_gb` | the RAM need: the largest bound on the RAM the tree held at once (see "How the RAM peak is bounded") |
+| `peak_ws_sum_gb` | sum of every process's lifetime peak (the pre-`measure: 2` `peak_ws_gb`); kept to compare |
 | `peak_ws_sampled_gb` | largest sum of current `WorkingSetSize` seen in one sample |
+| `peak_private_sampled_gb` | largest sum of current private commit seen in one sample |
 | `peak_commit_gb` | the Job Object's `PeakJobMemoryUsed`: exact tree-wide peak private commit (the commit need) |
-| `nprocs_total`, `nprocs_sampled`, `complete` | processes the job ever had (Job Object accounting), how many were sampled alive, and whether that is all of them |
+| `nprocs_total`, `nprocs_sampled`, `nprocs_missed` | processes the job ever had (Job Object accounting), how many were read alive, how many never were (most of them start and end between two reads) |
+| `complete`, `partial_why` | whether the run counts as fully measured, and if not, why |
+| `measure` | 2 for rows with the measurement above (rows without it summed lifetime peaks) |
 | `ram_before_gb`, `ram_min_gb`, `ram_after_gb` | free RAM at admission, lowest while running, right after the tree ended |
 | `commit_before_gb`, `commit_min_gb`, `commit_after_gb` | same for free commit |
 | `commit_limit_growth_gb` | how much the system commit limit grew while it ran (the page file grew) |
@@ -176,21 +190,85 @@ the jobs (`KILL_ON_JOB_CLOSE`).
 Limits of the measurement:
 
 - Peaks must be read while the process is alive. After exit, Windows reports a peak working
-  set of about 4 MB and a peak commit of 0 (measured), so growth in a process's last
-  0.25 s is missed. Commit is not affected: the Job Object keeps its own peak.
-- A process that lives less than 0.25 s may not be sampled for working set. Its commit is
-  still in the Job Object peak, and the row is marked `complete: false`, so it only counts as
-  a lower bound.
-- `peak_ws_gb` is neither a guaranteed upper nor lower bound on the draw on free RAM. It
-  sums per-process peaks that may not have happened at the same moment, and it includes
-  shared, file-backed pages (DLLs, CUDA libraries). It can also miss a spike in the last
-  0.25 s.
+  set of about 4 MB and a peak commit of 0 (measured). Commit is not affected: the Job
+  Object keeps its own peak. Growth after a process's last read is covered by the bound below.
+- A process that lives less than 0.25 s may never be read. Real jobs start such processes
+  all the time: a venv `python.exe` launcher whose child exits at once, a `git` call, a
+  `python -c` helper. The bound below covers them too.
+- `peak_ws_gb` is meant as an upper bound on what the tree held at once, but it rests on
+  three assumptions: a process can't touch new memory faster than `FILL_GB_PER_S`; a
+  process that was never read has at most `MISSED_START_GB` of shared pages; and a process
+  read before maps no new shared pages after its last read (see below). It includes
+  shared, file-backed pages (DLLs, CUDA libraries), which mostly don't take free RAM, so it
+  can overstate the draw on free RAM. Processes that ran one after another are not added
+  together.
   `ram_before_gb - ram_min_gb` is logged next to it (other programs move that number too),
   so a later study can judge it. Until a job family has a few measured runs, declare its
   need, both RAM and commit; for the jobs in "Why", `ram_gb: 4.5` and `commit_gb: 6.6`
   (their 6.0 GB private peak plus the 10% margin; commit alone at the 3 GB default would
   admit them with too little room for the final check).
 - `peak_commit_gb` covers the job's tree only, not commit that other programs take meanwhile.
+
+#### How the RAM peak is bounded
+
+At each read the guard adds up the peaks so far (`PeakWorkingSetSize`) of the processes it
+read. A process read at both ends of a stretch is covered by its peak so far. Three things
+can happen between two reads that one read can't see: a process starts and ends unseen
+(counted from the Job Object's process total, read before each list and after it, so the
+count can be one too high but never too low); a process read last time grows and ends; and
+processes seen only at one end each overlap. For such a stretch the guard takes two upper
+bounds on the RAM in use and keeps the smaller one:
+
+- **fill bound**: the peaks of every process read at either end, plus, for each process
+  never read or ended since its last read, `MISSED_START_GB` (0.05) and `FILL_GB_PER_S` (8)
+  times how long it could have gone unread. Measured on this machine (2026-11-08), a new
+  process fills fresh memory at 3.3-4.3 GB/s; 8 is about twice that.
+- **commit bound**: the Job Object's exact peak commit so far, which counts every process
+  read or not, plus the shared pages of the processes read (working set minus its resident
+  private part, `PrivateWorkingSetSize`; private commit can't stand in for that part, since
+  it counts memory not touched yet; where Windows doesn't report it, the whole working set),
+  plus `MISSED_START_GB` for each process never read. RAM in use is private memory, which
+  commit covers, plus shared pages.
+
+The commit bound takes the shared pages of the processes read as they were at the two reads,
+the larger of the two for a process read at both. It
+does not allow for shared pages a process maps after its last read and before it ends (a
+file mapped in its last 0.25 s). That is a deliberate choice: such pages are file-backed, so
+Windows can drop them under pressure without writing to the page file, while allowing for
+them would add up to 2 GB for every process that ends, so needs would sit far above what
+jobs hold. Private memory growing in that window is covered, by the exact peak commit.
+
+The first stretch starts at the time read just before the job is launched, which the guard
+passes to the job's meter. The meter itself is made only after the job has been resumed, so
+a stretch starting there would miss processes that ran and ended in between.
+
+A stretch whose process count could not be read counts as a read error, so the run is
+partial: processes that started and ended in it are unknown.
+
+`peak_ws_gb` is the largest of these over the run. Most of the time the commit bound is the
+smaller one, so `peak_ws_gb` comes out near the peak commit plus shared pages. The fill
+bound counts when the peak commit is loose, for example after a process that committed far
+more than it touched.
+
+#### When a run counts as fully measured
+
+A run is fully measured (`complete: true`) when the process count and the Job Object's peak
+commit were read, no reads failed, no processes had to be ended, and no process stayed
+listed for two reads or more without being read (that one was alive too long for the bound
+above). Processes that started and ended between reads no longer make a run partial: the
+bound covers them.
+
+Measured on this machine (2026-11-08), through the real guard: jobs that start quick
+helpers (`python -c pass` four times, six `git --version` calls, a short child) never read
+1 to 5 of their processes. All were fully measured, and the second run's estimate came from
+history. Their `peak_ws_gb` was 0.01-0.16 GB above the peak commit. Six 250 MB workers run
+one after another gave 0.28 GB, where the old sum gave 1.54 GB.
+
+Before this rule, a run counted as fully measured only if every process was read. On the
+real machine no run ever was: all 31 rows of the first studies were partial, from 1 missed
+process out of 3 (a comparison script) to 45 out of 179 (a Codex session). So every job got
+the default need. And `peak_ws_gb` summed lifetime peaks, up to 10 GB for a job that held
+1.8 GB at once.
 
 ### 4. Shedding only in an emergency
 
@@ -379,6 +457,6 @@ The hash-locked runner and v1 guard stay as they are. In the new study:
 
 - `ADMIT_TIMEOUT` default: `fail` never runs a job under pressure but can leave jobs for the
   next session on a busy machine; `start` runs them and relies on the emergency rules.
-- If `peak_ws_gb` proves much larger than what a job really draws, jobs will wait longer
-  than they need to. The log also records the drop in free RAM. Admitting on that drop
+- If `peak_ws_gb` proves much larger than what a job really draws (it counts shared DLL
+  pages, and its bound can sit near the peak commit), jobs will wait longer than they need to. The log also records the drop in free RAM. Admitting on that drop
   instead would be unsafe, because other programs on the machine move it too.

@@ -146,14 +146,18 @@ class History:
         runs whose measurement saw every process (full measurements). complete=False: every
         other row of any age (failed, shed, timed out, partly measured): lower bounds, kept
         until the key changes. A missing or malformed number is skipped, never read as 0."""
-        rows = [r for r in self.rows
-                if _finite_nonneg(r.get(field))
-                and (r.get("outcome") == "ok" and r.get("complete") is True) == complete
-                and (key is None or r.get("key") == key)
-                and (family is None or r.get("family") == family)]
+        vals = []
+        for r in self.rows:
+            if ((r.get("outcome") == "ok" and r.get("complete") is True) != complete
+                    or (key is not None and r.get("key") != key)
+                    or (family is not None and r.get("family") != family)):
+                continue
+            v = r.get(field)
+            if _finite_nonneg(v):
+                vals.append(v)
         if complete:
-            rows = rows[-n:]
-        return max(r[field] for r in rows) if rows else None
+            vals = vals[-n:]
+        return max(vals) if vals else None
 
 
 def job_family(job):
@@ -210,10 +214,33 @@ def estimate(job, hist, cfg):
                 out["warnings"].append(f"{job['name']}: declared {declared}={d:.2f} is below the measured "
                                        f"{seen:.2f} GB; using {val:.2f} GB (set mem_override to keep it)")
         out[f"{kind}_gb"], out[f"{kind}_source"] = round(val, 3), src
+    if out["ram_source"] in ("default",) or out["ram_source"].startswith("lower-bound"):
+        runs = [r for r in hist.rows if r.get("key") == key]
+        if len(runs) >= 2 and not any(r.get("outcome") == "ok" and r.get("complete") is True for r in runs):
+            last = next((r for r in reversed(runs) if r.get("partial_why")), runs[-1])
+            out["warnings"].append(f"{job['name']}: {len(runs)} runs recorded but none fully measured "
+                                   f"(last: {'; '.join(last.get('partial_why') or ['measured before v2'])}); "
+                                   f"its RAM need is {out['ram_source']}, not measured")
     return out
 
 
 # ---------------------------------------------------------------- measuring a job's tree
+
+# Between two reads, processes can start and end unseen (a venv launcher's quick child, a git
+# call), a process read last time can grow before it ends, and processes read only at one end
+# can overlap. Each stretch between two reads gets two upper bounds on the RAM in use, and
+# the smaller one counts:
+#   fill bound: the peaks so far of every process read at either end, plus, for each process
+#     never read or ended since its last read, MISSED_START_GB and FILL_GB_PER_S times how long
+#     it could have gone unread (a process can't touch new memory faster; measured 3.3-4.3 GB/s
+#     on this machine, doubled);
+#   commit bound: the Job Object's exact peak commit so far, which counts every process read or
+#     not, plus the shared pages of the processes read and MISSED_START_GB for each one never
+#     read (RAM in use is private memory, which commit covers, plus shared pages).
+FILL_GB_PER_S = 8.0
+MISSED_START_GB = 0.05
+MEASURE_VERSION = 2  # rows from v2 onward: peak_ws_gb is the bounded concurrent peak, not a sum
+
 
 class TreeMeter:
     """Measures one job's process tree through its Job Object (every process the job starts
@@ -222,7 +249,7 @@ class TreeMeter:
     pids() returns None when the Job Object can not be read: callers treat that as "not
     known to be empty", never as empty."""
 
-    def __init__(self, system, pid, job):
+    def __init__(self, system, pid, job, t_start=None):
         self.sys, self.pid, self.job = system, pid, job
         self.handles = {}       # pid -> handle of a process verified to be in the job (or None)
         self.peak_ws = {}       # pid -> largest PeakWorkingSetSize read while alive (bytes)
@@ -230,6 +257,16 @@ class TreeMeter:
         self.private_now = 0    # current tree private commit (bytes)
         self.ws_sampled_peak = 0
         self.private_sampled_peak = 0
+        self.ws_conc_peak = 0   # largest bound on the RAM in use at once (see FILL_GB_PER_S)
+        # the last read, or the moment before the job was launched: processes can run before
+        # this meter exists, and the first stretch must cover them
+        self.t_prev = system.now() if t_start is None else t_start
+        self.read_prev = {}     # pid -> (peak_ws so far, shared pages) at the last read
+        self.total_prev = 0     # process count read just before the last read's list
+        self.listed = set()     # every pid ever listed in the job
+        self.unread = {}        # pid listed but never read -> (times listed, earliest it could have started)
+        self.unread_long = set()  # listed at two reads or more, never read
+        self.missed = 0         # processes never listed: started and ended between two reads
         self.samples = 0
         self.read_errors = 0
         self.forced = False     # processes had to be ended after the job's root exited
@@ -243,11 +280,16 @@ class TreeMeter:
         return p
 
     def sample(self):
+        before = self.sys.job_total_processes(self.job) if self.job else None
         live = self.pids()
         if live is None:
             return self.ws_now  # keep the last numbers; this sample says nothing
-        ws = private = 0
+        ws = private = new = 0
+        cur = {}
         for pid in live:
+            if pid not in self.listed:
+                self.listed.add(pid)
+                new += 1
             if self.handles.get(pid) is None:
                 # Membership is checked on the open handle, so a pid reused between the list
                 # and the open can not add a stranger's memory. A failed open is retried on
@@ -255,21 +297,76 @@ class TreeMeter:
                 self.handles[pid] = self.sys.open_job_process(pid, self.job)
             h = self.handles[pid]
             if h is None:
+                self._not_read(pid)
                 continue  # exited before it could be opened, or not openable: never sampled
             mem = self.sys.process_memory(h)
             if not self.sys.process_running(h):
+                self._not_read(pid)
                 continue  # exited before or during the read: its numbers are not real
             if mem is None:
                 self.read_errors += 1  # alive but unreadable: this measurement is partial
+                self._not_read(pid)
                 continue
             ws += mem["ws"]
             private += mem["private"]
             self.peak_ws[pid] = max(self.peak_ws.get(pid, 0), mem["peak_ws"])
+            # Shared pages are the working set minus its resident private part. Private commit
+            # can't stand in for that part (it counts memory not yet touched), so without the
+            # resident private size the whole working set counts as possibly shared.
+            pws = mem.get("private_ws")
+            cur[pid] = (self.peak_ws[pid], mem["ws"] - min(pws, mem["ws"]) if pws is not None else mem["ws"])
+            self.unread.pop(pid, None)
         self.samples += 1
+        self._bound(cur, set(live), new, before)
         self.ws_now, self.private_now = ws, private
         self.ws_sampled_peak = max(self.ws_sampled_peak, ws)
         self.private_sampled_peak = max(self.private_sampled_peak, private)
         return ws
+
+    def _not_read(self, pid):
+        if pid in self.peak_ws:
+            return  # read before: it ended, which _bound covers
+        n, t = self.unread.get(pid, (0, self.t_prev))
+        self.unread[pid] = (n + 1, t)
+        if n + 1 >= 2:
+            self.unread_long.add(pid)
+
+    def _bound(self, cur, live, new, before):
+        """Raise ws_conc_peak to cover this read and the stretch since the last one."""
+        now = self.sys.now()
+        after = self.sys.job_total_processes(self.job) if self.job else None
+        commit = self.sys.job_peak_commit(self.job) if self.job else None
+        gap = max(0.0, now - self.t_prev)
+        # A process's peak so far also covers a spike between reads while it was read at both
+        # ends; processes alive together are added, ones that ran one after another are not.
+        conc = sum(p for p, _ in cur.values())
+        # Started since the count before the last list, and not listed now or before: started
+        # and ended unseen. Counts are read before the last list and after this one, so this
+        # can overcount by a process that started during a read, never undercount.
+        if self.job and (before is None or after is None):
+            self.read_errors += 1  # a stretch without a count: missed processes are unknown
+        missed = max(0, after - self.total_prev - new) if after is not None else 0
+        ended = [pid for pid in self.read_prev if pid not in cur]
+        gone = [pid for pid in self.unread if pid not in live]
+        if missed or ended or gone:
+            unread_s = (missed + len(ended)) * gap + sum(now - self.unread.pop(p)[1] for p in gone)
+            # a process read at both ends keeps its newer peak and the larger shared count:
+            # shared pages seen at the last read may have been held into the stretch
+            union = dict(self.read_prev)
+            for pid, (p, sh) in cur.items():
+                union[pid] = (p, max(sh, union[pid][1])) if pid in union else (p, sh)
+            fill = (sum(p for p, _ in union.values())
+                    + (unread_s * FILL_GB_PER_S + (missed + len(gone)) * MISSED_START_GB) * GB)
+            bound = fill
+            if commit:
+                shared = sum(sh for _, sh in union.values())
+                bound = min(fill, commit + shared + (missed + len(gone)) * MISSED_START_GB * GB)
+            conc = max(conc, bound)
+        self.missed += missed
+        self.ws_conc_peak = max(self.ws_conc_peak, conc)
+        self.t_prev, self.read_prev = now, cur
+        if before is not None:
+            self.total_prev = before
 
     def kill(self, deadline):
         """End every process in the job. True only once the job is known to be empty; gives
@@ -289,17 +386,35 @@ class TreeMeter:
         total = self.sys.job_total_processes(self.job) if self.job else None
         peak_commit = self.sys.job_peak_commit(self.job) if self.job else None
         sampled = len(self.peak_ws)
+        missed = max(0, total - sampled) if total else None
+        why = []
+        if not total:
+            why.append("process count unknown")
+        if not peak_commit:
+            why.append("no peak commit")
+        if self.forced:
+            why.append("processes had to be ended")
+        if self.read_errors:
+            why.append(f"{self.read_errors} read error(s)")
+        if self.unread_long:
+            # listed at two reads or more but never read: alive too long for the bound on
+            # processes that start and end between reads
+            why.append(f"{len(self.unread_long)} process(es) alive but never read")
         return {
-            "peak_ws_gb": round(sum(self.peak_ws.values()) / GB, 3) if self.peak_ws else None,
+            "measure": MEASURE_VERSION,
+            "peak_ws_gb": round(self.ws_conc_peak / GB, 3) if self.peak_ws else None,
+            "peak_ws_sum_gb": round(sum(self.peak_ws.values()) / GB, 3) if self.peak_ws else None,
             "peak_ws_sampled_gb": round(self.ws_sampled_peak / GB, 3) if self.peak_ws else None,
+            "peak_private_sampled_gb": round(self.private_sampled_peak / GB, 3) if self.peak_ws else None,
             "peak_commit_gb": round(peak_commit / GB, 3) if peak_commit else None,
             "nprocs_total": total,
             "nprocs_sampled": sampled,
+            "nprocs_missed": missed,
             "samples": self.samples,
             "read_errors": self.read_errors,
             "forced_end": self.forced,
-            "complete": (bool(total) and sampled == total and bool(peak_commit)
-                         and not self.forced and self.read_errors == 0),
+            "complete": not why,
+            "partial_why": why,
         }
 
     def close(self):
@@ -332,11 +447,14 @@ if os.name == "nt":
             "SystemCache", "KernelTotal", "KernelPaged", "KernelNonpaged", "PageSize")] + [
             ("HandleCount", W.DWORD), ("ProcessCount", W.DWORD), ("ThreadCount", W.DWORD)]
 
-    class _MemCounters(ctypes.Structure):  # PROCESS_MEMORY_COUNTERS_EX
+    class _MemCounters(ctypes.Structure):  # PROCESS_MEMORY_COUNTERS_EX2 (newer Windows; else _EX)
         _fields_ = [("cb", W.DWORD), ("PageFaultCount", W.DWORD)] + [(n, ctypes.c_size_t) for n in (
             "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
             "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage",
-            "PeakPagefileUsage", "PrivateUsage")]
+            "PeakPagefileUsage", "PrivateUsage", "PrivateWorkingSetSize")] + [
+            ("SharedCommitUsage", ctypes.c_uint64)]
+
+    _MEM_EX_SIZE = _MemCounters.PrivateWorkingSetSize.offset  # PROCESS_MEMORY_COUNTERS_EX
 
     class _BasicLimit(ctypes.Structure):  # JOBOBJECT_BASIC_LIMIT_INFORMATION
         _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
@@ -518,6 +636,10 @@ class WinSystem:
     def process_memory(self, h):
         m = _MemCounters()
         m.cb = ctypes.sizeof(_MemCounters)
+        if self.k.K32GetProcessMemoryInfo(h, ctypes.byref(m), m.cb):
+            return {"ws": m.WorkingSetSize, "peak_ws": m.PeakWorkingSetSize, "private": m.PrivateUsage,
+                    "private_ws": m.PrivateWorkingSetSize}
+        m.cb = _MEM_EX_SIZE  # older Windows: no resident private size
         if not self.k.K32GetProcessMemoryInfo(h, ctypes.byref(m), m.cb):
             return None
         return {"ws": m.WorkingSetSize, "peak_ws": m.PeakWorkingSetSize, "private": m.PrivateUsage}
@@ -1104,6 +1226,7 @@ def _loop(plan, out_dir, stop_file, system, cfg, hist, log):
         try:
             if dirs:  # written before launch, so a guard killed later leaves it behind
                 active = note_active(cfg, lock_path, job["name"], dirs)
+            t_launch = system.now()
             proc, jobobj = system.spawn_in_job([PY] + [str(c) for c in job["cmd"]], env,
                                                os.path.join(out_dir, job["name"] + ".jsonl"),
                                                os.path.join(out_dir, job["name"] + ".err"),
@@ -1116,7 +1239,7 @@ def _loop(plan, out_dir, stop_file, system, cfg, hist, log):
             end_chain(job, "failed to start", False, failed)
             return
         try:
-            meter = TreeMeter(system, proc.pid, jobobj)
+            meter = TreeMeter(system, proc.pid, jobobj, t_launch)
             meter.sample()
             run = Run(entry, proc, meter, need, system.now(), r)
             run.active, run.active_dirs = active, dirs
