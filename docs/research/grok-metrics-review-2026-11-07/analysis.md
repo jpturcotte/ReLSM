@@ -1,5 +1,7 @@
 # Grokking criteria and better metrics: an analysis (2026-11-07)
 
+> **Read `report.md` first (added 2026-11-08).** It has the checked numbers and the final recommendations. This analysis is left as written. `recheck_2026-11-07.md` lists the corrections it needs, and `dmul_100k_prediction.md` registers the D_mul forecast.
+
 **Question (owner):** we did research before on grokking signs or criteria. Is it still relevant? Are there better metrics? Which would help the project in general, not just for grokking?
 
 **Data used:** the 48 phase 1 runs of the task × format study (`grok_runs/taskfmt_2026-11-07/runs`), the 6 reused add runs (`format_2026-11-05/runs/{TA,D}_s0-2`), and the 15 E1 runs (`e1_2026-11-02`) as an out-of-sample check. Everything was computed from `metrics.jsonl`, `final_errors.json` and `split_counts.json`, with stdlib and numpy only. No torch, no checkpoints. The script is `curve_metrics.py` in this folder; its full output is `curve_results.json`. Step notes are in `progress.md`.

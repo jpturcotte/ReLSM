@@ -221,7 +221,8 @@ The recheck lists 26 numbered items. These change meaning:
 | File | What it is |
 |---|---|
 | `report.md` | this consolidated report |
-| `analysis.md` | the original analysis, unedited |
+| `dmul_100k_prediction.md` | the registered D_mul 100k forecasts and how they are scored |
+| `analysis.md` | the original analysis; unedited except a pointer line at the top |
 | `curve_metrics.py`, `curve_results.json` | the analysis's script and output |
 | `progress.md` | the analysis's step notes |
 | `recheck_2026-11-07.md` | the full recheck: number-by-number audit, literature audit, new literature, the three lists, 26 corrections, red-team table |
