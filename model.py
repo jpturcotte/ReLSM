@@ -1074,6 +1074,10 @@ def create_model(
 # Size presets. Values not listed come from TransformerConfig's defaults.
 PRESETS: Dict[str, Dict[str, Any]] = {
     "nano": dict(d_model=512, n_layers=6, n_heads=8),
+    # tools/grok_lab.py's model (d_ff from the Llama rule = 512), for the train.py bridge runs
+    "grok": dict(d_model=128, n_layers=2, n_heads=4),
+    # the task x format study's depth arm: grok with 4 layers
+    "grok4": dict(d_model=128, n_layers=4, n_heads=4),
     "50M": dict(d_model=512, n_layers=8, n_heads=8),
     "125M": dict(d_model=768, n_layers=12, n_heads=12),
     "350M": dict(d_model=1024, n_layers=24, n_heads=16),

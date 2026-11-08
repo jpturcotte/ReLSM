@@ -320,7 +320,28 @@ def build_model(args):
         model = BaselineTransformer(cfg)
     if args.no_final_norm:
         model.norm = nn.Identity()
+    # --dropout_sites: zero the rate at the sites left out (each site reads its own nn.Dropout.p);
+    # older run records have no such arg, which means every site
+    sites = getattr(args, "dropout_sites", "all")
+    if sites != "all":
+        keep = set(sites.split(","))
+        if "emb" not in keep:
+            model.drop.p = 0.0
+        for blk in model.layers:
+            if "attn" not in keep:
+                blk.attn.attn_dropout.p = 0.0
+            if "ff" not in keep:
+                blk.ff.dropout.p = 0.0
     return model
+
+
+def dropout_rates(model):
+    """The dropout rate at each site, as the model will use it."""
+    out = {"emb": model.drop.p}
+    for li, blk in enumerate(model.layers):
+        out[f"attn{li}"] = blk.attn.attn_dropout.p
+        out[f"ff{li}"] = blk.ff.dropout.p
+    return out
 
 
 def decays(name, scope):
@@ -1023,6 +1044,7 @@ def run(args):
         "seed": args.seed, "split_seed": split_seed, "threads": torch.get_num_threads(),
         "float32_matmul_precision": torch.get_float32_matmul_precision(),
         "model_config": dataclasses.asdict(model.config), "init_std": 0.02,  # model.py _init_weights
+        "dropout_rates": dropout_rates(model),
         "cudnn_deterministic": torch.backends.cudnn.deterministic, "cudnn_benchmark": torch.backends.cudnn.benchmark,
         "reproducibility": "CPU runs with pinned threads repeat exactly (T6). CUDA runs are not bitwise "
                            "deterministic; same-seed GPU reruns can drift apart, most visibly after a loss spike.",
@@ -1163,6 +1185,8 @@ def parse_args(argv=None):
     ap.add_argument("--untie", action="store_true", help="separate output head (default: tied to the embedding)")
     ap.add_argument("--no_final_norm", action="store_true")
     ap.add_argument("--dropout", type=float, default=0.0)
+    ap.add_argument("--dropout_sites", default="all",
+                    help="'all', or a comma list from emb, attn, ff: --dropout applies only there (both layers)")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--wd", type=float, default=1.0)
     ap.add_argument("--wd_scope", choices=["all", "embeddings", "repo"], default="all")
@@ -1215,6 +1239,15 @@ def parse_args(argv=None):
 
 def parse_tasks(ap, args):
     """--tasks and its options: names checked, name=value lists turned into dicts."""
+    if args.dropout_sites != "all":
+        s = [x.strip() for x in args.dropout_sites.split(",") if x.strip()]
+        if not s or len(set(s)) != len(s) or set(s) - {"emb", "attn", "ff"}:
+            ap.error(f"--dropout_sites {args.dropout_sites!r}: 'all' or a comma list from emb, attn, ff, each once")
+        if set(s) == {"emb", "attn", "ff"}:
+            ap.error("--dropout_sites: list all three as 'all'")
+        if args.dropout <= 0:
+            ap.error("--dropout_sites needs --dropout > 0")
+        args.dropout_sites = ",".join(x for x in ("emb", "attn", "ff") if x in s)
     per_task = ("task_frac", "task_weight", "task_start", "task_stop")
     if args.wd_until is not None and not 0 < args.wd_until < args.updates:
         ap.error("--wd_until must be inside the run (1 .. --updates - 1)")
