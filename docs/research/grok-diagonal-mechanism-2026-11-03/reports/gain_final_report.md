@@ -1,9 +1,13 @@
 # Operand-gain sweep (H8): final report, 2026-11-03
 
+> **Corrections (2026-11-03 consolidation):** the bottom line and "hurts both alike" (wrong in every mode); "content, not size" (inferred, not shown); the side note's "exactly 0"; the study-status table (exposure, layer-1 attention, size). Each is marked below. Source: `grok_runs\consolidation_2026-11-03\CONSOLIDATED_REPORT.md`.
+
 **Bottom line: the doubled operand write is not what costs diagonals their margin.**
 - Shrinking the diagonal's layer-0 operand write to off-diagonal size (g = 1/√2), and letting the rest of the network respond, *lowers* diagonal margins in all 9 shared-token runs. The losses are −0.17 to −1.03 nats, with the norm fixed.
 - Off-diagonals fall by about as much.
 - The registered alternative wins in 9 of 9 runs: the later layers handle (a, a) worse than (a, b), and this does not depend on how large the doubled write is.
+
+> **Correction (2026-11-03 consolidation):** "hurts both alike" is wrong in every mode. The same gain is applied to every pair, so off-diagonals also move off their operating point: at g = 0.707 (replay, norm fixed) they lose 0.67–1.08 nats. Net of that cost, the diagonal fares better in 6/9 runs (Δdiag − Δoff +0.08 to +0.56, ≤ ~12 % of the gap) and worse in 3/9 (−0.01 to −0.20). With the norm free, replay raises diagonal margins in 9/9 (registered closure +1.3 to +16.1 %, which counts the diagonal change only); net of the off-diagonal change the gap narrows in only 2/9 (−10.8 % to +5.5 %) and widens in 7/9 (corrected 2026-11-08). The registered verdicts (D1 0/9, D2 0/9, D3 1/9, alternative 9/9) stand as counted, but the alternative is met by the generic off-operating-point cost. Supported reading: size alone doesn't selectively rescue diagonals; at final weights it is a minor factor, not ruled out. A final-weights test can't rule out a cause acting during training. All 9 models are at lr 6e-4, `repo`, dropout 0.1.
 
 ## Validity
 - The manual forward matches model(x) within 3.1e-5.
@@ -29,6 +33,9 @@
    - at 1.414 the diagonal falls again in 6 of 9.
    
    The downstream layers are tuned to the operand write as it is. Making the diagonal's write off-diagonal-sized just weakens its signal.
+
+   > **Correction (2026-11-03 consolidation):** "about equally" hides a matched difference: net of the off-diagonal loss, the gap narrows in 6/9 runs (+0.08 to +0.56 nats). See the correction under the bottom line.
+
 2. **Final-only, norm fixed** (the direct readout of the write):
    - a cut gives the diagonal a small gain, +0.01 to +0.45, in 8 of 9;
    - off-diagonals lose a little.
@@ -40,8 +47,13 @@
    - Its attn1 write is larger than off-diagonal (0.076 vs 0.066).
    
    A diagonal input of matched size is still processed differently. What sets (a, a) apart is its content, not its size.
+
+   > **Correction (2026-11-03 consolidation):** "content, not size" is an inference, not a shown result. Size is a minor factor at final weights (see above), and H10 later placed about 2/3 of the deficit in the '=' state after layer 0, path-averaged, which is not localized to layer-0 content.
+
 5. **Accuracy** stays at 0.96–1.00 throughout. These are margin changes, not failures.
 6. **Side note:** in all three separate-token models the layer-1 MLP write is exactly 0. That MLP is dead in those runs. It doesn't affect H8, but it's worth knowing for the design doc.
+
+   > **Correction (2026-11-03 consolidation):** not exactly 0. The write RMS is about 5e-14 to 3e-13: functionally dead. It is dead in all 6 separate-token models (diag and add2b), and near-dead in 4/6 E1 sub/div runs. Separate-token models are therefore a different circuit, not the shared-token one minus the diagonal problem.
 
 ## Where the study stands
 | question | answer | test |
@@ -52,6 +64,12 @@
 | Readout-invisible energy? | ≤ 7 % | H7 |
 | Size of the doubled layer-0 write? | **no**: matching it makes things worse | H8 |
 | What remains | content: (a, a) gives one operand direction instead of two, and the later layers handle that input worse | inferred |
+
+> **Correction (2026-11-03 consolidation):** three rows overstate.
+> - **Exposure:** most of the gap at update 100, 32–44 % at 200, fading by about 500 (R 0.87–0.90) with a 5–15 % residual through 10k. These are CPU fp32 reruns, which act as new seeds.
+> - **Layer-1 operand attention:** registered MIXED. At final weights, raising operand mass helps diagonals and off-diagonals alike. That is no diagonal-specific effect, not "not the limiter".
+> - **Size:** minor at final weights (≤ ~12 %): net of the off-diagonal cost the gap narrows in 6/9; with the norm free, net of the off-diagonal change the gap narrows in only 2/9 (−10.8 % to +5.5 %; corrected 2026-11-08: the 1–16 % counted the diagonal change alone). Not "no".
+> - **Final-norm scale:** the 15–30 % is measured under `repo`, which leaves the norm gains undecayed.
 
 ## Next (no training, about a minute on the GPU; needs your go-ahead)
 **Content swap:**

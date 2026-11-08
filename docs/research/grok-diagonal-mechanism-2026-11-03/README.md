@@ -1,6 +1,18 @@
 # Why diagonal pairs (a, a) are weak: mechanism study, 2026-11-03
 
-In `grok_lab` models trained on a commutative task (add, mul) with shared operand tokens, diagonal pairs (a, a) end training with lse margins 4–6 nats lower than off-diagonal pairs. With separate operand tokens the gap is about 0. This folder is the study of why.
+In `grok_lab` models trained on a commutative task (add, mul) with shared operand tokens, diagonal pairs (a, a) end training with lse margins about 3.7–6.2 nats lower than off-diagonal pairs (train, final weights, E1 add and mul) at lr 6e-4, `--wd_scope repo`, dropout 0.1. At lr 1e-3 the long-run a+b train gap is 2.6–3.4 (corrected 2026-11-03, consolidation). With separate operand tokens the gap is about 0. This folder is the study of why.
+
+**Corrections from the 2026-11-03 consolidation** (full analysis: `grok_runs\consolidation_2026-11-03\CONSOLIDATED_REPORT.md`):
+- The gap is now stated with its base (lr 6e-4, `repo`, dropout 0.1). Every model here was trained at that one base. No-training checks on older checkpoints (2026-11-03, `grok_runs\checks_2026-11-03\RESULTS.md`) since showed:
+  - **Under full decay** (C1, lr 1e-3, dropout 0, 1e4 updates): the gap exists in 3/3 seeds, but it is small, 0.3–0.6 nats (8–34 % of the off-diagonal margin). Most of its size at this base comes from the training stack, not the task.
+  - **At lr 1e-3 on this base:** the gap is about half the 6e-4 gap at 1e5 updates, the route mix is different, and the layer-1 MLP decayed to zero in 2/3 seeds (see the scope note in the Summary).
+  - **Dropout:** at C1's settings, adding dropout 0.1 makes every unseen error diagonal (3/3 seeds). Dropout 0 at this base is still untested.
+- H2's "one component" rule was ill-posed; H1, H3 and H4 failed as registered.
+- H5: exposure fades by about update 500, not 200, and leaves a 5–15 % residual. The early curve comes from CPU fp32 reruns, which act as new seeds.
+- H6/H6c: "not diagonal-specific" restated as the registered MIXED verdict at final weights. H6a had no matched off-diagonal arm.
+- H8: "hurts diagonals and off-diagonals alike" was wrong in every mode. Size is a minor factor at final weights, not ruled out.
+- Summary: "content, not size, at layer 0" replaced by the path-averaged H10 statement.
+- The probe's 32–49 % (a/b ratio) and H6c (operand mass) measure different quantities; the correction paragraph is rewritten.
 
 **Method:**
 - Every test was pre-registered in `hypotheses.md` before it ran, with thresholds.
@@ -13,23 +25,35 @@ In `grok_lab` models trained on a commutative task (add, mul) with shared operan
 - diag-arms control (ordered split), seeds 0–2;
 - separate-token control, seeds 0–2.
 
+**Scope** (added 2026-11-03, consolidation): all 12 models were trained at lr 6e-4 constant, `--wd_scope repo`, dropout 0.1, under bf16 autocast, and rescored in fp32. The 3 control models are the same trajectories, bit for bit, as long-stack `stack_lr6e4` to 25k, so they are not an independent replication. Every intervention is at final weights, so none rules out a training-time cause. The separate-token models have a functionally dead layer-1 MLP (write RMS 5e-14 to 3e-13), so they are a different circuit, not the shared-token one minus the diagonal problem.
+
 ## Results
 
 | test | question | registered verdict | what it shows |
 |---|---|---|---|
-| H1–H4 (probe) | operand as competitor, a/b-ratio computing, one component | all failed | none of these explain it |
-| H5, H5b (mirror) | exposure (diagonals have no swapped twin) vs representation | mixed by the noise gate; the curves agree | exposure explains it only in the first ~200 updates |
-| H6, H6c (restore) | layer-1 operand attention; final-norm scale | attention: mixed; scale: 15–30 % of the gap | layer-1 operand attention is not diagonal-specific; the final-norm scale is part of it |
+| H1–H4 (probe) | operand as competitor, a/b-ratio computing, one component | all failed | H1, H3 and H4 failed as registered. H2's "one component" rule is ill-posed: shares exceed 100 % because mlp1 cancels, and in 4/6 seeds one component is ≥ 60 % (corrected 2026-11-03, consolidation) |
+| H5, H5b (mirror) | exposure (diagonals have no swapped twin) vs representation | mixed by the noise gate; the curves agree | exposure explains most of the gap at update 100 and 32–44 % at 200. It fades by about 500 (R 0.87–0.90) but leaves a 5–15 % residual through 10k. These are CPU fp32 reruns, which act as new seeds (corrected 2026-11-03, consolidation) |
+| H6, H6c (restore) | layer-1 operand attention; final-norm scale | attention: mixed; scale: 15–30 % of the gap | at final weights, raising layer-1 operand mass helps diagonals and off-diagonals alike (registered MIXED). H6a ("not causal") had no matched off-diagonal arm (corrected 2026-11-03, consolidation). The final-norm scale is part of it, measured under `repo`, which leaves the norm gains undecayed |
 | H7 (residual) | where the extra residual norm comes from; is it readout-invisible | H7a pass; H7b (ii), (iii) fail | layer-0 attention writes √2 more on (a, a) (coherent doubling); invisible energy closes ≤ 7 % |
-| H8 (gain) | does the doubled write's size cause it | fail, 0/9; alternative 9/9 | no: shrinking it hurts diagonals and off-diagonals alike |
+| H8 (gain) | does the doubled write's size cause it | fail, 0/9; alternative 9/9 | size alone doesn't selectively rescue diagonals. Net of the off-diagonal cost, the gap narrows in 6/9 (≤ ~12 %); with the norm free the diagonal margin rises by 1–16 % of the gap in 9/9, but net of the off-diagonal change the gap narrows in only 2/9 (−10.8 % to +5.5 %; corrected 2026-11-08: the 1–16 % counted the diagonal change alone). At final weights, size is a minor factor, not ruled out (corrected 2026-11-03, consolidation) |
 | H9 (patching) | '=' stream vs layer-1 operand reads, by transplant | mixed; design flaw | transplants between same-answer pairs cost 3–7 nats even off the diagonal, so they can't localize |
 | H10 (route attribution) | the same question, by integrated gradients | mixed (7 unresolved, 2 '='); no "split" category was registered | about 2/3 '=' stream after layer 0 (60–85 % in 8/9), 1/3 layer-1 operand reads, 0 op position; per pair it is noisy |
 
-**Summary:**
-- The diagonal deficit is about **what (a, a) puts into the '=' stream at layer 0** (content, not size), plus a smaller share in how layer 1 reads the operand positions.
-- It is not about exposure (after early training), layer-1 attention allocation, readout-invisible energy, or the size of the doubled write.
+**Summary** (corrected 2026-11-03, consolidation):
+- **Scope (added 2026-11-03):** the H10 route shares were measured at lr 6e-4 and 25k updates, and don't carry over to lr 1e-3.
+  - At lr 1e-3 (long-stack runs that differ from the 6e-4 control only in lr, scored at 1e5 updates), the operand route carries 103–131 % of the deficit and the '=' route is negative (−3 to −31 %), in 3/3 seeds. The registered prediction (K2b in `checks_2026-11-03\RESULTS.md`) is falsified; Codex agreed blind.
+  - In 2 of those seeds, the layer-1 MLP had decayed to zero. lr and lr × wd are confounded here.
+  - Even at 6e-4, by 1e5 updates the '=' share is 48–70 %.
+  - The routes cancel heavily from pair to pair, so the shares are path averages.
+  - **The lr difference doesn't depend on the method** (per-pair replay, `checks_2026-11-03\RESULTS.md` R; Codex agreed blind). An exact Shapley split, which uses no path, gives '=' shares of −82 % to −134 % at 1e-3 against 39–61 % at 6e-4.
+    - The point shares do depend on the method: Shapley moves about 10 points from '=' to operands at 6e-4, and 50–117 at 1e-3.
+    - Per-pair signs often disagree between methods.
+    - Report the shares as ranges across methods, and don't read single pairs.
+- At lr 6e-4 and 25k updates, averaged along one integration path, about 2/3 of the deficit flows through the '=' state after layer 0. That state includes the layer-1 query and the '=' self K/V, so "layer-0 content" is not localized. The rest goes through layer 1's reads of the operand positions.
+- Exposure fades early but leaves a residual. Layer-1 attention and size show no diagonal-specific effect at final weights. Invisible energy accounts for ≤ 7 % at final weights.
+- Training-time roles are untested. All of this is at lr 6e-4, `repo`, dropout 0.1.
 
-**A correction to the probe's reading:** the probe found that equalizing the layer-1 a/b attention ratio removes 32–49 % of the final gap. H6c later showed that raising operand attention helps diagonal and off-diagonal pairs about equally. So layer-1 attention is not a diagonal-specific limiter.
+**A correction to the probe's reading** (rewritten 2026-11-03, consolidation): removing the token-dependent layer-1 a/b split lowers *off-diagonal* margins by 1.6–2.3 nats (32–49 % of the gap) and leaves diagonals unchanged. Raising operand mass at a fixed split (H6c) gives a small, non-selective gain (MIXED). The two tests measure different quantities. Neither shows that layer-1 attention causes the deficit, and neither rules it out.
 
 ## Files
 - **`hypotheses.md`:** every registration and result, H1–H10, in order.
@@ -53,5 +77,5 @@ In `grok_lab` models trained on a commutative task (add, mul) with shared operan
 
 ## Open
 Two next steps were proposed and neither has run:
-- **Finer attribution, no training:** split the '=' route into residual / query / self K-V, and the operand route into K / V.
-- **A 2× diagonal-weight training arm:** is the deficit a learned trade-off or a structural limit?
+- **Finer attribution, no training:** split the '=' route into residual / query / self K-V, and the operand route into K / V. (2026-11-03: run it on the 6e-4 and the 1e-3 models together, since the route mix differs between them. A per-pair path replay on the saved checkpoints comes first: fixed pair IDs, finite-difference route checks, and attention, norm and MLP activity along the path.)
+- **A 2× diagonal-weight training arm:** is the deficit a learned trade-off or a structural limit? (2026-11-03: it waits for the scope and lr checks, and needs a matched off-diagonal control when it runs. Its lower priority in the consolidation rested partly on "content, not size" looking weakened; that weakening used the misread norm-free figure (see H8, corrected 2026-11-08), so the size account is weaker, and this arm's motivation less weakened, than the consolidation said.)

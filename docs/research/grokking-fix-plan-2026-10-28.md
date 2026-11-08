@@ -1,5 +1,7 @@
 # Grokking fix plan: blocker map and PR sequence for the first finite-set run
 
+> **Corrections (2026-11-03 consolidation):** two stated reasons in this plan did not survive later measurement. (1) The bf16 cliff at about 5.5 exists only where the softmax sum is held in bf16 (the CPU kernel, explicit rounding); CUDA autocast has none, so it is not a reason for fp32 on CUDA. (2) Decaying the embedding is not necessary for first-crossing grokking: C1's `repo` arm grokked in 3/3 seeds. Both are marked below, next to the passages that rely on them; the original text is kept. Source: `grok_runs\consolidation_2026-11-03\CONSOLIDATED_REPORT.md`.
+
 Date: 2026-10-28. Status: **draft, corrected after an independent red-team review on 2026-10-28.** Nothing here has been posted, committed or applied. The red-team changed: the precision guard (§2.6, Q7), the reading of the step thresholds (§3.4), the scope of PRs 2 to 7 (§4.1), the #145, #218, #256 rows (§2.3), and the open questions (§6). The blocker verdicts did not change.
 
 Code revision: `origin/main` at `be08cde`. The worktree's `.py` files differ from main only by `docs/research/unseen_token_rows_probe.py` (checked with `git diff origin/main --stat -- '*.py'` after `git fetch`). Every `file:line` below is at `be08cde`.
@@ -147,6 +149,8 @@ All open. All **N** for the first run, because the run uses the baseline variant
 | G8 | Defaults the first run must override | **R** | `--grad_accum_steps 4`, `--lr_schedule wsd`, `--max_lr 6e-4`, `--num_workers 4`, `--train_eval_samples 2000` (wraps the set in a `Subset`, same #136 crash), `--fixed_data_size 5000`, `--task_weighting adaptive`, `--difficulty_schedule smooth`, `--eval_interval 500`, `--mix_band_tokens` (half of `alg_tokens`, so the logged phase reads `mix` for the second half of the run). | PR 7's README command lists every override; PR 6's finite-mode validation refuses accumulation > 1 and a non-`constant` schedule. |
 | G9 | Harness and train.py do not share an objective | **R** | train.py's loss is a token-mean cross-entropy over the answer digits **and EOS** (`data.py:1275-1289`, `model.py:903-910`), over four prompt templates, with padding. The harness scores one answer token per example. A difference between A1-H and A1-50 is not attributable until a harness arm reproduces the EOS target and the token-mean, or PR 6's scorer reports the single-token margin beside the sequence exact match. | PR 6 reports both; a `digits` harness arm, if ever built, copies train.py's objective. |
 
+> **Correction (2026-11-03 consolidation), G1:** the autocast effect was later measured on the RTX 4060. CUDA autocast computes cross-entropy in fp32 and keeps the target gradient to logit gap 16, the same as fp32; there is no bf16 cliff on CUDA. The bf16 cliff (lse margin 8 ln 2 = 5.55; measured on CPU between logit gap 6 and 7) comes from the CPU kernel, which rounds the softmax sum to bf16. A precision flag is still useful for a clean fp32 reference, but the cliff is not a reason for one. Guard instead against any future fused or chunked CE that holds the sum in bf16.
+
 ### 2.6 Literature guards, mapped
 
 | Guard | Status at `be08cde` | Owner |
@@ -161,6 +165,10 @@ All open. All **N** for the first run, because the run uses the baseline variant
 | CPU smoke test (harness T3; #256 test of the training stack) | Missing | G6: PR 2 and PR 6 |
 | Adam eps: **keep 1e-8 in the primary arm; sweep eps in #255.** Barron et al. (arXiv 2610.31642) derive a margin equilibrium of order ln(1/eps) per parameter, with λ, the parameter size and the loss's 1/N dropped inside the "≈" (§5, Eq. 10-11). At N = 4,704 the 1/N term alone moves the estimate by about 2.3 nats, more than the 1.8-nat gap between ln(1e8) = 18.4 and the fp32 cliff 16.6. They measured a mean margin of 17.9 with **their fixed loss** on a 1-layer mod-31 model (N ≈ 480); with standard cross-entropy the mean margin ended at 13.0 (Table 1). They ran eps ∈ {1e-8, 1e-12, 1e-16} only; "eps ≥ 1e-7 settles without spiking" is one untested sentence. So whether this run crosses the cliff must be measured (R11), not assumed. The guards with direct evidence are the margin-form cross-entropy (Table 1, 100 ± 0 vs 94.3 ± 5.4, 5 seeds) and an fp64 loss (Table 1, fp64 standard CE 100 ± 0; Liu et al. Fig. 1a). | eps fixed at default (`train.py:1844`); no loss option | #246 flag; margin-form CE, fp64 loss and eps arms in #255 (`--loss_fp64` from #268) |
 | Expect loss spikes; log loss on a log axis; no rollback | No rollback exists | State in #249 |
+
+> **Correction (2026-11-03 consolidation):**
+> - **"Decay on embedding and output head":** C1 (2026-10-29/30) ran the `repo` arm, the falsifier the literature report itself named. It grokked in 3/3 seeds, with the same final and late unseen accuracy as `all`; first crossing 800/1,000/1,100 vs 800/600/700. This retires "decay must reach the embedding" as a *necessity for first crossing*, in that setup (2 layers, d 128, tied, fraction 0.5, lr 1e-3, full batch, fp32, 1e4 updates). It does not show scope is irrelevant: `repo` roughly doubles the logit scale (final-norm gain 16.9–19.1 vs 7.2–7.9; peak mean margin 13.4–15.4 vs 6.2–6.8) and put 18 % of train examples at zero target gradient in pure fp32 (one seed), where every `all` arm stays at 0. Scored later on C1's final checkpoints, the diagonal (a, a) margin deficit exists under both scopes but is 2.0–5.2× larger under `repo` (3/3 seeds; 0.3–0.6 nats under `all`; `grok_runs\checks_2026-11-03\RESULTS.md`, K1). `repo` also exempts the norm gains, so the contrast does not isolate the table. Keep the matched scope comparison; #186's **H** is a recipe-parity verdict, not evidence that the exemption blocks grokking.
+> - **"Logits and loss in fp32, missing on CUDA":** not a defect for the cliff's sake. CUDA autocast keeps CE in fp32 with no bf16 cliff (see the G1 correction above). fp32 survives as the clean reference and for unquantized readouts.
 
 ---
 
@@ -196,6 +204,8 @@ All open. All **N** for the first run, because the run uses the baseline variant
 
   Each arm answers one question. If arm 1 groks, the replication works and the other arms rank the fixes. If arm 1 fails but another arm groks, that arm names the blocker. If nothing groks, the margin, zero-gradient, Adam-v and norm logs in every arm show where training stalls.
 
+  > **Correction (2026-11-03 consolidation), arm 4:** answered by C1 (1e4 updates, not the 1e5 sweep): the old exemption did not stop first-crossing grokking (3/3 seeds), and was slower to first crossing by 0–400 updates. It did change the regime: about twice the logit scale and more examples at zero target gradient. See the correction under §2.6.
+
 ### 3.3 The minimal ordered path
 
 For A1-H (the first valid run):
@@ -220,6 +230,8 @@ From #249: groks in at least 2 of 3 seeds, or not by 1e5. The step counts in the
 
 - Every source with a stated batch size and model that groks within a few thousand updates at wd 1 is a **1-layer** transformer (Truong 2603.13331: 1.6-2.2k at fraction 0.5, batch 512; Truong 2605.18845: 2-4k at fraction 0.4, full batch; Nanda: about 10k at fraction 0.3). The only 2-layer, fraction-0.5 number is one blog run (ja-13) with no batch size and no code, whose wd 0 arm also grokked. The 2-layer, fraction-0.3 number is one seed (zh-13: first above 50 % near 21k, 90 % near 26k). Power 2022's only quantified p = 97, fraction-0.5 timing is division, at 1e5 to 1e6 steps. A 15-seed 1-layer mod-31 replication had only 8 of 15 seeds above 95 % at 30k full-batch steps.
 - So 1e5 updates is the budget (Power), and no elapsed step count is a failure line. At 2e4 and 5e4 updates, **inspect**: the margin trace and the fraction of examples past 16.6, the optimizer groups, the split overlap, the transpose-seen curve, train exact match. Then finish the budget. Call a defect only on a positive sign: train exact match never reaches 99 %, transpose-unseen accuracy high from the first eval, a decayed group with zero numel, a margin stuck at the bf16 cliff of about 5.5.
+
+  > **Correction (2026-11-03 consolidation):** the last sign can appear only on a CPU bf16 path or under explicit rounding; CUDA autocast has no bf16 cliff. Even where the cliff was forced (C1 `rounded`, mean margin pinned at 5.55), first crossing was not slowed (700/500/600 vs 800/600/700), though rounded_s0 ended in a dip at 0.954.
 - Loss spikes after memorisation are expected and are not divergence. Each one is classified by the margin log: at the fp32 cliff, or elsewhere.
 - At fraction 0.5 a short or absent plateau is a valid outcome (zh lane 5).
 
@@ -328,6 +340,10 @@ Settled or recommended, no decision needed:
 - **Train fraction.** 0.5 primary (Power), 0.3 as an arm in the first sweep, as #249 says. At 0.5 the plateau may be short or absent.
 - **Compute.** Time 100 harness updates on CPU first; the GPU sweep and the laptop's memory decide the rest.
 
+> **Correction (2026-11-03 consolidation):**
+> - **Decay scope:** decaying every parameter stays the recipe's scope (parity with `openai/grok`), but it is a recipe choice, not a requirement for grokking. C1's `repo` arm grokked 3/3. Scope still matters for logit scale and the zero-gradient share, so keep `repo` vs `all` as a matched comparison. See the correction under §2.6.
+> - **Precision:** fp32 for the A-series stands as the clean reference, not because of a bf16 cliff (none on CUDA). "It costs nothing" was not timed against bf16: fp32 full batch measured 41.3 ms per update (69 min per 1e5), and no matched bf16 timing exists. For train.py, keep CUDA bf16 autocast.
+
 ---
 
 ## 7. What this session checked, and how
@@ -349,6 +365,8 @@ Settled or recommended, no decision needed:
 | Whether "all weights" in Power 2022 includes LayerNorm gains | **Resolved:** yes. `openai/grok` `training.py` decays every parameter. |
 | #158 is harmless in the finite mode | Read from `data.py` region B and `train.py:2243`, `train.py:3690`; not run. |
 | Size estimates (S / M / L) | Judgement, not counted from diffs. |
+
+> **Correction (2026-11-03 consolidation):** "bf16 autocast leaves cross-entropy in fp32 but rounds the logits" was later measured on the RTX 4060: the CE is fp32 and keeps the target gradient to logit gap 16, with no bf16 cliff. Autocast's effect on training dynamics alone (bf16-rounded logits) is still untested in isolation.
 
 ## Sources
 

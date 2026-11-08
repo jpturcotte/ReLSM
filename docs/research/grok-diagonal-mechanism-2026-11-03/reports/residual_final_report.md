@@ -1,9 +1,13 @@
 # Residual tests (H7): final report, 2026-11-03
 
+> **Corrections (2026-11-03 consolidation):** "ruled out" is scoped to final weights; "exposure only very early" and "layer-1 attention is not the limiter" overstate; "visible direction" was not measured. Each is marked below. Source: `grok_runs\consolidation_2026-11-03\CONSOLIDATED_REPORT.md`.
+
 **Bottom line.**
 - **Confirmed: the diagonal's extra residual energy starts in layer-0 attention.** Its size is exactly what coherent doubling predicts: √2 larger on (a, a), in all 9 shared-token runs (1.409–1.435), and absent with separate tokens (0.93–1.08).
 - **Ruled out: invisible energy.** Some of that extra energy is invisible to the answer readout (9/9 runs), but removing it closes only −1 % to 7 % of the margin gap.
 - **The deficit is in directions the readout does see.** Whether the early doubling causes it has not been tested yet.
+
+> **Correction (2026-11-03 consolidation):** ruled out **at final weights**. Invisible energy reaches the output only through the final norm, so stripping it measures its whole final-weights effect: −1 to 7 %. That is firmer than an intervention ceiling. Its role during training is untested. The 9 models are all at lr 6e-4, `repo`, dropout 0.1.
 
 ## Validity
 - The components sum to the final residual exactly (error 0).
@@ -36,6 +40,12 @@
 - **Layer-1 operand attention is not the limiter** (H6c).
 - **Final-norm scale explains 15–30 %** of the gap (H6).
 - **The rest is visible direction.** Its likely root is the √2 doubled operand write at layer 0. That link is inferred, not shown.
+
+> **Correction (2026-11-03 consolidation):**
+> - **Exposure:** it explains most of the gap at update 100 and 32–44 % at 200. It fades by about 500 (R 0.87–0.90) but leaves a 5–15 % residual through 10k. These are CPU fp32 reruns, which act as new seeds.
+> - **Layer-1 operand attention:** H6c is registered MIXED. At final weights, raising operand mass helps diagonals and off-diagonals alike: no diagonal-specific effect, which is weaker than "not the limiter".
+> - **Final-norm scale:** the 15–30 % is measured under `repo`, which also leaves the norm gains undecayed.
+> - **"Visible direction":** the 70–85 % is an arithmetic complement of the scale share. Direction was not measured. H8 later found the doubled write's size a minor factor at final weights.
 
 ## Next (no training, about a minute on the GPU; needs your go-ahead)
 **Operand-gain sweep:** scale only the operand part of attn0's write at '=' by 0.707 / 0.85 / 1.0 / 1.15, on diagonal and off-diagonal pairs separately. Run it in two modes, each with the norm free and with the norm fixed:

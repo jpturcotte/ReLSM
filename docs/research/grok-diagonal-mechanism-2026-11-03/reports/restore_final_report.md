@@ -1,5 +1,7 @@
 # Restore tests: final report (2026-11-03)
 
+> **Corrections (2026-11-03 consolidation):** "neither is the main cause" and "not specific to diagonals" are restated as the registered MIXED verdict; the 70–85 % is an arithmetic complement, and "direction" was not measured; the 15–30 % is under `repo`; H6a had no matched off-diagonal arm. Marked below. Source: `grok_runs\consolidation_2026-11-03\CONSOLIDATED_REPORT.md`.
+
 **Question:** late in training, do diagonal pairs (a, a) lose margin because:
 - layer-1 attention at '=' reads the operands less (operand mass about 0.6–0.75 vs 0.8), or
 - the final norm scales their logits down (inverse RMS 6–12 % lower)?
@@ -8,6 +10,12 @@
 - **Layer-1 operand attention is not specific to diagonals.** Changing it moves diagonal and off-diagonal margins together.
 - **The final-norm scale accounts for 15–30 % of the gap,** and only by rescaling logits; predictions don't change.
 - **The remaining 70–85 % is in the direction of the diagonal residual, not its size.**
+
+> **Correction (2026-11-03 consolidation):**
+> - The remaining 70–85 % is not explained by the final-norm scale. It is an arithmetic complement; "direction" was not measured.
+> - The 15–30 % is measured under `repo`, which also exempts the norm gains from decay (final-norm gain about 2.3× that of `all` in C1). The share may differ under full decay.
+> - Layer-1 attention: H6c is registered MIXED. At final weights it shows no diagonal-specific effect, which neither shows nor rules out a cause. H6a ("not causal") had no matched off-diagonal arm.
+> - All 12 models are at lr 6e-4, `repo`, dropout 0.1, and every test is at final weights.
 
 ## What was run
 
@@ -55,6 +63,8 @@ Both analyses agree on all three.
 
 **Where both analyses agree:**
 1. **More operand attention gives a small, general gain** when the norm is held fixed (≤ 0.39, closing at most 7.8 % of a gap), about the same for diagonal and off-diagonal pairs. So diagonals' lower operand mass is not what costs them margin.
+
+   > **Correction (2026-11-03 consolidation):** the supported reading is narrower: at final weights, raising operand mass gives no diagonal-specific gain (registered MIXED). That does not rule out a role for operand mass during training.
 2. **With the norm free, more operand attention hurts, and hurts diagonals more.** The extra content raises the residual norm, and the final RMSNorm shrinks every logit. That explains the first test's odd "more attention, worse diagonal" result, largely but not entirely: in control s0, the group-mean swap hurts even at fixed norm (−0.59).
 3. **On diagonals the residual at '=' carries extra energy that doesn't help the answer.**
    - Codex: "redundant residual content".

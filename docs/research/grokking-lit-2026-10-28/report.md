@@ -2,11 +2,15 @@
 
 As of 2026-10-28. A synthesis of the zh, ja, ko, fr and de lanes, with the decision-driving claims checked against primary sources.
 
+> **Corrections (2026-11-03 consolidation):** the experiment this report named as able to change its answer (below, "What could change this answer") has run. ReLSM's d = 128 harness stack grokked with the embedding exempt from weight decay, so recommendation 1's "must reach the embedding" does not hold as a requirement for grokking in that setup. Marked below; the original text is kept. Separately, the bf16 cliff at about 5.5 (recommendation 2) applies only where the softmax sum is held in bf16, such as the CPU kernel; CUDA autocast keeps cross-entropy in fp32 with no early cliff (see the corrections in `docs/research/grokking-fix-plan-2026-10-28.md`). Source: `grok_runs\consolidation_2026-11-03\CONSOLIDATED_REPORT.md`.
+
 ## Answer
 
 The standard recipe in issue #249 is sound. Every non-English replication that matches it groks, and most do so well inside 1e5 updates. The first run will fail for ReLSM-specific reasons before it fails for literature reasons. Fix those first, and add two numerical guards that the recipe does not mention.
 
 1. **Put weight decay on the embedding (and so on the tied head) before the run.** Every replication that groks decays the embedding. Weight decay 0.1 or less does not grok within 3e4–1e5 steps. One ICML 2026 case study finds that late-phase weight decay acts mainly on the embedding and output layers [5][19][20][26][28][29]. Confidence: high.
+
+   > **Correction (2026-11-03 consolidation):** "every replication decays the embedding" is an observation, not a test: none ran an exempt arm. ReLSM's own exempt arm grokked in 3/3 seeds (C1; see the correction under "What could change this answer"), so decaying the embedding is not required for grokking in that setup. The weight-decay strength part of this recommendation is not affected.
 2. **Keep logits and the loss in fp32, log the margin, and run the softmax fix as an arm.** Standard cross-entropy (CE) zeroes the target gradient once the logit margin passes about 16.6 in fp32 (5.5 in bf16) [1]. Under AdamW with weight decay the margin stops growing at a value of order ln(1/ε), which is 18.4 at ε = 1e-8, but that formula drops the weight decay, the parameter size and the loss's 1/N, each of which shifts it by nats; Barron et al. measured a mean margin of 17.9 with their fixed loss on a 1-layer mod-31 model, and 13.0 with standard CE [1]. Whether a 2-layer p = 97 run crosses the cliff is therefore not known in advance; log the per-example margin and the fraction of zero target gradients. Keep standard CE at ε = 1e-8 as the primary arm (it is the recipe). Run the margin-form CE [1] and an fp64 loss [1][3] beside it; both have direct evidence (Table 1 of [1]: 100 ± 0 for each, against 94.3 ± 5.4). A larger ε is a swept factor, not a guard: no source runs ε = 1e-7, and the ε = 1e-5 result is from runs without weight decay [3]. Too large an ε can halt learning, with no threshold given [2]. Confidence: high for the mechanism, low for any speed benefit in fp32 [21].
 3. **Treat loss spikes as a diagnosable event, not divergence.** Do not roll back or early-stop on them. Log the logit margin, so a spike can be classified as a precision-cliff event or as something else [1][4][38]. Confidence: medium.
 4. **Fix the split's commutation leak.** A random 50% split of ordered pairs puts about half the held-out pairs' transposes in training. Report held-out accuracy separately for "transpose seen" and "transpose unseen", or split on unordered pairs [4][5][32]. Confidence: high.
@@ -17,6 +21,13 @@ The standard recipe in issue #249 is sound. Every non-English replication that m
 The section "Parameters to test or sweep" lists what the planned experiments (#249, #251–#255) do not yet cover.
 
 What could change this answer: a seed-matched run showing that ReLSM's d = 128 stack groks with the embedding exempt, or a replication of the Barron fix showing a real speed-up in fp32. The only 15-seed replication found no fp32 speed-up [21].
+
+> **Correction (2026-11-03 consolidation):** the first of these runs exists. In the harness walk C1 (2026-10-29/30), the `--wd_scope repo` arm exempts the embedding, the tied head and the norm gains from decay. It grokked in 3/3 seeds, seed-matched (same init and split) with the decay-all arm, with the same final and late unseen accuracy. Its first crossing of unseen accuracy 0.99 came at 800/1,000/1,100 updates against 800/600/700. Setup: 2 layers, d 128, tied, p = 97, fraction 0.5, lr 1e-3, full batch, fp32, 1e4 updates. So recommendation 1's "decay must reach the embedding", rated high confidence, is contradicted as a requirement for first-crossing grokking there. The exemption still matters:
+> - it roughly doubles the logit scale (final-norm gain 16.9–19.1 vs 7.2–7.9);
+> - it put 18 % of train examples at zero target gradient in pure fp32 (one seed), where the decay-all arms stayed at 0;
+> - it makes the diagonal (a, a) margin deficit 2.0–5.2× larger (3/3 seeds).
+>
+> And because `repo` also exempts the norm gains, C1 doesn't isolate the table. The live argument for decaying the table in the real model is now dead-row drift at the 32k vocabulary: in the DAG-v12 checkpoint, 31,879 rows share one direction and hold 98.7 % of the table's squared norm. Their drift over training and any harm are untested. Decay-all stays a reasonable recipe-parity choice, not a requirement. The Barron half of this sentence is unchanged.
 
 ## Scope and assumptions
 
@@ -382,6 +393,8 @@ This section lists the parameters the reports suggest testing that the planned e
 | Alternative accelerators | Per-row ℓ2 clipping, max_norm 2.0, no decay; Grokfast with the reference settings | #254 (partial: Grokfast only) | Clip-to-Grok, 200 seeds against a weak baseline [62] (C); no independent Grokfast transformer replication [61] (C) | Unknown against a tuned λ = 1 baseline | 2 arms × 3 seeds ≈ 2–3 h |
 | Number of seeds | 3 for screening; 5 for any claim; report the grok rate | All | 8/15 seeds [21] (C); 2–3× spread [20] (C); 0/16 to 16/16 by split [73] (B); 1.00 / 0.75 / 0.78 [39] (C) | Single-seed negatives are uninterpretable | Multiplies every row; small models may fit several seeds at once on the 8 GB card (inference) |
 | Eval cadence | Every 100–250 steps on the full held-out set; checkpoints every ~2k steps; run ≥ 1e4 steps past the grok step | All (#249 first) | 250-step eval [20] (C); 100-step eval caught rise-and-fall [19] (C); compression continues ≥ 1e4 steps after grokking [66] (B) | Catches non-monotone transitions and late un-grokking | Small: the held-out set is about 4.7k examples |
+
+> **Correction (2026-11-03 consolidation), weight-decay scope row:** "Exempt embedding: slower or no grokking (inference; untested anywhere)" has since been tested in the harness (C1, see the correction under "What could change this answer"): the exempt arm grokked in 3/3 seeds, 0–400 updates later to first crossing, with about twice the logit scale.
 
 **What the table changes in the plan (inference):**
 - Run the weight-decay-scope and weight-decay-off controls next to #249 at the same seeds. They answer #186 directly and cost about one evening.
