@@ -340,17 +340,19 @@ def get_lr(
 class MetricsLogger:
     """Tracks metrics for the ablation ladder."""
     
-    def __init__(self, output_dir: Path):
+    def __init__(self, output_dir: Path, write_initial: bool = True):
         self.output_dir = output_dir
         self.hyperparameters = {}
         self.records = []
         self.task_accuracies = {}
         self.ood_task_accuracies = {}
         self.train_eval_task_accuracies = {}
-        self.output_dir.mkdir(parents=True, exist_ok=True)
         self._metrics_path = self.output_dir / "metrics.json"
-        if not self._metrics_path.exists():
-            self._append_snapshot()
+        # write_initial False (--resume_from): nothing is written until the resume has been validated
+        if write_initial:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            if not self._metrics_path.exists():
+                self._append_snapshot()
     
     def log(self, step: int, phase: str, **kwargs):
         record = {"step": step, "phase": phase}
@@ -1939,7 +1941,17 @@ def train(args):
     # SETUP
     # =========================================================================
 
+    import exact_resume as er
+
+    # the shared entry (drivers call train() directly): the arguments saved and compared on resume are canonical
+    er.canonical_args(args)
+    hooks = er.TestHooks()
+    # --cuda_deterministic: one numerical policy, set and read back before any device probe (exact CUDA resume)
+    cuda_initialized_before = er.prepare_numerics(args.cuda_deterministic)["cuda_initialized_before"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device_label = f"cuda:{torch.cuda.current_device()}" if device.type == "cuda" else str(device)
+    if hooks.expect_device and device_label != hooks.expect_device:
+        raise SystemExit(f"RELSM_TEST_EXPECT_DEVICE={hooks.expect_device}, but training chose {device_label}")
     log_print = print if args.extended_logging else (lambda *args, **kwargs: None)
 
     def clamp_difficulty(value: float) -> float:
@@ -1995,7 +2007,10 @@ def train(args):
         log_print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # --resume_from: read-only checks now; output_dir changes only once the whole restore is built (below)
+    resume_pre = er.preflight(Path(args.resume_from), output_dir) if args.resume_from else None
+    if resume_pre is None:
+        output_dir.mkdir(parents=True, exist_ok=True)
     resume_auto = args.mod_table_p is not None and args.mod_table_resume == "auto"
     resume_state = None  # the resume.pt payload this run continues from (in place or --mod_table_init_from)
     resume_kind = None  # "resume" (this output_dir's own resume.pt) or "extend" (another run's)
@@ -2046,8 +2061,13 @@ def train(args):
         if resume_kind != "resume":
             move_aside(output_dir)  # before the logger opens metrics.json: a restart never shows an earlier attempt
 
-    logger = MetricsLogger(output_dir)
-    logger.set_hyperparameters(vars(args))
+    logger = MetricsLogger(output_dir, write_initial=resume_pre is None)
+    # this run's identity, in every checkpoint and in the hyperparameter row (a resume keeps its checkpoint's)
+    run_id = er.new_run_id()
+    if args.mod_table_p is not None:
+        logger.set_hyperparameters(vars(args))  # the bridge's row, as it was
+    else:
+        logger.set_hyperparameters({**vars(args), "run_id": run_id, "resumes": []})
     
     # =========================================================================
     # TOKENIZER
@@ -2140,7 +2160,9 @@ def train(args):
         CurriculumSampler,
         FixedAlgorithmicDataset,
         LanguageDataset,
+        PermutationBatchSampler,
         create_curriculum_loaders,
+        language_manifest,
     )
     
     log_print("\nLoading datasets...")
@@ -2338,10 +2360,11 @@ def train(args):
             min_difficulty=args.min_difficulty,
             include_lengths=True,
         )
+        # reshuffle the fixed set each epoch to avoid ordering artifacts: the same draws and batches as
+        # shuffle=True, with a position a checkpoint can save (#154)
         alg_loader = DataLoader(
             alg_dataset,
-            batch_size=args.alg_batch_size,
-            shuffle=True,  # reshuffle fixed set each epoch to avoid ordering artifacts
+            batch_sampler=PermutationBatchSampler(len(alg_dataset), args.alg_batch_size),
             num_workers=args.num_workers,
             pin_memory=True,
             collate_fn=collate_fn,
@@ -2511,6 +2534,33 @@ def train(args):
         for name, param in model.named_parameters():
             if param.requires_grad:
                 grokfast_ema[name] = torch.zeros_like(param.data)
+
+    # exact resume: what a resume must find unchanged, and why this run's checkpoints could not be exact
+    eval_dtype = torch.get_autocast_dtype("cuda") if device.type == "cuda" else None  # utils' eval autocast
+    run_fp: Optional[Dict[str, Any]] = None
+    static_why: List[str] = []
+    if args.eval_checkpoints > 0 or resume_pre is not None:
+        run_fp = er.run_fingerprint(Path(__file__).resolve().parent, tokenizer, device,
+                                    dtype if device.type == "cuda" else None, eval_dtype, cuda_initialized_before)
+        if args.total_tokens > args.alg_tokens:
+            lang_entries, lang_why = language_manifest(lang_dataset.configs)
+            run_fp["language"] = er.plain(lang_entries)
+            static_why += lang_why
+        if args.compile:
+            static_why.append("--compile (compiled kernels are not shown to repeat bitwise across processes)")
+        tok_why = er.tokenizer_is_deterministic(tokenizer)
+        if tok_why:
+            static_why.append(tok_why)
+        static_why += er.cuda_exact_problems(run_fp, args.cuda_deterministic)
+    if hooks.expect_device:
+        bad = [f"parameter {n} on {q.device}" for n, q in model.named_parameters() if str(q.device) != device_label][:3]
+        if device.type == "cuda" and torch.cuda.get_rng_state(device).numel() == 0:
+            bad.append("empty CUDA RNG state")
+        if bad:
+            raise SystemExit("RELSM_TEST_EXPECT_DEVICE: " + "; ".join(bad))
+        print(f"[test] device {device_label}, train autocast {dtype if device.type == 'cuda' else None}, "
+              f"eval autocast {eval_dtype}", flush=True)
+    expect_batch_checked = not hooks.expect_device
     
     # =========================================================================
     # TRAINING LOOP
@@ -2642,6 +2692,8 @@ def train(args):
     last_log_time = start_time
     last_log_tokens = tokens_seen
     best_alg_acc = 0.0
+    # the best model as it was selected: {"bytes", "sha256", "step"}, None (none yet) or {"unknown": True}
+    best_state: Optional[Dict[str, Any]] = None
     last_grad_norm = 0.0
     checkpoint_paths: List[Path] = []
     prev_eval_task_acc: Dict[str, float] = {}
@@ -2678,10 +2730,13 @@ def train(args):
             "curriculum_jitter": float(args.curriculum_jitter),
         }
 
+    from model import config_to_payload
+
     def build_checkpoint_payload(step: int, tokens_seen: int) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "model_state_dict": model.state_dict(),
-            "config": config,
+            "config": config_to_payload(config),  # plain values: loads with weights_only=True (#138)
+            "run_id": run_id,
             "step": step,
             "tokens_seen": tokens_seen,
             "optimizer_state_dict": optimizer.state_dict(),
@@ -2701,20 +2756,32 @@ def train(args):
             payload["dag_state"] = dag_state.state_dict()
         return payload
 
-    def save_rotating_checkpoint(step: int, tokens_seen: int, tag: Optional[str] = None) -> Optional[Path]:
+    def save_rotating_checkpoint(step: int, tokens_seen: int, tag: Optional[str] = None,
+                                 resume: Optional[Dict[str, Any]] = None) -> Optional[Path]:
+        """checkpoint_step_N[_TAG].pt and its sidecar. The retained list (this checkpoint included) is in the
+        payload; retired checkpoints are pruned only after it is published, and only checkpoint_step_*.pt files of
+        this output_dir."""
+        nonlocal checkpoint_paths
         if args.eval_checkpoints <= 0:
             return None
         suffix = f"_{tag}" if tag else ""
         checkpoint_path = output_dir / f"checkpoint_step_{step}{suffix}.pt"
+        retained = [q for q in checkpoint_paths if q != checkpoint_path] + [checkpoint_path]
+        retired = retained[: max(0, len(retained) - args.eval_checkpoints)]
+        retained = retained[len(retired):]
         payload = build_checkpoint_payload(step, tokens_seen)
-        torch.save(payload, checkpoint_path)
-        checkpoint_paths.append(checkpoint_path)
-        while len(checkpoint_paths) > args.eval_checkpoints:
-            old_checkpoint = checkpoint_paths.pop(0)
-            try:
-                old_checkpoint.unlink()
-            except FileNotFoundError:
-                pass
+        if resume is not None:
+            resume["loop"]["checkpoint_paths"] = [q.name for q in retained]
+            payload["resume"] = resume
+        er.publish(checkpoint_path, step, kill=lambda point: hooks(step, point, checkpoint_path), role="ckpt",
+                   obj=payload)
+        payload = resume = None
+        checkpoint_paths = retained
+        for k, old in enumerate(retired, 1):
+            if old.parent.resolve() == output_dir.resolve() and er.checkpoint_step_of(old.name) is not None:
+                er.sidecar(old).unlink(missing_ok=True)
+                old.unlink(missing_ok=True)
+            hooks(step, f"ckpt:prune#{k}", old)
         return checkpoint_path
 
     def _apply_task_curriculum_config(config_payload: Dict[str, float]) -> None:
@@ -2736,46 +2803,6 @@ def train(args):
             task_curriculum.init_difficulty, task_curriculum.min_difficulty
         )
 
-    def load_checkpoint_state(checkpoint_path: str) -> Tuple[int, int, float]:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        check_resume_architecture(checkpoint.get("config"), getattr(model, "_orig_mod", model).config)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer_state = checkpoint.get("optimizer_state_dict")
-        if optimizer_state is not None:
-            optimizer.load_state_dict(optimizer_state)
-        scaler_state = checkpoint.get("scaler_state_dict")
-        if scaler is not None and scaler_state is not None:
-            scaler.load_state_dict(scaler_state)
-        if task_curriculum is not None and checkpoint.get("curriculum_state"):
-            task_curriculum.load_state_dict(checkpoint["curriculum_state"])
-        if checkpoint.get("task_curriculum_config"):
-            _apply_task_curriculum_config(checkpoint["task_curriculum_config"])
-        if dag_state is not None and checkpoint.get("dag_state"):
-            dag_state.load_state_dict(checkpoint["dag_state"])
-        if checkpoint.get("curriculum_rng_state") is not None:
-            curriculum.rng.setstate(checkpoint["curriculum_rng_state"])
-        resume_tokens = int(checkpoint.get("tokens_seen", 0))
-        curriculum_tokens = int(checkpoint.get("curriculum_tokens_seen", resume_tokens))
-        curriculum.tokens_seen = curriculum_tokens
-        if difficulty_value is not None and checkpoint.get("difficulty_value") is not None:
-            difficulty_value.value = float(checkpoint["difficulty_value"])
-        resume_step = int(checkpoint.get("step", 0))
-        resume_best_alg = float(checkpoint.get("best_alg_acc", 0.0))
-        return resume_step, curriculum_tokens, resume_best_alg
-
-    if args.resume_from:
-        resume_step, resume_tokens, resume_best_alg = load_checkpoint_state(args.resume_from)
-        global_step = resume_step
-        tokens_seen = resume_tokens
-        best_alg_acc = resume_best_alg
-        log_print(
-            f"Resumed from checkpoint: {args.resume_from} "
-            f"(step={global_step}, tokens_seen={tokens_seen}, "
-            f"best_alg_acc={best_alg_acc:.4f})"
-        )
-        last_log_time = time.time()
-        last_log_tokens = tokens_seen
-    
     # Estimate steps with hybrid calculation for sparse algorithmic and dense language data
     algo_steps = args.alg_tokens // (args.alg_batch_size * 40)
     lang_tokens = max(0, args.total_tokens - args.alg_tokens)
@@ -3037,6 +3064,393 @@ def train(args):
         log_print(f"  Mod table: resumed ({resume_kind}) at micro-step {global_step}, tokens {tokens_seen}")
         resume_state = st = lp = lg = None  # free the payload (CPU copies of weights and moments); nothing reads it
 
+    # =========================================================================
+    # EXACT RESUME (--resume_from; #138, #154, #150)
+    # =========================================================================
+
+    name_of_param = {id(p): n for n, p in model.named_parameters()}
+
+    def _dataset_roles() -> Dict[str, Any]:
+        """The datasets whose own counters (tokens_seen, worker token budget) steer generation, by role. A role that
+        is another role's dataset is recorded as that role's name (an alias, restored once)."""
+        roles: Dict[str, Any] = {"alg": alg_dataset if hasattr(alg_dataset, "exact_dataset_state") else None}
+        te = train_eval_loader.dataset if train_eval_loader is not None else None
+        if te is not None and te is alg_dataset:
+            roles["train_eval"] = "alg"
+        else:
+            roles["train_eval"] = te if hasattr(te, "exact_dataset_state") else None
+        return roles
+
+    def _role_kind(x: Any) -> Any:
+        return x if x is None or isinstance(x, str) else "counters"
+
+    def _snapshots() -> Optional[Dict[str, Any]]:
+        if task_curriculum is None:
+            return None
+        return er.plain({
+            "difficulty": dict(difficulty_snapshot), "weights": dict(weights_snapshot),
+            "dag_gate": dict(dag_gate_snapshot), "dag_frontier": list(dag_frontier_snapshot),
+            "dag_replay_ratio": list(dag_replay_ratio_snapshot), "dag_unlocked": sorted(dag_unlocked_snapshot),
+            "dag_prob": dict(dag_prob_snapshot), "dag_gated_weight": dict(dag_gated_weight_snapshot),
+            "dag_ema": dict(dag_ema_snapshot),
+        })
+
+    def build_resume_state() -> Dict[str, Any]:
+        """Everything the loop carries into the next iteration, at the end of an iteration (the "resume" key of a
+        rotating checkpoint). exact is False, with the reasons, when a resume from it could not continue exactly."""
+        from tools.grok_bridge import numpy_rng_state
+
+        sampler_state, sampler_why = curriculum.exact_state()
+        why = list(static_why) + list(sampler_why)
+        if isinstance(best_state, dict) and best_state.get("unknown"):
+            why.append("the best model at this point is unknown (the run resumed from a file without it)")
+        named = list(model.named_parameters())
+        cuda_rng = None
+        if device.type == "cuda":
+            index = torch.cuda.current_device()
+            cuda_rng = {"state": torch.cuda.get_rng_state(device), "index": int(index),
+                        "uuid": str(getattr(torch.cuda.get_device_properties(index), "uuid", ""))}
+        return {
+            "format": er.RESUME_FORMAT, "exact": not why, "why_inexact": why,
+            "args": er.plain(vars(args)), "hyperparameters": er.plain(logger.hyperparameters),
+            "fingerprint": run_fp, "warmup_tokens": int(warmup_tokens),
+            "micro_steps": int(global_step), "tokens_seen": int(tokens_seen),
+            "param_names": [n for n, _ in named],
+            "optimizer_bindings": [[name_of_param[id(p)] for p in g["params"]] for g in optimizer.param_groups],
+            # a checkpoint can fall part-way through an accumulation
+            "grads": {n: p.grad.detach().cpu().clone() for n, p in named if p.grad is not None},
+            "grokfast_ema": {n: t.detach().cpu().clone() for n, t in grokfast_ema.items()},
+            "buffers": er.non_persistent_buffers(model),
+            "rng": {"torch": torch.get_rng_state(), "cuda": cuda_rng, "python": random.getstate(),
+                    "numpy": numpy_rng_state()},
+            "sampler": sampler_state,
+            "datasets": {role: (ds if _role_kind(ds) != "counters" else ds.exact_dataset_state())
+                         for role, ds in _dataset_roles().items()},
+            "snapshots": _snapshots(),
+            "difficulty_value": float(difficulty_value.value) if difficulty_value is not None else None,
+            "loop": er.plain({
+                "running_loss": running_loss, "running_inner_steps": running_inner_steps,
+                "running_ponder": running_ponder, "last_grad_norm": last_grad_norm,
+                "last_token_accuracy": last_token_accuracy, "last_pct_masked_tokens": last_pct_masked_tokens,
+                "flush_diagnostic_metrics": flush_diagnostic_metrics, "lr_mismatch_warned": lr_mismatch_warned,
+                "task_window_counts": list(task_window_counts.items()),
+                "task_window_input_len": list(task_window_input_len.items()),
+                "task_window_target_len": list(task_window_target_len.items()),
+                "last_log_tokens": last_log_tokens, "best_alg_acc": best_alg_acc,
+                "prev_eval_task_acc": prev_eval_task_acc, "prev_eval_task_token_acc": prev_eval_task_token_acc,
+                "prev_eval_ood_task_acc": prev_eval_ood_task_acc,
+                "prev_eval_ood_task_token_acc": prev_eval_ood_task_token_acc,
+                "prev_train_eval_task_acc": prev_train_eval_task_acc,
+                "prev_train_eval_task_token_acc": prev_train_eval_task_token_acc,
+                "checkpoint_paths": [],  # filled in by save_rotating_checkpoint (the retained list, this one included)
+            }),
+            "logger": er.plain({"records": logger.records, "task_accuracies": logger.task_accuracies,
+                                "ood_task_accuracies": logger.ood_task_accuracies,
+                                "train_eval_task_accuracies": logger.train_eval_task_accuracies}),
+            "best": best_state,
+            "train_seconds": time.time() - start_time,
+        }
+
+    if resume_pre is not None:
+        def _restore_resume() -> Dict[str, Any]:
+            """--resume_from, in memory only: classify the checkpoint and put its state into the objects built above.
+            Raises ResumeRefused (nothing in output_dir has changed yet) when it cannot be resumed as asked."""
+            nonlocal global_step, tokens_seen, best_alg_acc, best_state, start_time, last_log_time, last_log_tokens
+            nonlocal running_loss, running_inner_steps, running_ponder, last_grad_norm, last_token_accuracy
+            nonlocal last_pct_masked_tokens, flush_diagnostic_metrics, lr_mismatch_warned
+            nonlocal task_window_counts, task_window_input_len, task_window_target_len
+            nonlocal prev_eval_task_acc, prev_eval_task_token_acc, prev_eval_ood_task_acc
+            nonlocal prev_eval_ood_task_token_acc, prev_train_eval_task_acc, prev_train_eval_task_token_acc
+            nonlocal checkpoint_paths, run_id, dag_prob_snapshot, dag_gated_weight_snapshot, dag_ema_snapshot
+            import hashlib
+
+            src, ckpt = resume_pre["src"], resume_pre["ckpt"]
+            r = ckpt.get("resume")
+            same_dir = src.parent.resolve() == output_dir.resolve()
+            why: List[str] = []
+            try:
+                if r is None:
+                    why.append(f"{src.name} holds no exact-resume state (written before exact resume, or a best, "
+                               f"final or interrupt checkpoint)")
+                else:
+                    er.validate_exact_state(ckpt, r)
+                    if r["hyperparameters"].get("run_id") != ckpt.get("run_id"):
+                        raise ValueError("its resume state belongs to another run_id")
+                    why += [f"not exact when written: {w}" for w in r["why_inexact"]]
+                    why += [f"argument {d}" for d in er.arg_differences(r["args"], er.plain(vars(args)))]
+                    why += [f"run fingerprint {d}" for d in er.fingerprint_differences(r["fingerprint"], run_fp)]
+                    if int(r["warmup_tokens"]) != int(warmup_tokens):
+                        why.append(f"warmup is {warmup_tokens} tokens here, {r['warmup_tokens']} in the checkpoint")
+                why += [f"this run: {w}" for w in static_why if r is None or w not in r["why_inexact"]]
+                if r is not None:
+                    best = r["best"]
+                    best_how = "none" if best is None else ("unknown" if best.get("unknown") else "embedded")
+                else:
+                    best, best_how = er.recover_legacy_best(src, ckpt, ckpt.get("run_id") or run_id)
+                if best_how == "unknown":
+                    why.append("the best model at the checkpoint is unknown (no best_model.pt beside it matches)")
+                if isinstance(best, dict) and "bytes" in best:
+                    if hashlib.sha256(best["bytes"].numpy().tobytes()).hexdigest() != best["sha256"]:
+                        raise ValueError("its embedded best model does not match its sha256")
+                why = list(dict.fromkeys(why))
+                if why and not args.resume_inexact:
+                    raise er.ResumeRefused(
+                        f"--resume_from: {src} cannot be resumed exactly:\n  - " + "\n  - ".join(why)
+                        + "\nPass --resume_inexact to continue anyway (the data loaders restart from their "
+                          "beginning; recorded as an inexact resume). Nothing was changed.")
+                kind = "inexact" if why else "exact"
+
+                check_resume_architecture(ckpt.get("config"), getattr(model, "_orig_mod", model).config)
+                model.load_state_dict(ckpt["model_state_dict"])
+                named = list(model.named_parameters())
+                if r is not None:
+                    if r["param_names"] != [n for n, _ in named]:
+                        raise ValueError("its parameter names differ from this model's")
+                    bindings = [[name_of_param[id(p)] for p in g["params"]] for g in optimizer.param_groups]
+                    if r["optimizer_bindings"] != bindings:
+                        raise ValueError("its optimizer parameter groups differ from this run's")
+                if ckpt.get("optimizer_state_dict") is not None:
+                    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                if ckpt.get("scaler_state_dict") is not None:
+                    scaler.load_state_dict(ckpt["scaler_state_dict"])  # a no-op for a disabled scaler
+                if task_curriculum is not None and ckpt.get("curriculum_state"):
+                    task_curriculum.load_state_dict(ckpt["curriculum_state"])
+                if ckpt.get("task_curriculum_config"):
+                    _apply_task_curriculum_config(ckpt["task_curriculum_config"])
+                if dag_state is not None and ckpt.get("dag_state"):
+                    dag_state.load_state_dict(ckpt["dag_state"])
+                if ckpt.get("curriculum_rng_state") is not None:
+                    version, internal, gauss = ckpt["curriculum_rng_state"]
+                    curriculum.rng.setstate((version, tuple(internal), gauss))
+                curriculum.tokens_seen = int(ckpt.get("curriculum_tokens_seen", ckpt.get("tokens_seen", 0)))
+                if difficulty_value is not None and ckpt.get("difficulty_value") is not None:
+                    difficulty_value.value = float(ckpt["difficulty_value"])
+                global_step = int(ckpt.get("step", 0))
+                tokens_seen = int(curriculum.tokens_seen)
+                best_alg_acc = float(ckpt.get("best_alg_acc", 0.0))
+                rng = None
+                train_seconds: Optional[float] = None
+                retained: Optional[List[str]] = None
+
+                if r is not None:
+                    params = dict(named)
+                    if set(r["grads"]) - set(params):
+                        raise ValueError("its pending gradients name parameters this model does not have")
+                    for n, p in named:
+                        g = r["grads"].get(n)
+                        p.grad = None if g is None else g.to(device=p.device, dtype=p.dtype).clone()
+                    if set(r["grokfast_ema"]) != set(grokfast_ema):
+                        raise ValueError("its Grokfast EMA tensors differ from this run's")
+                    for n, t in r["grokfast_ema"].items():
+                        grokfast_ema[n].copy_(t.to(device=grokfast_ema[n].device, dtype=grokfast_ema[n].dtype))
+                    er.set_non_persistent_buffers(model, r["buffers"])
+                    snaps = r["snapshots"]
+                    if (snaps is None) != (task_curriculum is None):
+                        raise ValueError("its run had the task curriculum and this one does not, or the reverse: even an "
+                                         "inexact resume keeps --use_task_curriculum as it was")
+                    if snaps is not None:
+                        # in place: the samplers built above hold references to these containers
+                        difficulty_snapshot.clear()
+                        difficulty_snapshot.update(snaps["difficulty"])
+                        weights_snapshot.clear()
+                        weights_snapshot.update(snaps["weights"])
+                        dag_gate_snapshot.clear()
+                        dag_gate_snapshot.update(snaps["dag_gate"])
+                        _set_frontier_snapshot(dag_frontier_snapshot, set())
+                        dag_frontier_snapshot.extend(snaps["dag_frontier"])
+                        dag_replay_ratio_snapshot[:] = list(snaps["dag_replay_ratio"])
+                        dag_unlocked_snapshot.clear()
+                        dag_unlocked_snapshot.update(snaps["dag_unlocked"])
+                        dag_prob_snapshot = dict(snaps["dag_prob"])
+                        dag_gated_weight_snapshot = dict(snaps["dag_gated_weight"])
+                        dag_ema_snapshot = dict(snaps["dag_ema"])
+                    if r["difficulty_value"] is not None and difficulty_value is not None:
+                        difficulty_value.value = float(r["difficulty_value"])
+                    if kind == "exact":
+                        curriculum.restore_exact_state(r["sampler"])
+                    else:
+                        print("[resume] inexact: the data loaders start from their beginning")
+                    # dataset counters after the sampler (its fresh iterators are made above)
+                    roles = _dataset_roles()
+                    if set(r["datasets"]) != set(roles):
+                        raise ValueError("its dataset roles differ from this run's")
+                    for role, saved in r["datasets"].items():
+                        if _role_kind(saved) != _role_kind(roles[role]):
+                            raise ValueError(f"its {role} dataset is {_role_kind(saved)}, this run's "
+                                             f"{_role_kind(roles[role])}")
+                        if _role_kind(saved) == "counters":
+                            roles[role].load_exact_dataset_state(saved)
+                    lp = r["loop"]
+                    running_loss, running_inner_steps = lp["running_loss"], lp["running_inner_steps"]
+                    running_ponder, last_grad_norm = lp["running_ponder"], lp["last_grad_norm"]
+                    last_token_accuracy, last_pct_masked_tokens = lp["last_token_accuracy"], lp["last_pct_masked_tokens"]
+                    flush_diagnostic_metrics, lr_mismatch_warned = lp["flush_diagnostic_metrics"], lp["lr_mismatch_warned"]
+                    task_window_counts = defaultdict(int, [(k, v) for k, v in lp["task_window_counts"]])
+                    task_window_input_len = defaultdict(int, [(k, v) for k, v in lp["task_window_input_len"]])
+                    task_window_target_len = defaultdict(int, [(k, v) for k, v in lp["task_window_target_len"]])
+                    last_log_tokens, best_alg_acc = lp["last_log_tokens"], lp["best_alg_acc"]
+                    prev_eval_task_acc = dict(lp["prev_eval_task_acc"])
+                    prev_eval_task_token_acc = dict(lp["prev_eval_task_token_acc"])
+                    prev_eval_ood_task_acc = dict(lp["prev_eval_ood_task_acc"])
+                    prev_eval_ood_task_token_acc = dict(lp["prev_eval_ood_task_token_acc"])
+                    prev_train_eval_task_acc = dict(lp["prev_train_eval_task_acc"])
+                    prev_train_eval_task_token_acc = dict(lp["prev_train_eval_task_token_acc"])
+                    # a resume into another directory never prunes the source's files
+                    checkpoint_paths = [output_dir / name for name in lp["checkpoint_paths"]] if same_dir else []
+                    retained = list(lp["checkpoint_paths"])
+                    train_seconds = float(r["train_seconds"])
+                    lg = r["logger"]
+                    logger.records = lg["records"]
+                    logger.task_accuracies = lg["task_accuracies"]
+                    logger.ood_task_accuracies = lg["ood_task_accuracies"]
+                    logger.train_eval_task_accuracies = lg["train_eval_task_accuracies"]
+                    hyper = dict(r["hyperparameters"])
+                    lineage, history = "verified", "checkpoint"
+                    global_step, tokens_seen = int(r["micro_steps"]), int(r["tokens_seen"])
+                    rng = r["rng"]
+                    if rng["cuda"] is not None and (device.type != "cuda" or rng["cuda"]["uuid"] != str(getattr(
+                            torch.cuda.get_device_properties(torch.cuda.current_device()), "uuid", ""))):
+                        if kind == "exact":  # the fingerprint matched, so this cannot happen on a sound file
+                            raise ValueError("its CUDA RNG state belongs to another device than this run's")
+                        rng = {**rng, "cuda": None}  # another device (inexact): its CUDA stream is not this one's
+                    # what will be restored (exact or inexact) loads on this device before anything is written
+                    er.validate_rng(rng, device)
+                else:
+                    # a file without loop state: publish the curriculum and DAG state it has now (#154 audit A-3;
+                    # they would otherwise stay at their initial values until the first eval)
+                    if task_curriculum is not None:
+                        refresh_curriculum_snapshots()
+                    if dag_state is not None:
+                        ema = {task: task_curriculum.get_task_state(task)["ema_acc"] for task in dag_state.tasks}
+                        dag_gate_snapshot.clear()
+                        dag_gate_snapshot.update(dag_state.get_gate_snapshot())
+                        _set_frontier_snapshot(dag_frontier_snapshot, dag_state.compute_frontier(ema))
+                        dag_replay_ratio_snapshot[0] = dag_state.compute_replay_ratio(ema)
+                        dag_unlocked_snapshot.clear()
+                        dag_unlocked_snapshot.update({t for t, gate in dag_gate_snapshot.items() if gate > 0.0})
+                    # history only from the source checkpoint's own directory, and only if compatible (#150)
+                    hist, history = er.legacy_history(er.read_metrics(src.parent / "metrics.json"), ckpt)
+                    if hist is not None:
+                        logger.records = hist["records"]
+                        logger.task_accuracies = hist["task_accuracies"]
+                        logger.ood_task_accuracies = hist["ood_task_accuracies"]
+                        logger.train_eval_task_accuracies = hist["train_eval_task_accuracies"]
+                        hyper = dict(hist["hyperparameters"])
+                        lineage = ("verified" if ckpt.get("run_id") and hyper.get("run_id") == ckpt.get("run_id")
+                                   else "unverified")
+                    else:
+                        print(f"[resume] no history taken from {src.parent / 'metrics.json'}: {history}; "
+                              f"metrics.json starts empty")
+                        hyper = dict(logger.hyperparameters)
+                        lineage = "unverified"
+                    checkpoint_paths = []
+                    last_log_tokens = tokens_seen
+                run_id = ckpt.get("run_id") or run_id  # a legacy file gets a new id for its continuation (lineage unverified)
+            except (KeyError, ValueError, RuntimeError, TypeError) as exc:
+                raise er.ResumeRefused(f"--resume_from: {src}: {type(exc).__name__}: {exc}. Nothing was changed.") from None
+
+            if train_seconds is not None:
+                start_time = time.time() - train_seconds  # training time, not downtime (#154)
+            last_log_time = time.time()
+            best_state = best
+            entry = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "attempt": er.attempt_id(), "from": str(src),
+                     "sha256": resume_pre["sha256"], "step": global_step, "tokens_seen": tokens_seen, "kind": kind,
+                     "why_inexact": why, "lineage": lineage, "history": history, "best": best_how,
+                     "train_seconds": train_seconds,
+                     "pending_grads": len(r["grads"]) if r is not None else None,
+                     # the gradients as restored on the device (er.digest_of), for comparison with the file's
+                     "pending_grads_digest": er.digest_of({n: p.grad for n, p in model.named_parameters()
+                                                           if p.grad is not None}) if r is not None else None,
+                     "argv": list(sys.argv)}
+            hyper["run_id"] = run_id
+            hyper["resumes"] = list(hyper.get("resumes") or []) + [entry]
+            logger.set_hyperparameters(hyper)
+            return {"entry": entry, "rng": rng, "best": best, "same_dir": same_dir, "retained": retained}
+
+        def _commit_resume(plan: Dict[str, Any]) -> None:
+            """The file steps of a resume, after the in-memory restore succeeded: journal, summary.json aside first,
+            then the stale outputs of the earlier attempt, metrics.json, best_model.pt. The file named by
+            --resume_from and its sidecar are never moved or rewritten. Every step can be killed and re-run."""
+            import hashlib
+
+            src, entry = resume_pre["src"], plan["entry"]
+            step = entry["step"]
+
+            def kill(point: str, path: Optional[Path] = None) -> None:
+                hooks(step, point, path)
+
+            output_dir.mkdir(parents=True, exist_ok=True)
+            er.repair_journal(resume_pre["journal"], resume_pre["journal_tail"])
+            er.append_journal(resume_pre["journal"], {**entry, "status": "started"})
+            protected = {src.resolve(), er.sidecar(src).resolve()}
+            old_dir = output_dir / f"old_{entry['attempt']}"
+
+            def aside(path: Path) -> bool:
+                if not path.exists() or path.resolve() in protected:
+                    return False
+                old_dir.mkdir(exist_ok=True)
+                os.replace(path, old_dir / path.name)
+                return True
+
+            aside(output_dir / "summary.json")  # first: the run no longer counts as finished
+            kill("rs:summary")
+            stale = [output_dir / "final_model.pt", er.sidecar(output_dir / "final_model.pt")]
+            for q in sorted(output_dir.iterdir()):
+                base = q.name
+                for suffix in (".sha256", ".tmp"):
+                    if base.endswith(suffix):
+                        base = base[: -len(suffix)]
+                n = er.checkpoint_step_of(base)
+                if n is not None and n > step:
+                    stale.append(q)
+                elif (n is not None and n < step and plan["same_dir"] and plan["retained"] is not None
+                      and base == f"checkpoint_step_{n}.pt" and base not in plan["retained"]):
+                    # an earlier rotating checkpoint this checkpoint had already retired: its prune was killed
+                    # (between publishing the newer file and deleting the older one); set aside like later files
+                    stale.append(q)
+            moved = 0
+            for q in stale:
+                if aside(q):
+                    moved += 1
+                    kill(f"rs:move#{moved}", q)
+            metrics_path = output_dir / "metrics.json"
+            if metrics_path.exists():
+                if plan["same_dir"]:  # kept whole before it is rewritten (#150)
+                    er.atomic_write_bytes(er.next_free(metrics_path, "legacy"), metrics_path.read_bytes())
+                else:  # another directory's history is never adopted, nor erased
+                    os.replace(metrics_path, er.next_free(metrics_path, "unadopted"))
+            logger.save()
+            kill("rs:logger")
+            best = plan["best"]
+            best_path = output_dir / "best_model.pt"
+            if best_path.resolve() in protected:
+                pass
+            elif isinstance(best, dict) and "bytes" in best:
+                why_sc, meta = er.check_sidecar(best_path) if best_path.exists() else ("absent", None)
+                if why_sc is not None or meta.get("sha256") != best["sha256"]:
+                    er.publish(best_path, best["step"], kill=kill, role="best", data=best["bytes"].numpy().tobytes())
+            else:  # no best yet, or an unknown one: a best_model.pt here is not this run's best at the checkpoint
+                aside(er.sidecar(best_path))
+                aside(best_path)
+            kill("rs:best")
+            print(f"[resume] {entry['kind']} resume from {src} at micro-step {step} "
+                  f"(tokens {entry['tokens_seen']}, history {entry['history']}, lineage {entry['lineage']}, "
+                  f"best {entry['best']})", flush=True)
+
+        _resume_plan = _restore_resume()
+        _commit_resume(_resume_plan)
+        # the global RNGs last: building the run above drew from them
+        if _resume_plan["rng"] is not None:
+            from tools.grok_bridge import set_numpy_rng_state
+
+            _rng = _resume_plan["rng"]
+            torch.set_rng_state(_rng["torch"])
+            if _rng["cuda"] is not None:
+                torch.cuda.set_rng_state(_rng["cuda"]["state"], device)
+            er.set_python_rng_state(_rng["python"])
+            set_numpy_rng_state(_rng["numpy"])
+        resume_pre = _resume_plan = _rng = None  # free the payload (CPU copies of weights and moments)
+
     try:
         while curriculum.tokens_seen < args.total_tokens:
             if difficulty_value is not None:
@@ -3051,9 +3465,14 @@ def train(args):
                 else:
                     difficulty_value.value = clamp_difficulty(1.0)
             batch = curriculum.next_batch()
+            hooks.log_batch(global_step + 1, batch)
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             tokens_seen = curriculum.tokens_seen
+            if not expect_batch_checked:
+                if str(input_ids.device) != device_label:
+                    raise SystemExit(f"RELSM_TEST_EXPECT_DEVICE: the first batch is on {input_ids.device}")
+                expect_batch_checked = True
 
             batch_tasks = batch.get("task")
             if batch_tasks is not None:
@@ -3161,6 +3580,8 @@ def train(args):
                 last_grad_norm = float(grad_norm)
 
             global_step += 1
+            hooks(global_step, "step")
+            hooks(global_step, "interrupt")
             if resume_auto and global_step % args.grad_accum_steps == 0:
                 test_kill(global_step // args.grad_accum_steps, "step")
 
@@ -3422,6 +3843,7 @@ def train(args):
                     **task_metrics,
                 )
                 logger.save()
+                hooks(global_step, "log")
                 if args.extended_logging and diagnostic_metrics:
                     log_print(f"  Diagnostics: {format_metrics_line(diagnostic_metrics)}")
 
@@ -3718,12 +4140,19 @@ def train(args):
                         if did_sync:
                             refresh_curriculum_snapshots()
 
-                    # Track best
+                    # Track best: serialized once; best_model.pt and every later rotating checkpoint hold these bytes
                     if overall_acc > best_alg_acc:
                         best_alg_acc = overall_acc
                         best_payload = build_checkpoint_payload(global_step, tokens_seen)
                         best_payload["alg_accuracy"] = best_alg_acc
-                        torch.save(best_payload, output_dir / "best_model.pt")
+                        best_bytes = er.serialize(best_payload)
+                        best_payload = None
+                        best_meta = er.publish(output_dir / "best_model.pt", global_step,
+                                               kill=lambda point: hooks(global_step, point), role="best",
+                                               data=best_bytes)
+                        best_state = {"bytes": er.bytes_tensor(best_bytes), "sha256": best_meta["sha256"],
+                                      "step": int(global_step)}
+                        best_bytes = None
                         if args.extended_logging:
                             log_print(f"  New best! Saved checkpoint.")
 
@@ -3880,6 +4309,7 @@ def train(args):
                                 line += f" | MAE: {task_mae:.3f}"
                             log_print(line)
 
+                hooks(global_step, "eval")
                 # Training data accuracy (memorization tracking)
                 if train_eval_loader is not None:
                     train_eval_metrics = evaluate_training_split(
@@ -4150,16 +4580,20 @@ def train(args):
                 torch.cuda.empty_cache()
                 last_log_time += eval_duration
 
-                checkpoint_path = save_rotating_checkpoint(global_step, tokens_seen)
-                if checkpoint_path is not None and args.extended_logging:
+                if args.extended_logging:
+                    log_print()
+                model.train()
+
+            # the rotating checkpoint, at the true end of the iteration (same cadence as the evaluation): the state
+            # the next iteration starts from, so a resume from it continues exactly (#154)
+            if global_step % args.eval_interval == 0 and args.eval_checkpoints > 0:
+                checkpoint_path = save_rotating_checkpoint(global_step, tokens_seen, resume=build_resume_state())
+                if args.extended_logging:
                     log_print(
                         f"  Saved checkpoint: {checkpoint_path.name} "
                         f"(keeping last {args.eval_checkpoints})"
                     )
-
-                if args.extended_logging:
-                    log_print()
-                model.train()
+            hooks(global_step, "end")
 
             # exact resume: at the end of an update's iteration (after its step, table score, join and log)
             if resume_auto and global_step % args.grad_accum_steps == 0:
@@ -4192,7 +4626,9 @@ def train(args):
 
     # Final save
     final_payload = build_checkpoint_payload(global_step, tokens_seen)
-    torch.save(final_payload, output_dir / "final_model.pt")
+    er.publish(output_dir / "final_model.pt", global_step, kill=lambda point: hooks(global_step, point),
+               role="final", obj=final_payload)
+    final_payload = None
     
     # Save metrics
     logger.save()
@@ -4202,9 +4638,14 @@ def train(args):
     summary["best_alg_accuracy"] = best_alg_acc
     summary["variant"] = args.variant
     summary["model_size"] = args.model_size
+    if args.mod_table_p is None:
+        summary["resumes"] = list(logger.hyperparameters.get("resumes") or [])
     
-    with open(output_dir / "summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
+    er.atomic_write_bytes(output_dir / "summary.json", json.dumps(summary, indent=2).encode("utf-8"),
+                          before_replace=lambda: hooks(global_step, "summary:write"))
+    if hooks.digest:
+        er.write_digest(Path(hooks.digest), model, optimizer, grokfast_ema, scaler, device,
+                        dtype if device.type == "cuda" else None, global_step, tokens_seen)
 
     if table_scorer is not None:
         final_update = global_step // args.grad_accum_steps
@@ -4486,7 +4927,21 @@ def main():
         "--resume_from",
         type=str,
         default=None,
-        help="Path to a training checkpoint to resume from",
+        help="Checkpoint to resume from. A rotating checkpoint_step_N.pt continues exactly (same batches, records "
+             "and weights as an uninterrupted run); anything else needs --resume_inexact. See docs/resume.md.",
+    )
+    parser.add_argument(
+        "--resume_inexact",
+        action="store_true",
+        help="Allow a resume that cannot continue exactly (an older checkpoint, a best/final/interrupt file, "
+             "changed arguments, code or libraries, --num_workers > 0): restores what the file has, data loaders "
+             "restart; recorded as inexact",
+    )
+    parser.add_argument(
+        "--cuda_deterministic",
+        action="store_true",
+        help="On CUDA: deterministic kernels, no TF32 or reduced-precision reductions, math-only attention "
+             "(needs CUBLAS_WORKSPACE_CONFIG=:4096:8). Required for exact resume on CUDA; slower",
     )
     parser.add_argument(
         "--eval_algorithmic",
@@ -4574,8 +5029,9 @@ def main():
 
     args = parser.parse_args()
 
-    if args.mix_band_tokens is None:
-        args.mix_band_tokens = int(0.5 * args.alg_tokens)
+    from exact_resume import canonical_args
+
+    canonical_args(args)  # the normalizations train() relies on, once, before validation
     if args.mod_table_p is None and (args.mod_table_resume != "off" or args.mod_table_init_from
                                      or args.mod_table_resume_fallback != "off"):
         parser.error("--mod_table_resume / --mod_table_init_from / --mod_table_resume_fallback need --mod_table_p")

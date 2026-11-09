@@ -9,8 +9,8 @@ from typing import Any, Dict
 
 import torch
 
-from model import BaselineTransformer, TransformerConfig
-from utils import DEFAULT_TOKENIZER_NAME, generate_batch, seed_all
+from model import BaselineTransformer, TransformerConfig, config_to_payload
+from utils import DEFAULT_TOKENIZER_NAME, generate_batch, load_checkpoint, seed_all
 
 
 def run_self_test_suite(
@@ -58,7 +58,7 @@ def _make_tiny_checkpoint(tmpdir: Path, vocab_size: int) -> Path:
     )
     model = BaselineTransformer(config)
     ckpt_path = tmpdir / "tiny_ckpt.pt"
-    torch.save({"config": config, "model_state_dict": model.state_dict()}, ckpt_path)
+    torch.save({"config": config_to_payload(config), "model_state_dict": model.state_dict()}, ckpt_path)
     return ckpt_path
 
 
@@ -73,7 +73,7 @@ def run_self_checks() -> None:
         tokenizer = prepare_tokenizer(DEFAULT_TOKENIZER_NAME)
         vocab_size = getattr(tokenizer, "vocab_size", None) or len(tokenizer)
         ckpt = _make_tiny_checkpoint(tmp_path, vocab_size)
-        checkpoint = torch.load(ckpt, map_location="cpu")
+        checkpoint = load_checkpoint(ckpt, map_location="cpu")  # weights_only (#138)
         model = BaselineTransformer(checkpoint["config"])
         model.load_state_dict(checkpoint["model_state_dict"])
         payload = run_eval_suite(

@@ -233,13 +233,15 @@ class DagUnlockState:
         self.gate: Dict[str, float] = {task: 0.0 for task in self.tasks}
         self.streak: Dict[str, int] = {task: 0 for task in self.tasks}
         self.unlocked_eval_index: Dict[str, int] = {}
-        for root in self.roots:
+        # sorted: a set of strings iterates in a per-process (hash-seeded) order, and this order is what
+        # state_dict() writes into checkpoints
+        for root in sorted(self.roots):
             self.gate[root] = 1.0
             self.unlocked_eval_index[root] = 0
 
     def state_dict(self) -> Dict[str, object]:
         return {
-            "roots": list(self.roots),
+            "roots": sorted(self.roots),
             "prereqs": {task: list(reqs) for task, reqs in self.prereqs.items()},
             "thresholds": {task: dict(values) for task, values in self.thresholds.items()},
             "patience_evals": int(self.patience_evals),
@@ -257,7 +259,7 @@ class DagUnlockState:
             "gate": {task: float(value) for task, value in self.gate.items()},
             "streak": {task: int(value) for task, value in self.streak.items()},
             "unlocked_eval_index": {
-                task: int(value) for task, value in self.unlocked_eval_index.items()
+                task: int(self.unlocked_eval_index[task]) for task in sorted(self.unlocked_eval_index)
             },
         }
 
