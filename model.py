@@ -24,6 +24,7 @@ Notes:
   thought KV source.
 """
 
+import dataclasses
 import importlib
 import math
 import warnings
@@ -203,6 +204,34 @@ class TransformerConfig:
         if not self.tie_weights:
             total += embed
         return total
+
+
+CONFIG_PAYLOAD_SCHEMA = 1
+
+
+def config_to_payload(config: "TransformerConfig") -> Dict[str, Any]:
+    """The config as plain values, for checkpoints that load with torch.load(weights_only=True) (#138)."""
+    fields = {f.name: getattr(config, f.name) for f in dataclasses.fields(config)}
+    for name, value in fields.items():
+        if value is not None and not isinstance(value, (bool, int, float, str)):
+            raise TypeError(f"TransformerConfig.{name} is not a plain value: {type(value).__name__}")
+    return {"schema": CONFIG_PAYLOAD_SCHEMA, "fields": fields}
+
+
+def config_from_payload(obj: Any) -> "TransformerConfig":
+    """A checkpoint's "config" as a TransformerConfig: the plain payload written by config_to_payload, or a
+    TransformerConfig object from a checkpoint written before it (returned as is)."""
+    if isinstance(obj, TransformerConfig):
+        return obj
+    if not isinstance(obj, dict) or "fields" not in obj:
+        raise ValueError(f"not a TransformerConfig payload: {type(obj).__name__}")
+    if obj.get("schema") != CONFIG_PAYLOAD_SCHEMA:
+        raise ValueError(f"config payload schema {obj.get('schema')!r} is not {CONFIG_PAYLOAD_SCHEMA}")
+    known = {f.name for f in dataclasses.fields(TransformerConfig)}
+    unknown = sorted(set(obj["fields"]) - known)
+    if unknown:
+        raise ValueError(f"config payload has fields this code does not know: {unknown}")
+    return TransformerConfig(**obj["fields"])
 
 
 # =============================================================================

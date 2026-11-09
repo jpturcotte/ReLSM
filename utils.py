@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 
 from data import AlgorithmicGenerator
-from model import BaselineTransformer, TransformerConfig, apply_rotary_emb
+from model import BaselineTransformer, TransformerConfig, apply_rotary_emb, config_from_payload
 
 DEFAULT_TOKENIZER_NAME = "EleutherAI/llemma_7b"
 
@@ -462,6 +462,27 @@ def _ensure_2d_tensor(value: Any) -> torch.Tensor:
 
 
 @torch.no_grad()
+def load_checkpoint(checkpoint_path, map_location: Any = "cpu") -> Dict[str, Any]:
+    """Load a train.py checkpoint with torch.load(weights_only=True) (#138).
+
+    Checkpoints written since #138 hold their config as plain values (model.config_to_payload). Older ones pickled
+    a TransformerConfig object; that one class is allowed for this call only (a scoped allowlist, so the process-wide
+    safe globals stay as they were). Either way "config", when present, comes back as a TransformerConfig.
+    """
+    # safe_globals removes its entries on exit: add the class only when the caller has not allowlisted it already
+    import contextlib
+
+    already = TransformerConfig in torch.serialization.get_safe_globals()
+    scope = contextlib.nullcontext() if already else torch.serialization.safe_globals([TransformerConfig])
+    with scope:
+        checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"{checkpoint_path}: not a checkpoint dict ({type(checkpoint).__name__})")
+    if checkpoint.get("config") is not None:
+        checkpoint["config"] = config_from_payload(checkpoint["config"])
+    return checkpoint
+
+
 def load_model_and_tokenizer(
     checkpoint_path: str,
     tokenizer_name: str,
@@ -478,8 +499,7 @@ def load_model_and_tokenizer(
     tokenizer : PreTrainedTokenizer
         Tokenizer ready for generation with a defined pad token.
     """
-    torch.serialization.add_safe_globals([TransformerConfig])
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    checkpoint = load_checkpoint(checkpoint_path, map_location=device)
     if "config" not in checkpoint or "model_state_dict" not in checkpoint:
         raise ValueError(f"Invalid checkpoint format: {checkpoint_path}")
     config = checkpoint["config"]

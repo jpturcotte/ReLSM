@@ -23,8 +23,9 @@ import math
 from functools import partial
 from typing import Any, List, Dict, Optional, Tuple, Iterator, Callable, Iterable, Union, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 import torch
-from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
+from torch.utils.data import Dataset, DataLoader, IterableDataset, Sampler, get_worker_info
 from torch.nn.utils.rnn import pad_sequence
 
 
@@ -1064,107 +1065,29 @@ class AlgorithmicDataset(IterableDataset):
                 return idx
         return len(self._length_bucket_boundaries)
 
-    def __iter__(self) -> Iterator[List[Dict[str, torch.Tensor]]]:
-        worker_info = get_worker_info()
+    def __iter__(self) -> "AlgorithmicIterator":
+        # An object with explicit state rather than a generator, so a checkpoint can save where it is (#154).
+        # Same calls in the same order as the generator it replaces.
+        it = AlgorithmicIterator(self)
+        pending, self._pending_state = getattr(self, "_pending_state", None), None
+        if pending is not None:
+            it.load_state_dict(pending)
+        self.last_iter = it
+        return it
 
-        # Keep tokens_seen cumulative across epochs so difficulty schedules carry
-        # forward instead of resetting each pass over the dataset.
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("last_iter", None)  # DataLoader workers get the dataset, never an iterator of the main process
+        state.pop("_pending_state", None)
+        return state
 
-        if self.seed is not None:
-            seed = self.seed + (worker_info.id if worker_info is not None else 0)
-        else:
-            seed = random.SystemRandom().randint(0, 2**63 - 1)
-            if worker_info is not None:
-                seed += worker_info.id
+    def exact_dataset_state(self) -> Dict[str, Any]:
+        """The counters every iterator of this dataset shares (saved once per dataset)."""
+        return {"tokens_seen": int(self.tokens_seen), "worker_token_budget": float(self._worker_token_budget)}
 
-        rng = random.Random(seed)
-        generators = AlgorithmicGenerator._get_generators()
-
-        worker_id = worker_info.id if worker_info is not None else 0
-        num_workers = worker_info.num_workers if worker_info is not None else 1
-
-        self._worker_token_budget = max(1, self._token_budget / num_workers)
-
-        num_buckets = len(self._length_bucket_boundaries) + 1
-        batch_buffers: List[List[Dict[str, torch.Tensor]]] = [[] for _ in range(num_buckets)]
-        buffer_max_len = [0 for _ in range(num_buckets)]
-
-        for _ in range(worker_id, self.num_examples, num_workers):
-            progress = min(self.tokens_seen / max(self._worker_token_budget, 1), 1.0)
-            if self.difficulty_fn is not None:
-                task = self._sample_task(rng, progress, generators)
-                difficulty = max(self.difficulty_fn(task), self.min_difficulty)
-                effective_schedule = self.difficulty_schedule
-                if effective_schedule in {"phased", "fixed"}:
-                    effective_schedule = "linear"
-                example = AlgorithmicGenerator.generate_example(
-                    tasks=[task],
-                    rng=rng,
-                    generators=generators,
-                    difficulty=difficulty,
-                    min_difficulty=self.min_difficulty,
-                    progress=progress,
-                    difficulty_schedule=effective_schedule,
-                    task_weighting=self.task_weighting,
-                )
-            else:
-                difficulty = self._sample_difficulty(rng, progress)
-                example = AlgorithmicGenerator.generate_example(
-                    tasks=self.tasks,
-                    rng=rng,
-                    generators=generators,
-                    difficulty=difficulty,
-                    min_difficulty=self.min_difficulty,
-                    progress=progress,
-                    difficulty_schedule=self.difficulty_schedule,
-                    task_weighting=self.task_weighting,
-                )
-            prompt_tokens = self._encode_text(example["input"])
-            prompt_len = len(prompt_tokens)
-            tokens = self._encode_text(example["text"])
-            if self.tokenizer.eos_token_id is not None:
-                tokens.append(self.tokenizer.eos_token_id)
-
-            if len(tokens) > self.max_seq_len:
-                tokens = tokens[:self.max_seq_len]
-            prompt_len = min(prompt_len, len(tokens))
-
-            input_ids = torch.tensor(tokens, dtype=torch.long)
-
-            labels = input_ids.clone()
-            if prompt_len > 0:
-                labels[:prompt_len] = -100
-
-            n_tokens = int((labels[1:] != -100).sum().item())
-            self.tokens_seen += n_tokens
-
-            payload = {
-                "input_ids": input_ids,
-                "labels": labels,
-                "task": example["task"],
-            }
-            if self.include_lengths:
-                payload["input_len_tokens"] = self._encode_length(example["input"])
-                payload["target_len_tokens"] = self._encode_length(example["target"])
-            seq_len = int(input_ids.numel())
-            bucket_idx = self._length_bucket_index(seq_len)
-            batch_buffers[bucket_idx].append(payload)
-            buffer_max_len[bucket_idx] = max(buffer_max_len[bucket_idx], seq_len)
-
-            current_batch_size = len(batch_buffers[bucket_idx])
-            estimated_tensor_size = current_batch_size * buffer_max_len[bucket_idx]
-
-            if (
-                current_batch_size >= self._max_batch_size
-                or estimated_tensor_size >= self._target_batch_tokens
-            ):
-                yield batch_buffers[bucket_idx]
-                batch_buffers[bucket_idx] = []
-                buffer_max_len[bucket_idx] = 0
-
-        for bucket_buffer in batch_buffers:
-            if bucket_buffer:
-                yield bucket_buffer
+    def load_exact_dataset_state(self, state: Dict[str, Any]) -> None:
+        self.tokens_seen = int(state["tokens_seen"])
+        self._worker_token_budget = float(state["worker_token_budget"])
 
     def _sample_task(
         self,
@@ -1229,6 +1152,193 @@ class AlgorithmicDataset(IterableDataset):
             )
 
         return max(sample_difficulty_smooth(progress, rng=rng), self.min_difficulty)
+
+
+class AlgorithmicIterator:
+    """AlgorithmicDataset.__iter__ as an object whose position can be saved and restored (exact resume, #154).
+
+    The body is the old generator's, cut at its yields: phase "unstarted" (nothing drawn yet: seeding and the
+    worker's token budget happen on the first next(), as they did in the generator), "generate" (examples
+    index < num_examples left), "flush" (the length buckets still to yield, from flush_index), "done".
+    Dataset-level counters (tokens_seen, _worker_token_budget) live on the dataset and are shared by every
+    iterator of it, as before.
+    """
+
+    def __init__(self, dataset: "AlgorithmicDataset"):
+        self.dataset = dataset
+        self.phase = "unstarted"
+        self.rng: Optional[random.Random] = None
+        self.seeded = dataset.seed is not None
+        self.worker_id = 0
+        self.num_workers = 1
+        self.index = 0
+        self.flush_index = 0
+        self.buffers: List[List[Dict[str, Any]]] = []
+        self.buffer_max_len: List[int] = []
+        self._generators: Optional[Dict[str, Callable]] = None
+
+    def __iter__(self) -> "AlgorithmicIterator":
+        return self
+
+    def _start(self) -> None:
+        ds = self.dataset
+        worker_info = get_worker_info()
+        if ds.seed is not None:
+            seed = ds.seed + (worker_info.id if worker_info is not None else 0)
+        else:
+            seed = random.SystemRandom().randint(0, 2**63 - 1)
+            if worker_info is not None:
+                seed += worker_info.id
+        self.rng = random.Random(seed)
+        self.worker_id = worker_info.id if worker_info is not None else 0
+        self.num_workers = worker_info.num_workers if worker_info is not None else 1
+        # Keep tokens_seen cumulative across epochs so difficulty schedules carry
+        # forward instead of resetting each pass over the dataset.
+        ds._worker_token_budget = max(1, ds._token_budget / self.num_workers)
+        num_buckets = len(ds._length_bucket_boundaries) + 1
+        self.buffers = [[] for _ in range(num_buckets)]
+        self.buffer_max_len = [0 for _ in range(num_buckets)]
+        self.index = self.worker_id
+        self.phase = "generate"
+
+    def __next__(self) -> List[Dict[str, Any]]:
+        if self.phase == "unstarted":
+            self._start()
+        ds = self.dataset
+        if self._generators is None:
+            self._generators = AlgorithmicGenerator._get_generators()
+        generators = self._generators
+        rng = self.rng
+        if self.phase == "generate":
+            while self.index < ds.num_examples:
+                self.index += self.num_workers
+                progress = min(ds.tokens_seen / max(ds._worker_token_budget, 1), 1.0)
+                if ds.difficulty_fn is not None:
+                    task = ds._sample_task(rng, progress, generators)
+                    difficulty = max(ds.difficulty_fn(task), ds.min_difficulty)
+                    effective_schedule = ds.difficulty_schedule
+                    if effective_schedule in {"phased", "fixed"}:
+                        effective_schedule = "linear"
+                    example = AlgorithmicGenerator.generate_example(
+                        tasks=[task],
+                        rng=rng,
+                        generators=generators,
+                        difficulty=difficulty,
+                        min_difficulty=ds.min_difficulty,
+                        progress=progress,
+                        difficulty_schedule=effective_schedule,
+                        task_weighting=ds.task_weighting,
+                    )
+                else:
+                    difficulty = ds._sample_difficulty(rng, progress)
+                    example = AlgorithmicGenerator.generate_example(
+                        tasks=ds.tasks,
+                        rng=rng,
+                        generators=generators,
+                        difficulty=difficulty,
+                        min_difficulty=ds.min_difficulty,
+                        progress=progress,
+                        difficulty_schedule=ds.difficulty_schedule,
+                        task_weighting=ds.task_weighting,
+                    )
+                prompt_tokens = ds._encode_text(example["input"])
+                prompt_len = len(prompt_tokens)
+                tokens = ds._encode_text(example["text"])
+                if ds.tokenizer.eos_token_id is not None:
+                    tokens.append(ds.tokenizer.eos_token_id)
+
+                if len(tokens) > ds.max_seq_len:
+                    tokens = tokens[:ds.max_seq_len]
+                prompt_len = min(prompt_len, len(tokens))
+
+                input_ids = torch.tensor(tokens, dtype=torch.long)
+
+                labels = input_ids.clone()
+                if prompt_len > 0:
+                    labels[:prompt_len] = -100
+
+                n_tokens = int((labels[1:] != -100).sum().item())
+                ds.tokens_seen += n_tokens
+
+                payload = {
+                    "input_ids": input_ids,
+                    "labels": labels,
+                    "task": example["task"],
+                }
+                if ds.include_lengths:
+                    payload["input_len_tokens"] = ds._encode_length(example["input"])
+                    payload["target_len_tokens"] = ds._encode_length(example["target"])
+                seq_len = int(input_ids.numel())
+                bucket_idx = ds._length_bucket_index(seq_len)
+                self.buffers[bucket_idx].append(payload)
+                self.buffer_max_len[bucket_idx] = max(self.buffer_max_len[bucket_idx], seq_len)
+
+                current_batch_size = len(self.buffers[bucket_idx])
+                estimated_tensor_size = current_batch_size * self.buffer_max_len[bucket_idx]
+
+                if (
+                    current_batch_size >= ds._max_batch_size
+                    or estimated_tensor_size >= ds._target_batch_tokens
+                ):
+                    out = self.buffers[bucket_idx]
+                    self.buffers[bucket_idx] = []
+                    self.buffer_max_len[bucket_idx] = 0
+                    return out
+            self.phase = "flush"
+            self.flush_index = 0
+        if self.phase == "flush":
+            while self.flush_index < len(self.buffers):
+                out = self.buffers[self.flush_index]
+                self.flush_index += 1
+                if out:
+                    self.buffers[self.flush_index - 1] = []
+                    return out
+            self.phase = "done"
+        raise StopIteration
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Plain values and tensors only (torch.load weights_only=True)."""
+        return {
+            "kind": "algorithmic",
+            "phase": self.phase,
+            "seeded": bool(self.seeded),
+            "rng": self.rng.getstate() if self.rng is not None else None,
+            "worker_id": int(self.worker_id),
+            "num_workers": int(self.num_workers),
+            "index": int(self.index),
+            "flush_index": int(self.flush_index),
+            "buffers": [[dict(p) for p in b] for b in self.buffers],
+            "buffer_max_len": [int(v) for v in self.buffer_max_len],
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        if state.get("kind") != "algorithmic":
+            raise ValueError(f"not an AlgorithmicIterator state: {state.get('kind')!r}")
+        phase = state["phase"]
+        if phase not in ("unstarted", "generate", "flush", "done"):
+            raise ValueError(f"AlgorithmicIterator state: unknown phase {phase!r}")
+        num_buckets = len(self.dataset._length_bucket_boundaries) + 1
+        if phase != "unstarted" and (len(state["buffers"]) != num_buckets
+                                     or len(state["buffer_max_len"]) != num_buckets):
+            raise ValueError("AlgorithmicIterator state: bucket count differs from this dataset's")
+        if phase != "unstarted" and state["rng"] is None:
+            raise ValueError("AlgorithmicIterator state: a started iterator without its rng")
+        if not state["seeded"]:
+            raise ValueError("AlgorithmicIterator state: an unseeded dataset (seed=None) cannot be resumed exactly")
+        self.phase = phase
+        self.seeded = bool(state["seeded"])
+        if state["rng"] is None:
+            self.rng = None
+        else:
+            version, internal, gauss = state["rng"]
+            self.rng = random.Random()
+            self.rng.setstate((version, tuple(internal), gauss))
+        self.worker_id = int(state["worker_id"])
+        self.num_workers = int(state["num_workers"])
+        self.index = int(state["index"])
+        self.flush_index = int(state["flush_index"])
+        self.buffers = [[dict(p) for p in b] for b in state["buffers"]]
+        self.buffer_max_len = [int(v) for v in state["buffer_max_len"]]
 
 
 class FixedAlgorithmicDataset(Dataset):
@@ -1319,6 +1429,94 @@ class FixedAlgorithmicDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         return self.examples[idx % len(self.examples)]
+
+
+class _PermutationBatchIterator:
+    """One epoch of PermutationBatchSampler. The seed is drawn on the first next(), as RandomSampler draws it."""
+
+    def __init__(self, n: int, batch_size: int):
+        self.n = int(n)
+        self.batch_size = int(batch_size)
+        self.perm: Optional[List[int]] = None
+        self.pos = 0
+
+    def __iter__(self) -> "_PermutationBatchIterator":
+        return self
+
+    def __next__(self) -> List[int]:
+        if self.perm is None:
+            # RandomSampler.__iter__ without a generator (torch 2.9.1 sampler.py:173-198): one draw from the
+            # global torch RNG, then a permutation from a fresh generator seeded with it
+            seed = int(torch.empty((), dtype=torch.int64).random_().item())
+            generator = torch.Generator()
+            generator.manual_seed(seed)
+            self.perm = torch.randperm(self.n, generator=generator).tolist()
+        if self.pos >= self.n:
+            raise StopIteration
+        batch = self.perm[self.pos:self.pos + self.batch_size]
+        self.pos += len(batch)
+        return batch
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": "permutation",
+            "n": self.n,
+            "batch_size": self.batch_size,
+            "perm": None if self.perm is None else torch.tensor(self.perm, dtype=torch.int64),
+            "pos": int(self.pos),
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        if state.get("kind") != "permutation":
+            raise ValueError(f"not a permutation sampler state: {state.get('kind')!r}")
+        if int(state["n"]) != self.n or int(state["batch_size"]) != self.batch_size:
+            raise ValueError("permutation sampler state: dataset size or batch size differs from this run's")
+        perm = state["perm"]
+        pos = int(state["pos"])
+        if perm is None:
+            if pos != 0:
+                raise ValueError("permutation sampler state: a position without a permutation")
+            self.perm = None
+        else:
+            values = perm.tolist()
+            if sorted(values) != list(range(self.n)):
+                raise ValueError("permutation sampler state: not a permutation of the dataset's indices")
+            self.perm = values
+        if not 0 <= pos <= self.n:
+            raise ValueError("permutation sampler state: position out of range")
+        self.pos = pos
+
+
+class PermutationBatchSampler(Sampler):
+    """What DataLoader(shuffle=True, batch_size=B) uses (BatchSampler over RandomSampler, drop_last False), with a
+    position a checkpoint can save (exact resume of --fixed_data, #154). Same global RNG draws, same batches."""
+
+    def __init__(self, n: int, batch_size: int):
+        if int(n) <= 0:
+            raise ValueError(f"PermutationBatchSampler needs a non-empty dataset, got n={n}")
+        if int(batch_size) <= 0:
+            raise ValueError(f"PermutationBatchSampler needs a positive batch size, got {batch_size}")
+        self.n = int(n)
+        self.batch_size = int(batch_size)
+        self.last_iter: Optional[_PermutationBatchIterator] = None
+        self._pending_state: Optional[Dict[str, Any]] = None
+
+    def __iter__(self) -> _PermutationBatchIterator:
+        it = _PermutationBatchIterator(self.n, self.batch_size)
+        pending, self._pending_state = self._pending_state, None
+        if pending is not None:
+            it.load_state_dict(pending)
+        self.last_iter = it
+        return it
+
+    def __len__(self) -> int:
+        return (self.n + self.batch_size - 1) // self.batch_size
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["last_iter"] = None
+        state["_pending_state"] = None
+        return state
 
 
 def create_algorithmic_dataset(
@@ -1562,6 +1760,75 @@ def load_language_dataset(
     return generator()
 
 
+def _example_sha256(example: Dict[str, torch.Tensor]) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    for key in ("input_ids", "labels"):
+        t = example[key].detach().cpu().contiguous()
+        h.update(str((key, t.dtype, tuple(t.shape))).encode())
+        h.update(t.numpy().tobytes())
+    return h.hexdigest()
+
+
+class LanguageIterator:
+    """LanguageDataset.__iter__ with a position a checkpoint can save (exact resume, #154).
+
+    The Hub/arrow streams themselves cannot be saved, so the position is how many examples were yielded, the hash
+    of the last one, and every routing event of the stream (a source popped, with why, and each rebuild), each with
+    the yield count it happened at. A restore rebuilds the streams and runs them forward that many examples; it must
+    see exactly the same events and end on the same example, else it raises (a source changed, or failed
+    differently this time). Running forward reads and tokenizes every consumed example once.
+    """
+
+    def __init__(self, dataset: "LanguageDataset"):
+        self.dataset = dataset
+        self.events: List[List[Any]] = []
+        self._gen = dataset._stream(self.events)
+        self.yielded = 0
+        self.last_sha256: Optional[str] = None
+
+    def __iter__(self) -> "LanguageIterator":
+        return self
+
+    def __next__(self) -> Dict[str, torch.Tensor]:
+        example = next(self._gen)
+        self.yielded += 1
+        self.last_sha256 = _example_sha256(example)
+        return example
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": "language",
+            "yielded": int(self.yielded),
+            "last_sha256": self.last_sha256,
+            "events": [list(e) for e in self.events],
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        if state.get("kind") != "language":
+            raise ValueError(f"not a LanguageIterator state: {state.get('kind')!r}")
+        target = int(state["yielded"])
+        if self.yielded != 0:
+            raise ValueError("LanguageIterator: restore needs a fresh iterator")
+        for _ in range(target):
+            try:
+                next(self)
+            except StopIteration:
+                raise ValueError(
+                    f"LanguageIterator restore: the language stream ended after {self.yielded} of the "
+                    f"{target} examples the checkpoint had consumed"
+                ) from None
+        want_events = [list(e) for e in state["events"]]
+        if self.events != want_events:
+            raise ValueError(
+                "LanguageIterator restore: the language stream routed differently this time "
+                f"(saved events {want_events[:5]}, now {self.events[:5]})"
+            )
+        if self.last_sha256 != state["last_sha256"]:
+            raise ValueError("LanguageIterator restore: the last example differs from the checkpoint's")
+
+
 class LanguageDataset(IterableDataset):
     """Dataset for Phase 2: Language Generalization, streamed to limit RAM."""
 
@@ -1575,11 +1842,28 @@ class LanguageDataset(IterableDataset):
         self.max_seq_len = max_seq_len
         self.configs = configs or LANGUAGE_CONFIGS
 
-    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+    def __iter__(self) -> "LanguageIterator":
+        it = LanguageIterator(self)
+        pending, self._pending_state = getattr(self, "_pending_state", None), None
+        if pending is not None:
+            it.load_state_dict(pending)
+        self.last_iter = it
+        return it
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("last_iter", None)
+        state.pop("_pending_state", None)
+        return state
+
+    def _stream(self, events: List[List[Any]]) -> Iterator[Dict[str, torch.Tensor]]:
+        """The language stream. events gets [kind, yield count, source name, reason] for every source popped
+        and every rebuild, so a restore can check it routed the same way (LanguageIterator)."""
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         num_workers = worker_info.num_workers if worker_info is not None else 1
         rng = random.Random(42 + worker_id)
+        yielded = 0
 
         config_items = list(self.configs.items())
         rng.shuffle(config_items)
@@ -1660,6 +1944,7 @@ class LanguageDataset(IterableDataset):
                         "Check the network or the HF offline settings, and LANGUAGE_CONFIGS."
                     )
                 rebuild_count += 1
+                events.append(["rebuild", yielded, "", str(rebuild_count)])
                 print(
                     "Warning: language streams exhausted; rebuilding streams "
                     f"(count={rebuild_count})."
@@ -1690,13 +1975,16 @@ class LanguageDataset(IterableDataset):
                 active_streams.pop(chosen_index)
                 if isinstance(stream, _EmptyLanguageSource):
                     pass_reasons.append(f"{config.name}: {stream.reason}")
+                    events.append(["pop", yielded, config.name, stream.reason])
                 else:
                     pass_reasons.append(f"{config.name}: stream ended with no example")
+                    events.append(["pop", yielded, config.name, "ended"])
                 continue
             except Exception as exc:
                 active_streams.pop(chosen_index)
                 reason = f"raised while streaming: {type(exc).__name__}: {exc}"
                 pass_reasons.append(f"{config.name}: {reason}")
+                events.append(["pop", yielded, config.name, f"raised {type(exc).__name__}"])
                 _warn_once(config, reason)
                 continue
             pass_yielded = True
@@ -1709,6 +1997,7 @@ class LanguageDataset(IterableDataset):
 
             labels = input_ids.clone()
 
+            yielded += 1
             yield {"input_ids": input_ids, "labels": labels}
 
 
@@ -1763,6 +2052,64 @@ def _generator_state(loader) -> Optional[torch.Tensor]:
     return None if gen is None else gen.get_state()
 
 
+def _position_holder(loader: Optional[DataLoader]):
+    """The object a loader's position lives in after iter(loader), for exact resume: its IterableDataset (which
+    records the iterator it made as last_iter) or, for a map-style dataset, its batch sampler. None when the loader
+    keeps it in worker processes (num_workers > 0)."""
+    if loader is None or getattr(loader, "num_workers", 0) != 0:
+        return None
+    if isinstance(loader.dataset, IterableDataset):
+        return loader.dataset
+    return loader.batch_sampler
+
+
+def language_manifest(configs: Dict[str, "LanguageDataConfig"]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """The language sources as an ordered list (insertion order drives the stream), each with its config and, for a
+    local directory, the sha256 of every file in it by relative path. Second value: why a resume of a stream over
+    these sources cannot be exact (a source that is not a local directory: Hub data can change under the same name;
+    a directory with a dataset card, script or YAML file, or with links out of it: datasets could then read files the
+    hashes do not cover). Exact language sources are plain directories of data files, read by datasets' default
+    patterns inside the directory."""
+    import hashlib
+    import os
+    from dataclasses import asdict
+
+    manifest: List[Dict[str, Any]] = []
+    why: List[str] = []
+    for key, config in configs.items():
+        entry: Dict[str, Any] = {"key": str(key), "config": {k: v for k, v in asdict(config).items()}}
+        if os.path.isdir(config.name):
+            root = Path(config.name)
+            files = []
+            redirects, outside = [], []
+            real_root = root.resolve()
+            for f in sorted(q for q in root.rglob("*") if q.is_file()):
+                rel = f.relative_to(root).as_posix()
+                # a dataset card (README YAML data_files / configs), a loading script or a YAML file can make
+                # datasets read files outside this directory (absolute or ../ paths, URLs); a link can too
+                if f.name.lower().startswith("readme") or f.suffix.lower() in (".py", ".yaml", ".yml"):
+                    redirects.append(rel)
+                if f.is_symlink() or real_root not in f.resolve().parents:
+                    outside.append(rel)
+                h = hashlib.sha256()
+                with open(f, "rb") as fh:
+                    for block in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(block)
+                files.append([rel, h.hexdigest()])
+            entry["files"] = files
+            if redirects:
+                why.append(f"language source {config.name} holds {', '.join(redirects[:3])}: a dataset card, "
+                           f"script or YAML file can point datasets at files outside the hashed directory")
+            if outside:
+                why.append(f"language source {config.name} holds links that resolve outside it: "
+                           f"{', '.join(outside[:3])}")
+        else:
+            entry["files"] = None
+            why.append(f"language source {config.name} is not a local directory")
+        manifest.append(entry)
+    return manifest, why
+
+
 class CurriculumSampler:
     """
     Flexible curriculum sampler that blends algorithmic, language, and optional
@@ -1800,9 +2147,12 @@ class CurriculumSampler:
             self._alg_anchor_kind = "init"  # made by this constructor, before lang_iter and lex_iter
             self.alg_drawn = 0
 
-        self.alg_iter = iter(self.alg_loader)
-        self.lang_iter = iter(self.lang_loader)
-        self.lex_iter = iter(self.lex_loader) if self.lex_loader is not None else None
+        # exact resume (train.py --resume_from): the object holding each source's position, read right after each
+        # iter() below; see exact_state()
+        self._inner: Dict[str, Any] = {"alg": None, "lang": None, "lex": None}
+        self.alg_iter = self._fresh_iter("alg")
+        self.lang_iter = self._fresh_iter("lang")
+        self.lex_iter = self._fresh_iter("lex") if self.lex_loader is not None else None
 
         self.total_tokens = total_tokens
         self.alg_tokens = alg_tokens
@@ -1812,6 +2162,17 @@ class CurriculumSampler:
         self.tokens_seen = 0
 
         self.rng = random.Random(seed)
+
+    def _loader(self, which: str) -> Optional[DataLoader]:
+        return {"alg": self.alg_loader, "lang": self.lang_loader, "lex": self.lex_loader}[which]
+
+    def _fresh_iter(self, which: str):
+        """iter() of one source's loader, noting the object its position lives in (made eagerly inside iter())."""
+        loader = self._loader(which)
+        iterator = iter(loader)
+        holder = _position_holder(loader)
+        self._inner[which] = getattr(holder, "last_iter", None) if holder is not None else None
+        return iterator
 
     @property
     def phase(self) -> str:
@@ -1869,12 +2230,7 @@ class CurriculumSampler:
         )[0]
 
     def _next_from(self, which: str) -> Dict[str, torch.Tensor]:
-        if which == "alg":
-            loader, iter_attr = self.alg_loader, "alg_iter"
-        elif which == "lang":
-            loader, iter_attr = self.lang_loader, "lang_iter"
-        else:
-            loader, iter_attr = self.lex_loader, "lex_iter"
+        iter_attr = f"{which}_iter"
 
         iterator = getattr(self, iter_attr)
         if self.track_position and which == "alg":
@@ -1882,7 +2238,7 @@ class CurriculumSampler:
         try:
             return next(iterator)
         except StopIteration:
-            iterator = iter(loader)
+            iterator = self._fresh_iter(which)
             setattr(self, iter_attr, iterator)
             return next(iterator)
 
@@ -1893,7 +2249,7 @@ class CurriculumSampler:
         except StopIteration:
             # the exhausted sampler has already drawn its tail from the generator: the anchor comes after that
             anchor = _generator_state(self.alg_loader)
-            self.alg_iter = iter(self.alg_loader)
+            self.alg_iter = self._fresh_iter("alg")
             batch = next(self.alg_iter)
             self._alg_anchor, self._alg_anchor_kind, self.alg_drawn = anchor, "epoch", 0
         self.alg_drawn += 1
@@ -1904,7 +2260,7 @@ class CurriculumSampler:
         if self.track_position:
             self._alg_anchor, self._alg_anchor_kind, self.alg_drawn = _generator_state(loader), "join", 0
         self.alg_loader = loader
-        self.alg_iter = iter(self.alg_loader)
+        self.alg_iter = self._fresh_iter("alg")
 
     def alg_position(self) -> Dict[str, Any]:
         if not self.track_position:
@@ -1921,10 +2277,10 @@ class CurriculumSampler:
         if gen is None or pos["anchor"] is None:
             raise RuntimeError("restore_alg_position needs an alg loader with its own torch.Generator")
         gen.set_state(pos["anchor"].clone())
-        self.alg_iter = iter(self.alg_loader)
+        self.alg_iter = self._fresh_iter("alg")
         if pos["kind"] == "init":
-            self.lang_iter = iter(self.lang_loader)
-            self.lex_iter = iter(self.lex_loader) if self.lex_loader is not None else None
+            self.lang_iter = self._fresh_iter("lang")
+            self.lex_iter = self._fresh_iter("lex") if self.lex_loader is not None else None
         last = None
         for _ in range(int(pos["drawn"])):
             last = next(self.alg_iter)  # StopIteration here means the saved count is wrong: fail loudly
@@ -1949,11 +2305,66 @@ class CurriculumSampler:
 
         return batch
 
+    def exact_state(self) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+        """(state, why not): where every source's current iterator is, for an exact resume. state is None, with the
+        reasons, when a position cannot be captured (workers, or an iterator type without state)."""
+        why: List[str] = []
+        sources: Dict[str, Any] = {}
+        for which in ("alg", "lang", "lex"):
+            loader = self._loader(which)
+            if loader is None:
+                sources[which] = None
+                continue
+            if getattr(loader, "num_workers", 0) != 0:
+                why.append(f"{which} loader has num_workers {loader.num_workers}")
+                continue
+            inner = self._inner.get(which)
+            if inner is None or not hasattr(inner, "state_dict"):
+                why.append(f"{which} loader position is not capturable ({type(inner).__name__})")
+                continue
+            sources[which] = inner.state_dict()
+        if why:
+            return None, why
+        return {
+            "format": 1,
+            "tokens_seen": int(self.tokens_seen),
+            "rng": self.rng.getstate(),
+            "alias": self.lang_loader is self.alg_loader,
+            "sources": sources,
+        }, []
+
+    def restore_exact_state(self, state: Dict[str, Any]) -> None:
+        """Put every source's iterator where exact_state() saw it. The loaders must be the ones that state belongs
+        to, freshly built (same datasets, batch sizes, samplers). Each iterator is made by iter(loader) with the
+        saved position armed on its holder, in the constructor's order."""
+        if state.get("format") != 1:
+            raise ValueError(f"sampler state format {state.get('format')!r} is not 1")
+        if bool(state["alias"]) != (self.lang_loader is self.alg_loader):
+            raise ValueError("sampler state: the language loader is the algorithmic one in only one of the runs")
+        for which in ("alg", "lang", "lex"):
+            loader = self._loader(which)
+            saved = state["sources"].get(which)
+            if (loader is None) != (saved is None):
+                raise ValueError(f"sampler state: the {which} source exists in only one of the runs")
+            if loader is None:
+                continue
+            holder = _position_holder(loader)
+            if holder is None:
+                raise ValueError(f"sampler state: the {which} loader cannot take a saved position here")
+            holder._pending_state = saved
+            iterator = self._fresh_iter(which)
+            if holder._pending_state is not None or self._inner[which] is None:
+                raise ValueError(f"sampler state: the {which} iterator did not take the saved position")
+            setattr(self, f"{which}_iter", iterator)
+        self.tokens_seen = int(state["tokens_seen"])
+        version, internal, gauss = state["rng"]
+        self.rng.setstate((version, tuple(internal), gauss))
+
     def reset(self):
         self.tokens_seen = 0
-        self.alg_iter = iter(self.alg_loader)
-        self.lang_iter = iter(self.lang_loader)
-        self.lex_iter = iter(self.lex_loader) if self.lex_loader is not None else None
+        self.alg_iter = self._fresh_iter("alg")
+        self.lang_iter = self._fresh_iter("lang")
+        self.lex_iter = self._fresh_iter("lex") if self.lex_loader is not None else None
 
 
 # =============================================================================
