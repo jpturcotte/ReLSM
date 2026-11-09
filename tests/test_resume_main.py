@@ -1,7 +1,7 @@
 """Exact resume for train.py's --resume_from (#138, #154, #150): the parts that need no training run.
 
-The end-to-end checks (interrupted + resumed == uninterrupted, in fresh processes) are run by the study harness
-described in docs/resume.md; these tests cover each piece on its own.
+The end-to-end checks (interrupted + resumed == uninterrupted, in fresh processes) are in
+tests/test_resume_end_to_end.py; these tests cover each piece on its own.
 """
 import io
 import json
