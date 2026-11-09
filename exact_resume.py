@@ -348,6 +348,28 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+REPLACE_TRIES = 5
+REPLACE_FIRST_SLEEP_S = 0.0625
+
+
+def replace_retrying(src: Path, dst: Path, tries: int = REPLACE_TRIES,
+                     first_sleep_s: float = REPLACE_FIRST_SLEEP_S) -> None:
+    """os.replace(src, dst), retried on PermissionError. On Windows the replace fails while another process has dst
+    (or src) open: antivirus, the search indexer, a tool reading the output folder. Such a lock lasts moments, so
+    this tries up to `tries` times, sleeping first_sleep_s and doubling between tries (0.0625 + 0.125 + 0.25 + 0.5 s,
+    under a second, by default), then raises the last error so a lasting failure still stops the run."""
+    delay = first_sleep_s
+    for attempt in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
+
+
 def atomic_write_bytes(path: Path, data: bytes, before_replace: Optional[Callable[[], None]] = None) -> None:
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
@@ -357,7 +379,7 @@ def atomic_write_bytes(path: Path, data: bytes, before_replace: Optional[Callabl
         os.fsync(f.fileno())
     if before_replace is not None:
         before_replace()
-    os.replace(tmp, path)
+    replace_retrying(tmp, path)
     _fsync_dir(path.parent)
 
 
@@ -397,7 +419,7 @@ def publish(path: Path, step: int, kill: Callable[[str], None], role: str, data:
     else:
         meta = {"sha256": file_sha256(tmp), "size": tmp.stat().st_size, "step": int(step)}
     kill(f"{role}:save")
-    os.replace(tmp, path)
+    replace_retrying(tmp, path)
     _fsync_dir(path.parent)
     kill(f"{role}:payload")
     atomic_write_text(sc, json.dumps(meta))
