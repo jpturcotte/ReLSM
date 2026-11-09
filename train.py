@@ -48,6 +48,7 @@ from torch.utils.data import DataLoader, Subset
 
 from curriculum import DagUnlockState, TaskCurriculumState
 from data import get_task_weight, make_collate_fn
+from exact_resume import replace_retrying
 from utils import (
     DEFAULT_TOKENIZER_NAME,
     aggregate,
@@ -449,7 +450,7 @@ class MetricsLogger:
                         f,
                     )
                     f.write("\n")
-        os.replace(tmp_path, self._metrics_path)
+        replace_retrying(tmp_path, self._metrics_path)
     
     def summary(self) -> Dict:
         train_losses = self.series("train/loss/ce")[1]
@@ -3389,7 +3390,7 @@ def train(args):
                 if not path.exists() or path.resolve() in protected:
                     return False
                 old_dir.mkdir(exist_ok=True)
-                os.replace(path, old_dir / path.name)
+                replace_retrying(path, old_dir / path.name)
                 return True
 
             aside(output_dir / "summary.json")  # first: the run no longer counts as finished
@@ -3418,7 +3419,7 @@ def train(args):
                 if plan["same_dir"]:  # kept whole before it is rewritten (#150)
                     er.atomic_write_bytes(er.next_free(metrics_path, "legacy"), metrics_path.read_bytes())
                 else:  # another directory's history is never adopted, nor erased
-                    os.replace(metrics_path, er.next_free(metrics_path, "unadopted"))
+                    replace_retrying(metrics_path, er.next_free(metrics_path, "unadopted"))
             logger.save()
             kill("rs:logger")
             best = plan["best"]
@@ -4664,7 +4665,7 @@ def train(args):
                                  final_state_sha256=state_sha256(model, optimizer))
         tmp = output_dir / "bridge_record.json.tmp"
         tmp.write_text(json.dumps(bridge_record, indent=1), encoding="utf-8")
-        os.replace(tmp, output_dir / "bridge_record.json")
+        replace_retrying(tmp, output_dir / "bridge_record.json")
 
     log_print("\n" + "="*60)
     log_print("Training complete!")

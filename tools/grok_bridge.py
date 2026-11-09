@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader
 
 from data import FixedAlgorithmicDataset, MOD_ADD_TEMPLATES, make_collate_fn
+from exact_resume import replace_retrying
 
 CLIFF_FP32 = math.log(2.0 ** 24)
 _GL = None
@@ -317,7 +318,7 @@ def move_aside(output_dir):
         aside = out / time.strftime("old_%Y%m%d-%H%M%S")
         aside.mkdir(parents=True, exist_ok=True)
         for f in old:
-            f.replace(aside / f.name)
+            replace_retrying(f, aside / f.name)
 
 
 # Exact resume of a bridge run (train.py --mod_table_resume auto, --mod_table_init_from). resume.pt holds everything
@@ -342,7 +343,7 @@ def atomic_write_text(path, text):
         f.write(text)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    replace_retrying(tmp, path)
 
 
 def atomic_write_bytes(path, data):
@@ -353,7 +354,7 @@ def atomic_write_bytes(path, data):
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    replace_retrying(tmp, path)
 
 
 def atomic_torch_save(obj, path, before_replace=None):
@@ -368,7 +369,7 @@ def atomic_torch_save(obj, path, before_replace=None):
         os.fsync(f.fileno())
     if before_replace is not None:
         before_replace()
-    os.replace(tmp, path)
+    replace_retrying(tmp, path)
 
 
 def load_resume(path):
@@ -503,7 +504,7 @@ def publish_resume(obj, output_dir, rotate=True, kill=None):
         shutil.copyfile(cur, tmp)
         with open(tmp, "rb+") as f:
             os.fsync(f.fileno())
-        os.replace(tmp, prev)
+        replace_retrying(tmp, prev)
         kill("rotate")
         atomic_write_text(sidecar(prev), sidecar(cur).read_text(encoding="utf-8"))
     tmp = cur.with_name(cur.name + ".tmp")
@@ -518,7 +519,7 @@ def publish_resume(obj, output_dir, rotate=True, kill=None):
     meta = json.dumps({"sha256": file_sha256(tmp), "size": tmp.stat().st_size, "kind": obj.get("kind"),
                        "micro_steps": obj.get("micro_steps")})
     kill("save")
-    os.replace(tmp, cur)
+    replace_retrying(tmp, cur)
     kill("replaced")
     atomic_write_text(sidecar(cur), meta)
 
