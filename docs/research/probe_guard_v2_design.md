@@ -94,7 +94,12 @@ without taking the disk under the floor.
 Two checks in a row stop a momentary rise in free RAM (Chrome freeing a tab) from admitting
 a job that the next sample would not. They do not reserve anything against other programs.
 
-While it waits, the guard logs the numbers once a minute. The wait clock (monotonic) starts
+While it waits, the guard logs the numbers once a minute, naming every rule that fails
+(joined by `; `) and then every rule's threshold, for example `waiting for room: pytest_rest
+blocked by disk: C: free 15.40 - commit need 9.13 < floor 9.00 | needs free ram >= ...`. The
+rules are ram, commit, disk (the out_dir drive, or the page-file rule), start gap and cooldown.
+With `MAX_PROCS` > 1 the running jobs' outstanding need is shown apart (`- running jobs 2.00`).
+The `GIVING UP ... not admitted` line names the failing rules the same way. The wait clock (monotonic) starts
 when the job is next in line and a slot is free. At `ADMIT_WAIT_S` (1800 s), room on that one
 check is enough to start (the `ADMIT_CONFIRM` streak is not required at the deadline).
 Without room:

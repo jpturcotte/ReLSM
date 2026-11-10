@@ -103,6 +103,46 @@ def fmt(r):
             f"pagefile_disk_gb={r['sys_disk_gb']:.1f}")
 
 
+def admission_text(r, need, out_ram, out_commit, since_start, since_shed, rules_ok, cfg):
+    """Log text for a job that is not admitted: (what blocks it, every rule's threshold).
+
+    `rules_ok` holds the loop's own ram/commit/disk/gaps results, so the text names the rule
+    that failed; the disk and gap parts repeat the loop's expressions term for term. Text
+    only: admission is decided in the loop. "running jobs" is the part of the running jobs'
+    need they do not hold yet (always 0 with MAX_PROCS=1)."""
+    drive = (cfg.PAGEFILE_DRIVE or "").rstrip("\\/") or "page-file drive"
+
+    def minus(free, out, need_gb, kind):
+        held = f" - running jobs {out:.2f}" if out > 0 else ""
+        return f"free {free:.2f}{held} - {kind} need {need_gb:.2f}"
+
+    why = []
+    if not rules_ok["ram"]:
+        why.append(f"ram: {minus(r['ram_gb'], out_ram, need['ram_gb'], 'ram')} "
+                   f"< floor {cfg.ADMIT_RAM_FLOOR_GB:.2f}")
+    if not rules_ok["commit"]:
+        why.append(f"commit: {minus(r['commit_gb'], out_commit, need['commit_gb'], 'commit')} "
+                   f"< floor {cfg.MIN_COMMIT_GB:.2f}")
+    if not rules_ok["disk"]:
+        if not r["disk_gb"] >= cfg.MIN_DISK_GB:
+            why.append(f"disk: out_dir free {r['disk_gb']:.2f} < floor {cfg.MIN_DISK_GB:.2f}")
+        if not r["sys_disk_gb"] - out_commit - need["commit_gb"] >= cfg.MIN_DISK_GB:
+            why.append(f"disk: {drive} {minus(r['sys_disk_gb'], out_commit, need['commit_gb'], 'commit')} "
+                       f"< floor {cfg.MIN_DISK_GB:.2f}")
+    if not rules_ok["gaps"]:
+        if not since_start >= cfg.START_GAP_S:
+            why.append(f"start gap: {since_start:.0f} s since the last start < {cfg.START_GAP_S:.0f} s")
+        if not since_shed >= cfg.COOLDOWN_S:
+            why.append(f"cooldown: {since_shed:.0f} s since a job was killed for memory "
+                       f"< {cfg.COOLDOWN_S:.0f} s")
+    needs = (f"needs free ram >= {out_ram + need['ram_gb'] + cfg.ADMIT_RAM_FLOOR_GB:.2f} GB, "
+             f"free commit >= {out_commit + need['commit_gb'] + cfg.MIN_COMMIT_GB:.2f} GB, "
+             f"out_dir free >= {cfg.MIN_DISK_GB:.2f} GB, "
+             f"{drive} free >= {out_commit + need['commit_gb'] + cfg.MIN_DISK_GB:.2f} GB, "
+             f"start gap {cfg.START_GAP_S:.0f} s, cooldown {cfg.COOLDOWN_S:.0f} s")
+    return "; ".join(why) or "unknown rule", needs
+
+
 def read_jsonl(path):
     rows = []
     if os.path.exists(path):
@@ -1404,6 +1444,7 @@ def _loop(plan, out_dir, stop_file, system, cfg, hist, log):
                            and r["sys_disk_gb"] - out_commit - need["commit_gb"] >= cfg.MIN_DISK_GB)
                 gaps_ok = now - last_start >= cfg.START_GAP_S and now - last_shed >= cfg.COOLDOWN_S
                 room = ram_ok and commit_ok and disk_ok and gaps_ok
+                rules_ok = {"ram": ram_ok, "commit": commit_ok, "disk": disk_ok, "gaps": gaps_ok}  # for logs
                 timed_out = now - wait_since >= cfg.ADMIT_WAIT_S
                 start_why = None
                 if need["ram_gb"] + cfg.ADMIT_RAM_FLOOR_GB > r.get("total_ram_gb", float("inf")):
@@ -1425,17 +1466,18 @@ def _loop(plan, out_dir, stop_file, system, cfg, hist, log):
                         elif cfg.ADMIT_TIMEOUT == "fail" or not (commit_ok and disk_ok):
                             pending.popleft()
                             not_admitted.append(job["name"])
-                            log(f"GIVING UP on {job['name']}: not admitted in {now - wait_since:.0f} s "
-                                f"(needs ram {need['ram_gb']:.2f} + floor {cfg.ADMIT_RAM_FLOOR_GB} GB, "
-                                f"commit {need['commit_gb']:.2f} + {cfg.MIN_COMMIT_GB} GB | {fmt(r)})")
+                            why, needs = admission_text(r, need, out_ram, out_commit, now - last_start,
+                                                        now - last_shed, rules_ok, cfg)
+                            log(f"GIVING UP on {job['name']}: not admitted in {now - wait_since:.0f} s, "
+                                f"blocked by {why} ({needs} | {fmt(r)})")
                             end_chain(job, "was not admitted", False, not_admitted)
                             wait_since = None
                         # else: start mode, waiting only out the start gap / cooldown (<= COOLDOWN_S)
                     elif not room and now - last_wait_log >= cfg.WAIT_LOG_S:
                         last_wait_log = now
-                        log(f"waiting for memory: {job['name']} needs free ram >= "
-                            f"{need['ram_gb'] + out_ram + cfg.ADMIT_RAM_FLOOR_GB:.2f} GB and free commit >= "
-                            f"{need['commit_gb'] + out_commit + cfg.MIN_COMMIT_GB:.1f} GB | {fmt(r)} | "
+                        why, needs = admission_text(r, need, out_ram, out_commit, now - last_start,
+                                                    now - last_shed, rules_ok, cfg)
+                        log(f"waiting for room: {job['name']} blocked by {why} | {needs} | {fmt(r)} | "
                             f"waited {now - wait_since:.0f}/{cfg.ADMIT_WAIT_S:.0f} s")
                 if start_why:
                     pending.popleft()

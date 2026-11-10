@@ -6,6 +6,7 @@ plain-Python children to check the Job Object measurement on the real machine.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -357,7 +358,8 @@ def test_waits_for_room_then_starts(tmp_path):
     fs = FakeSystem({"a": {"duration": 30, "ws_gb": 1.0}}, ram=lambda t: 1.0 if t < 100 else 3.0)
     code, logs, hist = run(tmp_path, [job("a", ram_gb=1.3)], fs)
     assert code == 0
-    assert has(logs, "waiting for memory: a needs free ram >= 1.70")
+    assert has(logs, "waiting for room: a blocked by ram: free 1.00 - ram need 1.30 < floor 0.40 | "
+                     "needs free ram >= 1.70 GB")
     (name, t_start), = fs.spawned
     assert 100 <= t_start <= 106  # two checks in a row after room appears
     r = hist.rows[-1]
@@ -377,6 +379,7 @@ def test_admission_timeout_fail(tmp_path):
     code, logs, hist = run(tmp_path, [job("a", ram_gb=1.3)], fs, ADMIT_WAIT_S=300)
     assert code == 8 and fs.spawned == [] and hist.rows == []
     assert has(logs, "GIVING UP on a: not admitted in 30")
+    assert has(logs, "s, blocked by ram: free 1.00 - ram need 1.30 < floor 0.40 (needs free ram >= 1.70")
 
 
 def test_admission_timeout_start(tmp_path):
@@ -403,6 +406,87 @@ def test_pagefile_headroom_blocks_admission(tmp_path):
     fs = FakeSystem({"a": {"duration": 10}}, disk=50.0, sys_disk=lambda t: 11.0 if t < 100 else 20.0)
     code, logs, _ = run(tmp_path, [job("a")], fs)
     assert code == 0 and fs.spawned[0][1] >= 100
+
+
+def blocked_by(line):
+    """The rule text of a wait line: between 'blocked by ' and the first ' | '."""
+    return line.split("blocked by ", 1)[1].split(" | ", 1)[0]
+
+
+def wait_lines(logs, name):
+    return [line for line in logs if line.startswith(f"waiting for room: {name} ")]
+
+
+def test_wait_and_give_up_lines_name_disk_when_disk_blocks(tmp_path):
+    # The 2026-11-10 case: RAM and commit have room, but the page-file drive (15.4 GB free)
+    # minus the job's 9.13 GB commit need is under MIN_DISK_GB 9. The log must say disk, not RAM.
+    fs = FakeSystem({"pytest_rest": {}}, ram=8.0, commit=30.0, disk=50.0, sys_disk=15.4)
+    code, logs, _ = run(tmp_path, [job("pytest_rest", commit_gb=9.13)], fs,
+                        ADMIT_WAIT_S=600, MIN_DISK_GB=9.0, PAGEFILE_DRIVE="C:\\")
+    assert code == 8 and fs.spawned == []
+    waits = wait_lines(logs, "pytest_rest")
+    assert waits
+    for line in waits:
+        assert blocked_by(line) == "disk: C: free 15.40 - commit need 9.13 < floor 9.00"
+        assert "C: free >= 18.13 GB" in line and "out_dir free >= 9.00 GB" in line
+    give_up = [line for line in logs if line.startswith("GIVING UP on pytest_rest")]
+    assert len(give_up) == 1
+    assert "not admitted in 60" in give_up[0]
+    assert "s, blocked by disk: C: free 15.40 - commit need 9.13 < floor 9.00 (needs" in give_up[0]
+
+
+def test_wait_line_counts_running_jobs_commit_for_disk(tmp_path):
+    # MAX_PROCS=2: a holds little of its 4 GB commit need yet, so ~3.9 GB is outstanding.
+    # b alone fits the page-file rule (15 - 3 >= 9); with a's outstanding commit it does not.
+    specs = {"a": {"duration": 200, "ws_gb": 0.5, "commit_gb": 1.0, "ramp_s": 1000},
+             "b": {"duration": 10}}
+    fs = FakeSystem(specs, ram=8.0, commit=30.0, disk=50.0, sys_disk=15.0)
+    plan = [job("a", ram_gb=1.0, commit_gb=4.0), job("b", ram_gb=1.0, commit_gb=3.0)]
+    code, logs, _ = run(tmp_path, plan, fs, MAX_PROCS=2, PAGEFILE_DRIVE="C:\\")
+    assert code == 0
+    (_, ta), (_, tb) = fs.spawned
+    assert tb >= ta + 200
+    waits = wait_lines(logs, "b")
+    assert waits
+    for line in waits:
+        why = blocked_by(line)
+        assert why.startswith("disk: C: free 15.00 - running jobs 3.") and why.endswith(
+            " - commit need 3.00 < floor 9.00"), why
+
+
+def test_wait_line_names_start_gap(tmp_path):
+    fs = FakeSystem({"a": {"duration": 1}, "b": {"duration": 1}}, ram=8.0)
+    code, logs, _ = run(tmp_path, [job("a"), job("b")], fs, START_GAP_S=100, WAIT_LOG_S=10)
+    assert code == 0 and fs.spawned[1][1] >= 100
+    waits = wait_lines(logs, "b")
+    assert waits
+    for line in waits:
+        assert re.fullmatch(r"start gap: \d+ s since the last start < 100 s", blocked_by(line)), line
+
+
+def test_wait_line_lists_every_failing_rule(tmp_path):
+    fs = FakeSystem({"a": {}}, ram=1.0, commit=4.0)
+    code, logs, _ = run(tmp_path, [job("a", ram_gb=1.3)], fs, ADMIT_WAIT_S=300)
+    assert code == 8
+    waits = wait_lines(logs, "a")
+    assert waits
+    for line in waits:
+        assert blocked_by(line) == ("ram: free 1.00 - ram need 1.30 < floor 0.40; "
+                                    "commit: free 4.00 - commit need 3.00 < floor 3.00")
+
+
+def test_admission_text_out_dir_and_cooldown(tmp_path):
+    # Not reachable through the loop (low disk on out_dir stops the plan first; a cooldown
+    # needs a shed), so the helper is called directly with the loop's rule results.
+    cfg = make_cfg(tmp_path, PAGEFILE_DRIVE="C:\\")
+    r = {"ram_gb": 8.0, "commit_gb": 30.0, "disk_gb": 5.0, "sys_disk_gb": 50.0}
+    rules_ok = {"ram": True, "commit": True, "disk": False, "gaps": False}
+    why, needs = pg.admission_text(r, {"ram_gb": 1.3, "commit_gb": 3.0}, 0.0, 0.0, 500.0, 40.0,
+                                   rules_ok, cfg)
+    assert why == ("disk: out_dir free 5.00 < floor 9.00; "
+                   "cooldown: 40 s since a job was killed for memory < 90 s")
+    assert "shed" not in why  # the runner copies lines with "shed" into its log
+    assert needs.endswith("start gap 20 s, cooldown 90 s")
 
 
 def test_outstanding_reservation(tmp_path):
