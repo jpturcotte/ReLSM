@@ -273,7 +273,9 @@ class TestHooks:
     eval (IID eval logged, before train-eval), end (end of the iteration), interrupt, and file operations named
     ROLE:OP, e.g. ckpt:save (staged, before its os.replace), ckpt:sidecar_removed, ckpt:payload (replaced, before
     its sidecar), ckpt:prune#K, best:payload, final:payload, summary:write, rs:summary, rs:move#K, rs:logger,
-    rs:best (startup of a resume). Separate from the bridge's RELSM_TEST_KILL."""
+    rs:best (startup of a resume). Separate from the bridge's RELSM_TEST_KILL.
+    RELSM_TEST_BEST_ACC=X makes the best-model check see accuracy X * micro-step (the logged metrics keep the measured
+    accuracy), so a short test run writes best_model.pt at its first IID evaluation and again at each later one."""
 
     def __init__(self) -> None:
         spec = os.environ.get("RELSM_TEST_KILL_STEP", "")
@@ -284,6 +286,8 @@ class TestHooks:
         self.batch_log = os.environ.get("RELSM_TEST_BATCH_LOG")
         self.digest = os.environ.get("RELSM_TEST_DIGEST")
         self.expect_device = os.environ.get("RELSM_TEST_EXPECT_DEVICE")
+        best = os.environ.get("RELSM_TEST_BEST_ACC", "").strip()
+        self.best_acc = (lambda step, x=float(best): x * step) if best else None
 
     def __call__(self, step: int, point: str, path: Optional[Path] = None) -> None:
         if self.step is None or step != self.step or point != self.point:
