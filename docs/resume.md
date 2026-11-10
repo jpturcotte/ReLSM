@@ -22,7 +22,10 @@ python train.py <the same arguments> --resume_from OUTPUT_DIR/checkpoint_step_N.
   or links out of it (each can point the datasets library at files the hashes do not cover; an exact source is a
   plain directory of data files), or CUDA without `--cuda_deterministic`. It restores what the file has, the
   data loaders start from their beginning, and the resume is recorded as inexact with its reasons. Without the flag
-  the run stops, lists the reasons, and changes nothing. Even an inexact resume of a rotating checkpoint keeps
+  the run stops, lists the reasons, and changes nothing. Changed arguments are among the reasons and are also
+  printed as a `[resume] WARNING` naming each flag: compared with the rotating checkpoint's resume state, or, for a
+  best, final or interrupt file, with its `run_record` (#187; a file without one has nothing to compare). Even an
+  inexact resume of a rotating checkpoint keeps
   `--use_task_curriculum` as the run had it (the loop state it restores belongs to that setting); to change it,
   resume from `best_model.pt` or `final_model.pt`, or start a new run.
 
@@ -68,6 +71,17 @@ time, not downtime: work done after the checkpoint by a killed attempt is not co
 - Each checkpoint embeds the best model (about twice the size of a checkpoint without it), so a checkpoint is
   complete on its own.
 - Every run has a `run_id`, in every checkpoint and in the hyperparameter row; a resume keeps it.
+- Every file a run writes (rotating, `_interrupt`, `best_model.pt`, `final_model.pt`, the bridge's `resume.pt`)
+  carries `run_record` (#187, `run_record.py`), plain values taken once as the process starts: `argv`, the resolved
+  `args`, `seed`, the git commit with `dirty`, a hash of `git diff HEAD` and the count of untracked entries (all
+  `null` with an `error` when git is unavailable), the run fingerprint, the platform and host, the start time,
+  values resolved from the arguments (device, AMP dtypes, warmup tokens, train-eval mode, the effective phase-1
+  lexical fraction, parameter counts, the model config), the optimizer (betas, eps, group sizes), and, on a resume,
+  `parent`: the file resumed from with its sha256, the resume kind and that file's own record (`null` for a file
+  written before #187), and `ancestors`: the earlier files of the chain, latest first, kept flat. `saved` adds the
+  micro-steps, optimizer steps and tokens at that save. A resume of a best, final or interrupt file compares its
+  `args` (above); nothing else in it is compared. Files written before #187
+  have no `run_record`.
 
 ## Resuming from an older checkpoint (`--resume_inexact`)
 
@@ -104,6 +118,8 @@ accumulation before torch 2.7) is recorded as `null` and counts as off.
 - `RELSM_TEST_DIGEST=PATH`: digests of the end-of-run state (weights, optimizer, EMA, buffers, gradients, scaler,
   RNGs).
 - `RELSM_TEST_EXPECT_DEVICE=cuda:0`: stop unless training runs on that device.
+- `RELSM_TEST_BEST_ACC=X`: the best-model check sees accuracy `X * micro-step` instead of the measured one (the
+  logged metrics keep the measured accuracy), so a short run writes `best_model.pt` at every IID evaluation.
 
 ## Not covered
 

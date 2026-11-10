@@ -18,8 +18,10 @@ resume must come from the intended file (the resume entries; the bridge's resume
 legs). The resume checkpoints fall inside a logging window, so the window and the rewound metrics rows are restored,
 not just reset. One more case: a resume with a changed --max_lr is refused and leaves the directory byte-identical.
 
-The jobs run as four parallel sequences (the reference runs, and each chain's legs in order); every subprocess pays
-train.py's import time. The checkpoints peak at about 0.8 GB on disk and are deleted when the module ends.
+The jobs run as four sequences (the reference runs, and each chain's legs in order), one after another by default, so
+one train.py process runs at a time (about 2 GB of RAM; four at once peaked near 5 GB). RELSM_E2E_PARALLEL=N runs up
+to N sequences at once. Every subprocess pays train.py's import time. The checkpoints peak at about 0.8 GB on disk
+and are deleted when the module ends.
 """
 import hashlib
 import json
@@ -188,7 +190,8 @@ def runs(tmp_path_factory):
         _sequence(jobs["bridge_1"], jobs["bridge_2"], check_bridge_pair, jobs["bridge_3"]),
     ]
     try:
-        with ThreadPoolExecutor(len(sequences)) as pool:
+        workers = max(1, min(int(os.environ.get("RELSM_E2E_PARALLEL", "1")), len(sequences)))
+        with ThreadPoolExecutor(workers) as pool:
             for f in [pool.submit(s) for s in sequences]:
                 f.result()
         yield {"root": root, "jobs": jobs, "dirs": d, "refuse_before": before.get("refuse"), "between": between}
@@ -295,7 +298,37 @@ def _same_final_resume(ref_dir, chain_dir, digest):
     _same_fields("resume.pt", {"logger": logger(a), "table_files": table_files(a)},
                  {"logger": logger(b), "table_files": table_files(b)})
     _same_fields("resume.pt", a, b, skip=("saved_at", "args", "bridge_record", "logger", "table_files",
-                                           "loop.train_seconds", "loop.checkpoint_paths"))
+                                           "loop.train_seconds", "loop.checkpoint_paths", "run_record"))
+    # its run record (#187): the reference's, and the chain's names the resume.prev.pt it reran from
+    _same_records("resume.pt", a["run_record"], b["run_record"], free=RESUME_FREE_ARGS)
+    assert _lineage(a["run_record"]) == [] and _lineage(b["run_record"]) == [("bridge-resume", "resume.prev.pt")]
+
+
+def _same_records(name, a, b, free=()):
+    """Two run records (#187) say the same about the run: arguments (but output_dir, resume_from and free), code,
+    commit, environment, resolved values, optimizer and progress at the save. Wall-clock, argv, lineage differ."""
+    assert isinstance(a, dict) and isinstance(b, dict), f"{name}: run_record missing ({type(a)}, {type(b)})"
+    diffs = er.arg_differences(a["args"], b["args"])
+    assert not [x for x in diffs if x.split(":")[0].lstrip("-") not in free], f"{name}: {diffs}"
+    for k in ("format", "git", "fingerprint", "resolved", "optimizer", "seed"):
+        assert a[k] == b[k], f"{name}: run_record.{k} differs"
+    for k in ("micro_steps", "optimizer_steps", "tokens_seen"):
+        assert a["saved"][k] == b["saved"][k], f"{name}: run_record.saved.{k} differs"
+
+
+def _lineage(rec):
+    """[(kind, file name), ...] of the files a record's run resumed from, latest first; every one carries a record."""
+    chain = [e for e in [rec["parent"], *rec["ancestors"]] if e is not None]
+    assert all(isinstance(e["record"], dict) and len(e["sha256"] or "") == 64 for e in chain), chain
+    return [(e["kind"], e["name"]) for e in chain]
+
+
+def _same_run_record(ref_path, chain_path, parents, free=()):
+    """The chain's file carries the reference's run record (_same_records) and names the files the chain resumed
+    from (parents, latest first); the reference resumed from none."""
+    a, b = _load(ref_path)["run_record"], _load(chain_path)["run_record"]
+    _same_records(chain_path.name, a, b, free)
+    assert _lineage(a) == [] and _lineage(b) == parents, (_lineage(a), _lineage(b))
 
 
 def _same_summary(ref_dir, chain_dir):
@@ -343,8 +376,11 @@ def test_main_path_killed_and_resumed_matches_an_uninterrupted_run(runs):
     kinds = [json.loads(r)["type"] for r in ref_rows]
     assert kinds.count("record") >= 4 and "task_accuracy" in kinds, kinds
     _same_summary(d["main_ref"], d["main"])
-    _same_file_state(d["main_ref"] / "final_model.pt", d["main"] / "final_model.pt", skip=("run_id",))
-    _same_file_state(d["main_ref"] / "best_model.pt", d["main"] / "best_model.pt", skip=("run_id",), required=False)
+    _same_file_state(d["main_ref"] / "final_model.pt", d["main"] / "final_model.pt", skip=("run_id", "run_record"))
+    _same_file_state(d["main_ref"] / "best_model.pt", d["main"] / "best_model.pt", skip=("run_id", "run_record"),
+                     required=False)
+    _same_run_record(d["main_ref"] / "final_model.pt", d["main"] / "final_model.pt",
+                     [("exact", "checkpoint_step_12.pt"), ("exact", "checkpoint_step_6.pt")])
     # one run identity across the chain (the first leg's), not the reference's
     hyp = json.loads((d["main"] / "metrics.json").read_text(encoding="utf-8").splitlines()[0])
     run_id = runs["between"].get("main_run_id")
@@ -356,6 +392,8 @@ def test_main_path_killed_and_resumed_matches_an_uninterrupted_run(runs):
 
 
 def test_bridge_path_killed_and_rerun_matches_an_uninterrupted_run(runs):
+    from tools.grok_bridge import RESUME_FREE_ARGS
+
     # resume.pt is written every 3 updates (12 micro-steps). Kill at update 5: the rerun continues after update 3.
     # Kill at update 6 between resume.pt and its sidecar: that resume.pt fails its check (its sidecar is still update
     # 3's), so the rerun falls back to resume.prev.pt (update 3 again; --mod_table_resume_fallback previous)
@@ -376,7 +414,11 @@ def test_bridge_path_killed_and_rerun_matches_an_uninterrupted_run(runs):
     assert chain_scores == ref_scores, _first_row_diff(ref_scores, chain_scores)
     assert len(ref_scores) >= 3, ref_scores
     _same_summary(d["bridge_ref"], d["bridge"])
-    _same_file_state(d["bridge_ref"] / "final_model.pt", d["bridge"] / "final_model.pt", skip=("run_id",))
+    _same_file_state(d["bridge_ref"] / "final_model.pt", d["bridge"] / "final_model.pt",
+                     skip=("run_id", "run_record"))
+    # the last leg reran from resume.prev.pt (update 3), written by the first leg, which started afresh
+    _same_run_record(d["bridge_ref"] / "final_model.pt", d["bridge"] / "final_model.pt",
+                     [("bridge-resume", "resume.prev.pt")], free=RESUME_FREE_ARGS)
     # the final resume.pt: what the loop carries (loader position, curriculum RNG, logging window, best accuracy)
     _same_final_resume(d["bridge_ref"], d["bridge"], _json(runs["jobs"]["bridge_ref"].digest))
     rec = {k: _json(d[k] / "bridge_record.json") for k in ("bridge_ref", "bridge")}

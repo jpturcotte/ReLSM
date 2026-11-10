@@ -1943,6 +1943,7 @@ def train(args):
     # =========================================================================
 
     import exact_resume as er
+    import run_record as rr
 
     # the shared entry (drivers call train() directly): the arguments saved and compared on resume are canonical
     er.canonical_args(args)
@@ -2010,6 +2011,7 @@ def train(args):
     output_dir = Path(args.output_dir)
     # --resume_from: read-only checks now; output_dir changes only once the whole restore is built (below)
     resume_pre = er.preflight(Path(args.resume_from), output_dir) if args.resume_from else None
+    record_resumed: Optional[Dict[str, Any]] = None  # the run record's lineage: the file this run resumed from (#187)
     if resume_pre is None:
         output_dir.mkdir(parents=True, exist_ok=True)
     resume_auto = args.mod_table_p is not None and args.mod_table_resume == "auto"
@@ -2553,6 +2555,12 @@ def train(args):
         if tok_why:
             static_why.append(tok_why)
         static_why += er.cuda_exact_problems(run_fp, args.cuda_deterministic)
+    # the run record (#187): the code version and environment, taken once, as the run starts
+    record_git = rr.git_state(Path(__file__).resolve().parent)
+    record_fp = run_fp if run_fp is not None else er.run_fingerprint(
+        Path(__file__).resolve().parent, tokenizer, device, dtype if device.type == "cuda" else None, eval_dtype,
+        cuda_initialized_before)
+    record_static: Optional[Dict[str, Any]] = None  # built once the resume (if any) is restored, before the loop
     if hooks.expect_device:
         bad = [f"parameter {n} on {q.device}" for n, q in model.named_parameters() if str(q.device) != device_label][:3]
         if device.type == "cuda" and torch.cuda.get_rng_state(device).numel() == 0:
@@ -2667,6 +2675,8 @@ def train(args):
                             + "\n")
                     f.flush()
                     os.fsync(f.fileno())
+            record_resumed = rr.lineage(src, er.file_sha256(src), f"bridge-{resume_kind}",
+                                        resume_state["micro_steps"], resume_state.get("run_record"))
             if resume_kind == "resume":
                 bridge_record = resume_state["bridge_record"]
                 bridge_record["status"] = "running"
@@ -2750,6 +2760,8 @@ def train(args):
             ),
             "curriculum_config": _curriculum_config(),
             "task_curriculum_config": _task_curriculum_config(),
+            # args, argv, git commit, fingerprint, environment: plain values, not compared on resume (#187)
+            "run_record": rr.at_save(record_static, optimizer, step, tokens_seen) if record_static is not None else None,
         }
         if task_curriculum is not None:
             payload["curriculum_state"] = task_curriculum.state_dict()
@@ -2965,6 +2977,8 @@ def train(args):
                                  "ood_task_accuracies": logger.ood_task_accuracies,
                                  "train_eval_task_accuracies": logger.train_eval_task_accuracies}),
                 "fingerprint": run_fingerprint,
+                "run_record": (rr.at_save(record_static, optimizer, global_step, tokens_seen)
+                               if record_static is not None else None),  # #187; not compared on resume
                 "rng": {"torch": torch.get_rng_state(),
                         "cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
                         "python": random.getstate(), "numpy": numpy_rng_state()},
@@ -3173,6 +3187,9 @@ def train(args):
                 if r is None:
                     why.append(f"{src.name} holds no exact-resume state (written before exact resume, or a best, "
                                f"final or interrupt checkpoint)")
+                    rec = ckpt.get("run_record")  # a best, final or interrupt file still names its arguments (#187)
+                    if isinstance(rec, dict) and isinstance(rec.get("args"), dict):
+                        why += [f"argument {d}" for d in er.arg_differences(rec["args"], er.plain(vars(args)))]
                 else:
                     er.validate_exact_state(ckpt, r)
                     if r["hyperparameters"].get("run_id") != ckpt.get("run_id"):
@@ -3199,6 +3216,10 @@ def train(args):
                         f"--resume_from: {src} cannot be resumed exactly:\n  - " + "\n  - ".join(why)
                         + "\nPass --resume_inexact to continue anyway (the data loaders restart from their "
                           "beginning; recorded as an inexact resume). Nothing was changed.")
+                changed = [w[len("argument "):] for w in why if w.startswith("argument --")]
+                if changed:
+                    print("[resume] WARNING: arguments differ from the checkpoint's: " + "; ".join(changed),
+                          flush=True)
                 kind = "inexact" if why else "exact"
 
                 check_resume_architecture(ckpt.get("config"), getattr(model, "_orig_mod", model).config)
@@ -3440,6 +3461,8 @@ def train(args):
 
         _resume_plan = _restore_resume()
         _commit_resume(_resume_plan)
+        record_resumed = rr.lineage(resume_pre["src"], resume_pre["sha256"], _resume_plan["entry"]["kind"],
+                                    _resume_plan["entry"]["step"], resume_pre["ckpt"].get("run_record"))
         # the global RNGs last: building the run above drew from them
         if _resume_plan["rng"] is not None:
             from tools.grok_bridge import set_numpy_rng_state
@@ -3451,6 +3474,25 @@ def train(args):
             er.set_python_rng_state(_rng["python"])
             set_numpy_rng_state(_rng["numpy"])
         resume_pre = _resume_plan = _rng = None  # free the payload (CPU copies of weights and moments)
+
+    record_static = rr.build(
+        run_id=run_id, args=er.plain(vars(args)), fingerprint=record_fp, git=record_git, resumed=record_resumed,
+        optimizer=rr.optimizer_setup(optimizer),
+        resolved={
+            **rr.model_counts(model),
+            "device": device_label,
+            "train_autocast_dtype": str(dtype) if device.type == "cuda" else None,
+            "eval_autocast_dtype": str(eval_dtype) if eval_dtype is not None else None,
+            "grad_scaler": bool(scaler.is_enabled()) if scaler is not None else False,
+            "train_eval_mode": train_eval_mode,
+            "warmup_tokens": int(warmup_tokens),
+            "warmup_source": warmup_source,
+            # the sampler forces it to 0 without a lexical loader, whatever --lexical_frac_phase1 says
+            "lexical_frac_phase1_effective": getattr(curriculum, "lexical_frac_phase1", None),
+            "model_config": config_to_payload(config),  # also in the payload's "config"; resume.pt has none
+            "bridge_fingerprint": run_fingerprint if args.mod_table_p is not None else None,
+        })
+    record_fp = record_git = record_resumed = None
 
     try:
         while curriculum.tokens_seen < args.total_tokens:
@@ -4142,6 +4184,8 @@ def train(args):
                             refresh_curriculum_snapshots()
 
                     # Track best: serialized once; best_model.pt and every later rotating checkpoint hold these bytes
+                    if hooks.best_acc is not None:  # test hook: a best model without training to accuracy
+                        overall_acc = hooks.best_acc(global_step)
                     if overall_acc > best_alg_acc:
                         best_alg_acc = overall_acc
                         best_payload = build_checkpoint_payload(global_step, tokens_seen)
